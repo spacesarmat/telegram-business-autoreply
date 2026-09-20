@@ -358,39 +358,25 @@ async def handle_form_message(
     return True
 
 
-async def notify_admins_about_submission(
-    bot: Bot, submission_id: int, session: dict, form: dict, questions: list[dict]
-) -> None:
-    full_name = " ".join(
-        part for part in [session.get("first_name"), session.get("last_name")] if part
-    ).strip() or "Без имени"
-    user_id = session.get("user_id")
-    if user_id:
-        client = f'<a href="tg://user?id={int(user_id)}">{html.escape(full_name)}</a>'
-    else:
-        client = html.escape(full_name)
-    username = f"@{html.escape(session['username'])}" if session.get("username") else "—"
+def _submission_chat_text(
+    submission_id: int, form: dict, questions: list[dict], answers: dict[str, str]
+) -> str:
     lines = [
-        "🆕 <b>НОВАЯ ЗАЯВКА</b>",
-        f"№ {submission_id}",
+        f"✅ Заявка №{submission_id} принята",
         "",
-        f"<b>{html.escape(form['name'])}</b>",
-        "",
-        f"Клиент: {client}",
-        f"Telegram: {username}",
-        f"User ID: {user_id or '—'}",
+        str(form["name"]),
         "",
     ]
-    answers = session["answers"]
     for question in questions:
         value = answers.get(str(question["id"])) or "—"
-        lines.append(f"<b>{html.escape(question['label'])}:</b> {html.escape(value)}")
-    text = "\n".join(lines)
-    for admin_id in settings.admin_ids:
-        try:
-            await bot.send_message(admin_id, text)
-        except TelegramAPIError:
-            logger.exception("Не удалось отправить заявку %s администратору %s", submission_id, admin_id)
+        lines.append(f"{question['label']}: {value}")
+    lines.extend(
+        [
+            "",
+            "Спасибо! Заявка сохранена. Я свяжусь с вами в этом чате.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 async def render_admin_home() -> tuple[str, object]:
@@ -783,16 +769,13 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
     await _upsert_form_message(
         bot,
         session,
-        text=(
-            f"✅ Спасибо! Заявка №{submission_id} отправлена. "
-            "Я получил её и свяжусь с вами."
+        text=_submission_chat_text(
+            submission_id, form, questions, session["answers"]
         ),
         reply_markup=None,
     )
     await db.delete_form_session(callback.message.chat.id)
-
-    await notify_admins_about_submission(bot, submission_id, session, form, questions)
-    await callback.answer("Заявка отправлена")
+    await callback.answer("Заявка сохранена в этом чате")
 
 
 @router.message(Command("start", "admin"))
