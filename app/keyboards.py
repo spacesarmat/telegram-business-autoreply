@@ -111,6 +111,34 @@ def form_question_nav(required: bool, can_go_back: bool) -> InlineKeyboardMarkup
     return builder.as_markup()
 
 
+def guest_count_keyboard(question_id: int, *, required: bool, can_go_back: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    options = [
+        "до 50",
+        "от 50 до 100",
+        "от 100 до 150",
+        "от 150 до 250",
+        "от 250 до 400",
+        "более 400",
+    ]
+    for index, option in enumerate(options):
+        builder.row(
+            InlineKeyboardButton(
+                text=option, callback_data=f"guests:pick:{question_id}:{index}"
+            )
+        )
+    nav: list[InlineKeyboardButton] = []
+    if can_go_back:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data="form:back"))
+    if not required:
+        nav.append(InlineKeyboardButton(text="⏭ Пропустить", callback_data="form:skip"))
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:menu"))
+    builder.row(InlineKeyboardButton(text="❌ Отменить заявку", callback_data="form:cancel"))
+    return builder.as_markup()
+
+
 def form_confirmation(has_addons: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="✅ Отправить заявку", callback_data="form:submit"))
@@ -342,6 +370,9 @@ def admin_question_type(question_id: int) -> InlineKeyboardMarkup:
     builder.row(
         InlineKeyboardButton(text="🕐 Время", callback_data=f"adm:q_type:{question_id}:time"),
         InlineKeyboardButton(text="📱 Контакт", callback_data=f"adm:q_type:{question_id}:contact"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="👥 Гости", callback_data=f"adm:q_type:{question_id}:guest_count")
     )
     builder.row(
         InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:q:{question_id}")

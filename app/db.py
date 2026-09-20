@@ -94,7 +94,7 @@ DEFAULT_FORMS: list[dict[str, Any]] = [
         "questions": [
             ("Дата", "На какую дату планируется мероприятие?", True, "date"),
             ("Формат", "Какой формат мероприятия планируется?", True),
-            ("Количество гостей", "Сколько примерно будет гостей?", True),
+            ("Количество гостей", "Сколько примерно будет гостей?", True, "guest_count"),
             ("Место", "Где планируется мероприятие / какая площадка нужна?", False),
             ("Телефон", "Оставьте контактный телефон для связи.", True, "contact"),
             ("Комментарий", "Дополнительные пожелания или комментарий.", False),
@@ -119,7 +119,7 @@ DEFAULT_FORMS: list[dict[str, Any]] = [
             ("Дата", "На какую дату нужна аренда Фабрики?", True, "date"),
             ("Время начала", "Во сколько планируется начало?", True, "time"),
             ("Окончание", "До скольки планируется мероприятие?", True, "time"),
-            ("Количество гостей", "Сколько примерно будет гостей?", True),
+            ("Количество гостей", "Сколько примерно будет гостей?", True, "guest_count"),
             ("Формат", "Какой формат мероприятия планируется?", True),
             ("Телефон", "Оставьте контактный телефон для связи.", True, "contact"),
             ("Комментарий", "Дополнительные пожелания или комментарий.", False),
@@ -185,6 +185,8 @@ class Database:
             return "time"
         if normalized in {"телефон", "контакт", "контактный телефон"}:
             return "contact"
+        if normalized in {"количество гостей", "гостей", "число гостей"}:
+            return "guest_count"
         return "text"
 
     @asynccontextmanager
@@ -440,6 +442,12 @@ class Database:
             await db.execute(
                 "UPDATE form_questions SET input_type='time' "
                 "WHERE input_type='text' AND trim(label) IN ('Время', 'время', 'ВРЕМЯ', 'Время начала', 'время начала', 'Начало', 'начало')"
+            )
+            await db.execute(
+                "UPDATE form_questions SET input_type='guest_count' "
+                "WHERE input_type='text' AND trim(label) IN ("
+                "'Количество гостей', 'количество гостей', 'КОЛИЧЕСТВО ГОСТЕЙ', "
+                "'Число гостей', 'число гостей', 'Гостей', 'гостей')"
             )
 
             pricing_columns = {
@@ -994,7 +1002,7 @@ class Database:
     ) -> int:
         now = utc_now_iso()
         input_type = input_type or self.infer_question_input_type(label)
-        if input_type not in {"text", "date", "time", "contact"}:
+        if input_type not in {"text", "date", "time", "contact", "guest_count"}:
             input_type = "text"
         async with self.connection() as db:
             row = await (

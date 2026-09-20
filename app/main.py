@@ -47,6 +47,7 @@ from .keyboards import (
     form_addons,
     form_confirmation,
     form_question_nav,
+    guest_count_keyboard,
     public_menu,
     time_slots_keyboard,
 )
@@ -230,12 +231,49 @@ QUESTION_TYPE_NAMES = {
     "date": "📅 Дата",
     "time": "🕐 Время",
     "contact": "📱 Контакт",
+    "guest_count": "👥 Количество гостей",
 }
 
 
 def _question_input_type(question: dict) -> str:
     value = str(question.get("input_type") or "text")
     return value if value in QUESTION_TYPE_NAMES else "text"
+
+
+GUEST_COUNT_OPTIONS = (
+    "до 50",
+    "от 50 до 100",
+    "от 100 до 150",
+    "от 150 до 250",
+    "от 250 до 400",
+    "более 400",
+)
+
+
+def _normalize_guest_count_answer(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = " ".join(str(value).strip().casefold().split())
+    for option in GUEST_COUNT_OPTIONS:
+        if raw == option.casefold():
+            return option
+    match = re.fullmatch(r"(\d{1,5})(?:\s*(?:гост(?:ей|я|ь)|чел(?:овек)?\.?))?", raw)
+    if not match:
+        return None
+    count = int(match.group(1))
+    if count <= 0:
+        return None
+    if count < 50:
+        return GUEST_COUNT_OPTIONS[0]
+    if count < 100:
+        return GUEST_COUNT_OPTIONS[1]
+    if count < 150:
+        return GUEST_COUNT_OPTIONS[2]
+    if count < 250:
+        return GUEST_COUNT_OPTIONS[3]
+    if count <= 400:
+        return GUEST_COUNT_OPTIONS[4]
+    return GUEST_COUNT_OPTIONS[5]
 
 
 def _parse_date_answer(value: str | None) -> str | None:
@@ -961,6 +999,50 @@ async def _notify_submission_status_change(
         return False, str(exc)
 
 
+async def _notify_submission_amount_change(
+    bot: Bot, submission: dict, old_amount: int, new_amount: int
+) -> tuple[bool, str | None]:
+    """Notify the customer when an administrator manually changes the request total."""
+    chat_id = submission.get("chat_id")
+    if not chat_id:
+        return False, "у заявки нет chat_id"
+
+    business_connection_id = submission.get("business_connection_id")
+    if not business_connection_id:
+        connection = await db.latest_business_connection()
+        if connection and connection.get("enabled") and connection.get("can_reply"):
+            business_connection_id = connection.get("id")
+    if not business_connection_id:
+        return False, "не найдено Business-соединение"
+
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    prepayment = max(0, int(submission.get("prepayment_amount") or 0))
+    balance = max(0, new_amount - prepayment) if new_amount else 0
+    text = (
+        f"💵 Стоимость заявки №{submission.get('id')} изменена\n\n"
+        f"{submission.get('form_name') or 'Заявка'}\n"
+        f"Было: {_money_text(old_amount, currency)}\n"
+        f"Стало: {_money_text(new_amount, currency)}\n"
+        f"Предоплата: {_money_text(prepayment, currency)}\n"
+        f"Остаток: {_money_text(balance, currency)}\n\n"
+        "Если есть вопросы по стоимости, ответьте в этом чате."
+    )
+    try:
+        await bot.send_message(
+            chat_id=int(chat_id),
+            business_connection_id=str(business_connection_id),
+            text=text,
+            parse_mode=None,
+        )
+        return True, None
+    except TelegramAPIError as exc:
+        logger.exception(
+            "Не удалось уведомить клиента об изменении стоимости заявки %s",
+            submission.get("id"),
+        )
+        return False, str(exc)
+
+
 async def _submission_admin_text(submission: dict) -> str:
     full_name = " ".join(
         part for part in [submission.get("first_name"), submission.get("last_name")] if part
@@ -1372,6 +1454,25 @@ async def send_current_form_question(
         )
         return
 
+    if input_type == "guest_count":
+        text = (
+            f"📝 {form['name']}\n\n"
+            f"Вопрос {index + 1} из {len(questions)}\n"
+            f"{question['prompt']}{suffix}\n\n"
+            "Выберите диапазон количества гостей. Можно также ввести число вручную."
+        )
+        await _upsert_form_message(
+            bot,
+            session,
+            text=text,
+            reply_markup=guest_count_keyboard(
+                int(question["id"]),
+                required=bool(question["required"]),
+                can_go_back=index > 0,
+            ),
+        )
+        return
+
     if input_type == "contact":
         text = _contact_question_text(
             form,
@@ -1476,6 +1577,12 @@ async def handle_form_message(
                     ),
                     reply_markup=form_question_nav(bool(question["required"]), index > 0),
                 )
+            return True
+    elif input_type == "guest_count":
+        answer = _normalize_guest_count_answer(message.text)
+        if not answer:
+            await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+            await send_current_form_question(bot, message.chat.id)
             return True
     elif input_type == "date":
         answer = _parse_date_answer(message.text)
@@ -2084,6 +2191,47 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer(f"Окончание: {selected} (+1 день)")
     else:
         await callback.answer(f"Время: {selected}")
+
+
+@router.callback_query(F.data.startswith("guests:pick:"))
+async def guest_count_pick(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, _, question_raw, option_raw = (callback.data or "").split(":", 3)
+        question_id = int(question_raw)
+        option_index = int(option_raw)
+        selected = GUEST_COUNT_OPTIONS[option_index]
+    except (ValueError, TypeError, IndexError):
+        await callback.answer("Некорректный вариант", show_alert=True)
+        return
+
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    if session.get("status") != "active":
+        await callback.answer("Нет активного вопроса", show_alert=True)
+        return
+    questions = await db.list_form_questions(int(session["form_id"]))
+    index = int(session["current_index"])
+    if index < 0 or index >= len(questions):
+        await callback.answer("Нет активного вопроса", show_alert=True)
+        return
+    question = questions[index]
+    if int(question["id"]) != question_id or _question_input_type(question) != "guest_count":
+        await callback.answer("Эта кнопка уже неактивна", show_alert=True)
+        return
+
+    answers = dict(session["answers"])
+    answers[str(question["id"])] = selected
+    next_index = index + 1
+    await db.update_form_session(
+        callback.message.chat.id,
+        current_index=next_index,
+        answers=answers,
+        status="confirm" if next_index >= len(questions) else "active",
+        keyboard_question_id=0,
+    )
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer(f"Гости: {selected}")
 
 
 @router.callback_query(F.data == "form:menu")
@@ -3044,7 +3192,8 @@ async def admin_question_type_menu(callback: CallbackQuery) -> None:
             "⌨️ Текст — обычный ответ\n"
             "📅 Дата — календарь + проверка занятости\n"
             "🕐 Время — свободные интервалы кнопками + ручной ввод\n"
-            "📱 Контакт — ручной ввод телефона с проверкой; Telegram-контакт тоже принимается",
+            "📱 Контакт — ручной ввод телефона с проверкой; Telegram-контакт тоже принимается\n"
+            "👥 Гости — выбор диапазона количества гостей кнопками + ручной ввод числа",
             reply_markup=admin_question_type(question_id),
         )
     await callback.answer()
@@ -3061,7 +3210,7 @@ async def admin_question_type_set(callback: CallbackQuery) -> None:
     except (ValueError, TypeError):
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    if input_type not in {"text", "date", "time", "contact"}:
+    if input_type not in {"text", "date", "time", "contact", "guest_count"}:
         await callback.answer("Неизвестный тип", show_alert=True)
         return
     question = await db.get_form_question(question_id)
@@ -3938,7 +4087,7 @@ async def admin_request_note_start(callback: CallbackQuery, state: FSMContext) -
     await _start_submission_field_edit(callback, state, "note")
 
 
-async def _finish_submission_field_edit(message: Message, state: FSMContext, field: str) -> None:
+async def _finish_submission_field_edit(message: Message, state: FSMContext, bot: Bot, field: str) -> None:
     if not is_admin(message.from_user.id if message.from_user else None):
         return
     data = await state.get_data()
@@ -3965,6 +4114,7 @@ async def _finish_submission_field_edit(message: Message, state: FSMContext, fie
         if len(value) > 1500:
             await message.answer("Заметка слишком длинная. Максимум 1500 символов.")
             return
+    old_amount = int(submission.get("total_amount") or 0)
     await db.update_submission_crm_field(
         sid,
         field,
@@ -3978,23 +4128,34 @@ async def _finish_submission_field_edit(message: Message, state: FSMContext, fie
             await _submission_admin_text(updated),
             reply_markup=admin_submission_card(updated),
         )
+        if field == "total_amount" and old_amount != int(updated.get("total_amount") or 0):
+            notified, error = await _notify_submission_amount_change(
+                bot, updated, old_amount, int(updated.get("total_amount") or 0)
+            )
+            if notified:
+                await message.answer("✅ Стоимость обновлена. Клиент уведомлён в исходном чате.")
+            else:
+                reason = (error or "неизвестная ошибка")[:180]
+                await message.answer(
+                    f"⚠️ Стоимость обновлена, но клиент не уведомлён: {reason}"
+                )
     else:
         await message.answer("✅ Карточка заявки обновлена.")
 
 
 @router.message(AdminStates.submission_amount)
-async def admin_request_amount_save(message: Message, state: FSMContext) -> None:
-    await _finish_submission_field_edit(message, state, "total_amount")
+async def admin_request_amount_save(message: Message, state: FSMContext, bot: Bot) -> None:
+    await _finish_submission_field_edit(message, state, bot, "total_amount")
 
 
 @router.message(AdminStates.submission_prepayment)
-async def admin_request_prepayment_save(message: Message, state: FSMContext) -> None:
-    await _finish_submission_field_edit(message, state, "prepayment_amount")
+async def admin_request_prepayment_save(message: Message, state: FSMContext, bot: Bot) -> None:
+    await _finish_submission_field_edit(message, state, bot, "prepayment_amount")
 
 
 @router.message(AdminStates.submission_note)
-async def admin_request_note_save(message: Message, state: FSMContext) -> None:
-    await _finish_submission_field_edit(message, state, "internal_note")
+async def admin_request_note_save(message: Message, state: FSMContext, bot: Bot) -> None:
+    await _finish_submission_field_edit(message, state, bot, "internal_note")
 
 
 @router.callback_query(F.data.startswith("adm:req_history:"))

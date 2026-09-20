@@ -70,12 +70,12 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.7.0"
+  version: "1.7.1"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      Added configurable paid add-ons and technical booking buffers before/after rentals.
-      Selected services are included in automatic pricing, while buffers reserve setup and cleanup time.
+      Guest count is now selected from predefined ranges, and customers are notified
+      when an administrator manually changes the final request price.
     ru_RU: >
-      Добавлены настраиваемые дополнительные услуги и технические буферы до/после аренды.
-      Услуги входят в авторасчёт, а буферы резервируют время монтажа и уборки.
+      Количество гостей выбирается из готовых диапазонов, а при ручном изменении
+      итоговой стоимости администратором заказчик получает уведомление в исходном чате.
