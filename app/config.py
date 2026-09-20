@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -24,6 +25,7 @@ class Settings:
     database_path: str
     log_level: str
     status_port: int
+    timezone_name: str
 
 
 def load_settings() -> Settings:
@@ -35,10 +37,19 @@ def load_settings() -> Settings:
     if not admin_ids:
         raise RuntimeError("Не задан ADMIN_IDS")
 
+    timezone_name = os.getenv("TZ", "Europe/Moscow").strip() or "Europe/Moscow"
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(
+            f"Некорректный TZ: {timezone_name!r}. Используйте IANA-зону, например Europe/Moscow."
+        ) from exc
+
     return Settings(
         bot_token=bot_token,
         admin_ids=admin_ids,
         database_path=os.getenv("DATABASE_PATH", "/data/bot.db").strip() or "/data/bot.db",
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         status_port=int(os.getenv("STATUS_PORT", "8080")),
+        timezone_name=timezone_name,
     )

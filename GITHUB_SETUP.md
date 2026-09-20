@@ -29,3 +29,8 @@ After that, every push to `main` rebuilds `latest` for `linux/amd64` and `linux/
 - `docker/build-push-action@v7`
 
 Переменную `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` включать не требуется.
+
+
+## v1.5.2 — timezone
+
+Видимые даты и время используют IANA-часовой пояс из `TZ`; внутренние timestamps SQLite остаются UTC. Для Docker добавлена зависимость `tzdata`.

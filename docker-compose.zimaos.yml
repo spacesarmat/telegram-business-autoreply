@@ -70,10 +70,10 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.5.1"
+  version: "1.5.2"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      GitHub Actions updated to Node 24-compatible major versions for checkout and Docker build/publish actions.
+      User-visible dates and timestamps now use the configured business timezone from TZ, while UTC remains internal storage.
     ru_RU: >
-      GitHub Actions обновлены до major-версий с Node 24 для checkout и сборки/публикации Docker-образа.
+      Все видимые даты и время теперь отображаются в часовом поясе бизнеса из TZ; UTC используется только для внутреннего хранения.

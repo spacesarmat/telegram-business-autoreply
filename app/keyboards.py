@@ -404,7 +404,7 @@ def admin_submissions_list(submissions: list[dict], current_filter: str = "all")
     for item in submissions:
         status = str(item.get("status") or "new")
         icon = SUBMISSION_STATUS_LABELS.get(status, "•").split(" ", 1)[0]
-        created = str(item.get("created_at") or "")[:10]
+        created = str(item.get("created_at_local") or item.get("created_at") or "")[:10]
         builder.row(
             InlineKeyboardButton(
                 text=f"{icon} №{item['id']} · {str(item['form_name'])[:24]} · {created}",

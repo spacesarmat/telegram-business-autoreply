@@ -6,6 +6,7 @@ import html
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -49,12 +50,62 @@ from .status import start_status_server
 logger = logging.getLogger(__name__)
 
 settings: Settings = load_settings()
+APP_TIMEZONE = ZoneInfo(settings.timezone_name)
 db = Database(settings.database_path)
 router = Router(name="main")
 
 
 def is_admin(user_id: int | None) -> bool:
     return user_id is not None and user_id in settings.admin_ids
+
+
+def local_now() -> datetime:
+    """Current time in the configured business/account timezone."""
+    return datetime.now(APP_TIMEZONE)
+
+
+def local_today():
+    return local_now().date()
+
+
+def _as_local_datetime(value: str | None) -> datetime | None:
+    """Convert an ISO timestamp stored in UTC to the configured local timezone.
+
+    Old naive values are treated as UTC because all historical database writes in
+    this project used utc_now_iso().
+    """
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(APP_TIMEZONE)
+
+
+def _format_local_timestamp(value: str | None, *, with_seconds: bool = False) -> str:
+    parsed = _as_local_datetime(value)
+    if not parsed:
+        return "—"
+    fmt = "%d.%m.%Y %H:%M:%S" if with_seconds else "%d.%m.%Y %H:%M"
+    return parsed.strftime(fmt)
+
+
+def _localize_submission_dates(items: list[dict]) -> list[dict]:
+    result: list[dict] = []
+    for item in items:
+        copy = dict(item)
+        parsed = _as_local_datetime(copy.get("created_at"))
+        copy["created_at_local"] = parsed.strftime("%Y-%m-%d") if parsed else ""
+        result.append(copy)
+    return result
 
 
 async def get_autoresponder_enabled() -> bool:
@@ -584,7 +635,7 @@ async def _submission_admin_text(submission: dict) -> str:
     else:
         for key, value in answers.items():
             lines.append(f"<b>Поле {html.escape(str(key))}:</b> {html.escape(str(value))}")
-    lines.extend(["", f"Создана: {html.escape(str(submission.get('created_at') or '—'))}"])
+    lines.extend(["", f"Создана: {html.escape(_format_local_timestamp(submission.get('created_at')))} ({html.escape(settings.timezone_name)})"])
     return "\n".join(lines)
 
 
@@ -786,7 +837,7 @@ async def send_current_form_question(
         suffix += f"\n\nТекущий ответ: {existing}"
 
     if input_type == "date":
-        today = datetime.now().date()
+        today = local_today()
         selected = _date_from_answer(existing)
         year = calendar_year or (selected.year if selected else today.year)
         month = calendar_month or (selected.month if selected else today.month)
@@ -1124,7 +1175,8 @@ async def render_admin_home() -> tuple[str, object]:
         f"Кнопок в строке: {columns}\n"
         f"Фраз вызова меню: {trigger_count}\n"
         f"Business-соединение: {conn_text}\n"
-        f"Чистая форма: {clean_form_text}\n\n"
+        f"Чистая форма: {clean_form_text}\n"
+        f"Часовой пояс: {html.escape(settings.timezone_name)}\n\n"
         "Настройки меняются прямо здесь и сохраняются в SQLite."
     )
     return text, admin_main(enabled)
@@ -1417,7 +1469,7 @@ async def calendar_today(callback: CallbackQuery, bot: Bot) -> None:
     if not data or not isinstance(callback.message, Message):
         return
     session, question = data
-    today_date = datetime.now().date()
+    today_date = local_today()
     if await _date_fully_busy(today_date.isoformat()):
         await callback.answer("Сегодня дата полностью занята", show_alert=True)
         return
@@ -2635,7 +2687,7 @@ async def admin_requests(callback: CallbackQuery, state: FSMContext) -> None:
         "Нажмите заявку, чтобы открыть карточку и изменить статус."
     )
     if isinstance(callback.message, Message):
-        await callback.message.edit_text(text, reply_markup=admin_submissions_list(items, status_filter))
+        await callback.message.edit_text(text, reply_markup=admin_submissions_list(_localize_submission_dates(items), status_filter))
     await callback.answer()
 
 
@@ -2776,7 +2828,7 @@ async def admin_request_search_save(message: Message, state: FSMContext) -> None
         f"Запрос: <code>{html.escape(query)}</code>\n"
         f"Найдено: {len(items)}"
     )
-    await message.answer(text, reply_markup=admin_submissions_list(items, "all"))
+    await message.answer(text, reply_markup=admin_submissions_list(_localize_submission_dates(items), "all"))
 
 
 async def _start_submission_field_edit(callback: CallbackQuery, state: FSMContext, field: str) -> None:
@@ -2928,7 +2980,7 @@ async def admin_request_history(callback: CallbackQuery) -> None:
             event_value = SUBMISSION_STATUS_NAMES.get(event_value, event_value)
         lines.append(
             f"• {html.escape(name)}: {html.escape(event_value)} · "
-            f"{html.escape(str(event.get('created_at') or '')[:16])}"
+            f"{html.escape(_format_local_timestamp(event.get('created_at')))}"
         )
     if isinstance(callback.message, Message):
         await callback.message.edit_text(
@@ -3045,7 +3097,7 @@ async def admin_availability_open(callback: CallbackQuery, state: FSMContext) ->
         await callback.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
-    today_iso = datetime.now().date().isoformat()
+    today_iso = local_today().isoformat()
     blocks = await db.list_availability_blocks(start_date=today_iso, limit=30)
     text = (
         "<b>📅 Занятость</b>\n\n"
@@ -3121,7 +3173,7 @@ async def admin_availability_period_save(message: Message, state: FSMContext) ->
         await db.add_availability_block(date_iso, start_time, end_time, note=note)
     await state.clear()
     await message.answer("✅ Блокировка добавлена.")
-    blocks = await db.list_availability_blocks(start_date=datetime.now().date().isoformat(), limit=30)
+    blocks = await db.list_availability_blocks(start_date=local_today().isoformat(), limit=30)
     await message.answer("📅 Занятость:", reply_markup=admin_availability(blocks))
 
 
@@ -3140,7 +3192,7 @@ async def admin_availability_delete(callback: CallbackQuery) -> None:
         await db.delete_submission_availability(int(block["source_submission_id"]))
     else:
         await db.delete_availability_block(block_id)
-    blocks = await db.list_availability_blocks(start_date=datetime.now().date().isoformat(), limit=30)
+    blocks = await db.list_availability_blocks(start_date=local_today().isoformat(), limit=30)
     if isinstance(callback.message, Message):
         await callback.message.edit_reply_markup(reply_markup=admin_availability(blocks))
     await callback.answer("Удалено")
