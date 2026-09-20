@@ -275,7 +275,7 @@ class AdvancedService:
             except ValueError:
                 continue
             for block in blocks:
-                if not block.get("enabled") or int(block.get("weekday") or -1) != weekday:
+                if not block.get("enabled") or int(block.get("weekday") if block.get("weekday") is not None else -1) != weekday:
                     continue
                 bs, be = block.get("start_time"), block.get("end_time")
                 if not bs or not be:
@@ -292,7 +292,7 @@ class AdvancedService:
             except ValueError:
                 continue
             for block in blocks:
-                if not block.get("enabled") or int(block.get("weekday") or -1) != weekday:
+                if not block.get("enabled") or int(block.get("weekday") if block.get("weekday") is not None else -1) != weekday:
                     continue
                 bs, be = block.get("start_time"), block.get("end_time")
                 if not bs or not be:

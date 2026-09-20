@@ -699,30 +699,64 @@ async def _booking_interval_conflicts(
     return False
 
 
-async def _booking_interval_conflicts_for_form(
+async def _booking_interval_block_reason_for_form(
     form_id: int, interval: dict | None, *, exclude_submission_id: int | None = None
-) -> bool:
-    if interval and await advanced.booking_rule_violation(form_id, interval):
-        return True
+) -> str | None:
+    """Return a user-facing reason why a booking interval is unavailable.
+
+    v2.0.2 keeps booking rules, recurring blocks, technical buffers and actual
+    availability in one diagnostic path. This prevents the end-time keyboard
+    from labelling every disabled option as merely "busy" when the real
+    reason is a lead-time/minimum-duration/working-hours rule.
+    """
+    if not interval:
+        return None
+
+    rule_violation = await advanced.booking_rule_violation(form_id, interval)
+    if rule_violation:
+        return str(rule_violation)
+
     pricing = await db.get_form_pricing(form_id)
     before = int(pricing.get("buffer_before_minutes") or 0)
     after = int(pricing.get("buffer_after_minutes") or 0)
-    if interval:
-        buffered = _booking_interval_with_buffers(interval, before, after)
-        recurring_segments = (buffered or {}).get("technical_segments") or interval.get("segments") or []
-        if await advanced.recurring_violation(form_id, recurring_segments):
-            return True
-    return await _booking_interval_conflicts(
+    buffered = _booking_interval_with_buffers(interval, before, after)
+    recurring_segments = (buffered or {}).get("technical_segments") or interval.get("segments") or []
+    recurring_violation = await advanced.recurring_violation(form_id, recurring_segments)
+    if recurring_violation:
+        return str(recurring_violation)
+
+    if await _booking_interval_conflicts(
         interval,
         exclude_submission_id=exclude_submission_id,
         buffer_before_minutes=before,
         buffer_after_minutes=after,
-    )
+    ):
+        return "Интервал пересекается с существующей бронью, занятостью или техническим буфером."
+    return None
+
+
+async def _booking_interval_conflicts_for_form(
+    form_id: int, interval: dict | None, *, exclude_submission_id: int | None = None
+) -> bool:
+    return (
+        await _booking_interval_block_reason_for_form(
+            form_id, interval, exclude_submission_id=exclude_submission_id
+        )
+    ) is not None
+
+
+def _most_common_block_reason(reasons: dict[str, str]) -> str | None:
+    if not reasons:
+        return None
+    counts: dict[str, int] = {}
+    for reason in reasons.values():
+        counts[reason] = counts.get(reason, 0) + 1
+    return max(counts, key=counts.get)
 
 
 async def _booking_end_time_options(
     form_id: int, questions: list[dict], answers: dict[str, str]
-) -> tuple[list[tuple[str, str]], set[str]]:
+) -> tuple[list[tuple[str, str]], dict[str, str]]:
     start_time = _find_start_time(questions, answers)
     if not start_time:
         slots = await _booking_time_slots()
@@ -740,7 +774,7 @@ async def _booking_end_time_options(
     after = int(pricing.get("buffer_after_minutes") or 0)
 
     options: list[tuple[str, str]] = []
-    busy: set[str] = set()
+    blocked: dict[str, str] = {}
     end_question = next((q for q in questions if _is_end_time_question(q)), None)
     for offset in range(step, max_duration + 1, step):
         total = start_minutes + offset
@@ -752,11 +786,30 @@ async def _booking_end_time_options(
         if end_question:
             temp_answers = dict(answers)
             temp_answers[str(end_question["id"])] = value
-            if await _booking_interval_conflicts_for_form(
+            reason = await _booking_interval_block_reason_for_form(
                 form_id, _booking_interval(questions, temp_answers)
-            ):
-                busy.add(value)
-    return options, busy
+            )
+            if reason:
+                blocked[value] = reason
+    return options, blocked
+
+
+async def _start_time_unavailable_reason(
+    form_id: int, questions: list[dict], answers: dict[str, str]
+) -> str | None:
+    """Explain when a selected start time cannot lead to any valid end time.
+
+    This is intentionally evaluated before moving the user to the end-time
+    question, so the UI never presents a screen where every end button is ×.
+    """
+    if not any(_is_end_time_question(q) for q in questions):
+        return None
+    options, blocked = await _booking_end_time_options(form_id, questions, answers)
+    if not options:
+        return "Для этого времени начала нет допустимых вариантов окончания."
+    if any(value not in blocked for value, _ in options):
+        return None
+    return _most_common_block_reason(blocked) or "Для этого времени начала нет свободного окончания."
 
 
 def _booking_interval_summary(interval: dict | None) -> str | None:
@@ -1531,7 +1584,7 @@ async def send_current_form_question(
     if input_type == "time":
         date_iso = _selected_date_iso(questions, session["answers"])
         if _is_end_time_question(question):
-            options, busy_values = await _booking_end_time_options(int(form["id"]), questions, session["answers"])
+            options, blocked_reasons = await _booking_end_time_options(int(form["id"]), questions, session["answers"])
             start_time = _find_start_time(questions, session["answers"])
             text = (
                 f"📝 {form['name']}\n\n"
@@ -1547,7 +1600,14 @@ async def send_current_form_question(
             else:
                 text += "Сначала укажите время начала или введите окончание вручную в формате ЧЧ:ММ."
             if date_iso:
-                text += "\n× — этот интервал пересекается с уже занятой бронью."
+                text += "\n× — вариант недоступен. Нажмите на него, чтобы увидеть причину."
+            available_values = [value for value, _ in options if value not in blocked_reasons]
+            if options and not available_values:
+                reason = _most_common_block_reason(blocked_reasons)
+                text += "\n\n⚠️ Для выбранного времени начала сейчас нет доступного окончания."
+                if reason:
+                    text += f"\nПричина: {reason}"
+                text += "\nВернитесь назад и выберите другое время начала или дату."
             await _upsert_form_message(
                 bot,
                 session,
@@ -1555,7 +1615,7 @@ async def send_current_form_question(
                 reply_markup=end_time_slots_keyboard(
                     int(question["id"]),
                     options,
-                    busy_values,
+                    set(blocked_reasons),
                     required=bool(question["required"]),
                     can_go_back=index > 0,
                 ),
@@ -1852,9 +1912,24 @@ async def handle_form_message(
                     reply_markup=form_question_nav(bool(question["required"]), index > 0),
                 )
                 return True
-            if await _booking_interval_conflicts_for_form(int(session["form_id"]), interval):
+            reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval)
+            if reason:
                 await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
-                await send_current_form_question(bot, message.chat.id)
+                options, blocked = await _booking_end_time_options(
+                    int(session["form_id"]), questions, session["answers"]
+                )
+                await _upsert_form_message(
+                    bot,
+                    session,
+                    text=(
+                        f"⚠️ Это время окончания недоступно.\nПричина: {reason}\n\n"
+                        "Выберите другой вариант окончания."
+                    ),
+                    reply_markup=end_time_slots_keyboard(
+                        int(question["id"]), options, set(blocked),
+                        required=bool(question["required"]), can_go_back=index > 0,
+                    ),
+                )
                 return True
         else:
             date_iso = _selected_date_iso(questions, temp_answers)
@@ -1870,18 +1945,39 @@ async def handle_form_message(
                     await send_current_form_question(bot, message.chat.id)
                     return True
             elif date_iso:
-                try:
-                    step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
-                except ValueError:
-                    step = 60
-                end_minutes = _time_to_minutes(answer) + max(15, step)
-                end_time = f"{min(end_minutes, 24 * 60) // 60:02d}:{min(end_minutes, 24 * 60) % 60:02d}"
-                if end_minutes >= 24 * 60:
-                    end_time = "24:00"
-                if await db.booking_conflicts(date_iso, answer, end_time):
+                start_reason = await _start_time_unavailable_reason(
+                    int(session["form_id"]), questions, temp_answers
+                )
+                if start_reason:
                     await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
-                    await send_current_form_question(bot, message.chat.id)
+                    slots = await _booking_time_slots()
+                    busy_slots = await _busy_time_slots(date_iso, slots, int(session["form_id"]))
+                    await _upsert_form_message(
+                        bot,
+                        session,
+                        text=(
+                            f"⚠️ Для начала {answer} нет доступного окончания.\n"
+                            f"Причина: {start_reason}\n\nВыберите другое время начала."
+                        ),
+                        reply_markup=time_slots_keyboard(
+                            int(question["id"]), slots, busy_slots,
+                            required=bool(question["required"]), can_go_back=index > 0,
+                        ),
+                    )
                     return True
+                if not any(_is_end_time_question(q) for q in questions):
+                    try:
+                        step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
+                    except ValueError:
+                        step = 60
+                    end_minutes = _time_to_minutes(answer) + max(15, step)
+                    end_time = f"{min(end_minutes, 24 * 60) // 60:02d}:{min(end_minutes, 24 * 60) % 60:02d}"
+                    if end_minutes >= 24 * 60:
+                        end_time = "24:00"
+                    if await db.booking_conflicts(date_iso, answer, end_time):
+                        await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+                        await send_current_form_question(bot, message.chat.id)
+                        return True
     else:
         answer = _message_answer_text(message)
 
@@ -2488,7 +2584,28 @@ async def _time_session_question(callback: CallbackQuery, question_id: int) -> t
 
 @router.callback_query(F.data.startswith("time:busy:"))
 async def time_busy(callback: CallbackQuery) -> None:
-    await callback.answer("Это время уже занято. Выберите другой вариант.", show_alert=True)
+    try:
+        _, _, question_raw, compact = (callback.data or "").split(":", 3)
+        question_id = int(question_raw)
+        if len(compact) != 4 or not compact.isdigit():
+            raise ValueError
+        selected = _parse_time_answer(f"{compact[:2]}:{compact[2:]}")
+        if not selected:
+            raise ValueError
+    except (ValueError, TypeError):
+        await callback.answer("Этот вариант недоступен.", show_alert=True)
+        return
+
+    data = await _time_session_question(callback, question_id)
+    if not data:
+        await callback.answer("Этот вариант недоступен.", show_alert=True)
+        return
+    session, question, questions = data
+    answers = dict(session["answers"])
+    answers[str(question["id"])] = selected
+    interval = _booking_interval(questions, answers)
+    reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval)
+    await callback.answer(reason or "Этот вариант времени недоступен.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("time:pick:"))
@@ -2519,8 +2636,9 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
                 f"Максимальный интервал — {max_duration // 60} ч.", show_alert=True
             )
             return
-        if await _booking_interval_conflicts_for_form(int(session["form_id"]), interval):
-            await callback.answer("Этот интервал пересекается с занятой бронью", show_alert=True)
+        reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval)
+        if reason:
+            await callback.answer(reason, show_alert=True)
             await send_current_form_question(bot, callback.message.chat.id)
             return
     else:
@@ -2533,21 +2651,32 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
                     f"Максимальный интервал — {max_duration // 60} ч.", show_alert=True
                 )
                 return
-            if await _booking_interval_conflicts_for_form(int(session["form_id"]), interval):
-                await callback.answer("Этот интервал пересекается с занятой бронью", show_alert=True)
+            reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval)
+            if reason:
+                await callback.answer(reason, show_alert=True)
                 await send_current_form_question(bot, callback.message.chat.id)
                 return
         elif date_iso:
-            try:
-                step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
-            except ValueError:
-                step = 60
-            end_minutes = _time_to_minutes(selected) + max(15, step)
-            end_time = "24:00" if end_minutes >= 24 * 60 else _minutes_to_time(end_minutes)
-            if await db.booking_conflicts(date_iso, selected, end_time):
-                await callback.answer("Это время уже занято", show_alert=True)
-                await send_current_form_question(bot, callback.message.chat.id)
+            start_reason = await _start_time_unavailable_reason(
+                int(session["form_id"]), questions, answers
+            )
+            if start_reason:
+                await callback.answer(
+                    f"Для начала {selected} нет доступного окончания. {start_reason}",
+                    show_alert=True,
+                )
                 return
+            if not any(_is_end_time_question(q) for q in questions):
+                try:
+                    step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
+                except ValueError:
+                    step = 60
+                end_minutes = _time_to_minutes(selected) + max(15, step)
+                end_time = "24:00" if end_minutes >= 24 * 60 else _minutes_to_time(end_minutes)
+                if await db.booking_conflicts(date_iso, selected, end_time):
+                    await callback.answer("Это время уже занято", show_alert=True)
+                    await send_current_form_question(bot, callback.message.chat.id)
+                    return
     next_index = int(session["current_index"]) + 1
     await db.update_form_session(
         callback.message.chat.id,
