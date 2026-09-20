@@ -87,6 +87,19 @@ DEFAULT_BUTTONS = [
     ),
 ]
 
+
+FACTORY_FORMAT_OPTIONS = [
+    "🎧 Рейв / клубная вечеринка",
+    "🎂 День рождения",
+    "🥂 Корпоратив",
+    "💍 Свадьба / банкет",
+    "🎤 Концерт / выступление",
+    "📸 Съёмка / контент",
+    "🎓 Выпускной",
+    "🔒 Закрытое мероприятие",
+    "✨ Другое",
+]
+
 DEFAULT_FORMS: list[dict[str, Any]] = [
     {
         "button_title": "Заказать мероприятие",
@@ -120,7 +133,7 @@ DEFAULT_FORMS: list[dict[str, Any]] = [
             ("Время начала", "Во сколько планируется начало?", True, "time"),
             ("Окончание", "До скольки планируется мероприятие?", True, "time"),
             ("Количество гостей", "Сколько примерно будет гостей?", True, "guest_count"),
-            ("Формат", "Какой формат мероприятия планируется?", True),
+            ("Формат", "Какой формат мероприятия планируется?", True, "choice", FACTORY_FORMAT_OPTIONS),
             ("Телефон", "Оставьте контактный телефон для связи.", True, "contact"),
             ("Комментарий", "Дополнительные пожелания или комментарий.", False),
         ],
@@ -283,6 +296,7 @@ class Database:
                     position INTEGER NOT NULL DEFAULT 100,
                     required INTEGER NOT NULL DEFAULT 1,
                     input_type TEXT NOT NULL DEFAULT 'text',
+                    choice_options_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE CASCADE
@@ -301,6 +315,7 @@ class Database:
                     form_id INTEGER NOT NULL,
                     form_message_id INTEGER,
                     keyboard_question_id INTEGER NOT NULL DEFAULT 0,
+                    custom_choice_question_id INTEGER NOT NULL DEFAULT 0,
                     current_index INTEGER NOT NULL DEFAULT 0,
                     answers_json TEXT NOT NULL DEFAULT '{}',
                     selected_addons_json TEXT NOT NULL DEFAULT '[]',
@@ -394,6 +409,10 @@ class Database:
                 await db.execute(
                     "ALTER TABLE form_sessions ADD COLUMN addons_confirmed INTEGER NOT NULL DEFAULT 0"
                 )
+            if "custom_choice_question_id" not in session_columns:
+                await db.execute(
+                    "ALTER TABLE form_sessions ADD COLUMN custom_choice_question_id INTEGER NOT NULL DEFAULT 0"
+                )
 
             question_columns = {
                 row["name"]
@@ -402,6 +421,10 @@ class Database:
             if "input_type" not in question_columns:
                 await db.execute(
                     "ALTER TABLE form_questions ADD COLUMN input_type TEXT NOT NULL DEFAULT 'text'"
+                )
+            if "choice_options_json" not in question_columns:
+                await db.execute(
+                    "ALTER TABLE form_questions ADD COLUMN choice_options_json TEXT NOT NULL DEFAULT '[]'"
                 )
                 await db.execute(
                     "UPDATE form_questions SET input_type='date' WHERE trim(label) IN ('Дата', 'дата', 'ДАТА')"
@@ -449,6 +472,26 @@ class Database:
                 "'Количество гостей', 'количество гостей', 'КОЛИЧЕСТВО ГОСТЕЙ', "
                 "'Число гостей', 'число гостей', 'Гостей', 'гостей')"
             )
+
+            # v1.8.1: формат стандартной формы «Аренда Фабрики» — выбор кнопками.
+            migrated_factory_format = await (
+                await db.execute("SELECT value FROM settings WHERE key='factory_format_choice_v181'")
+            ).fetchone()
+            if not migrated_factory_format:
+                factory_forms = await (
+                    await db.execute("SELECT id FROM forms WHERE trim(name)='Аренда Фабрики'")
+                ).fetchall()
+                options_json = json.dumps(FACTORY_FORMAT_OPTIONS, ensure_ascii=False)
+                for factory_form in factory_forms:
+                    await db.execute(
+                        "UPDATE form_questions SET input_type='choice', choice_options_json=?, updated_at=? "
+                        "WHERE form_id=? AND trim(label)='Формат' "
+                        "AND trim(prompt)='Какой формат мероприятия планируется?'",
+                        (options_json, utc_now_iso(), int(factory_form["id"])),
+                    )
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings(key, value) VALUES('factory_format_choice_v181', '1')"
+                )
 
             pricing_columns = {
                 row["name"]
@@ -597,7 +640,10 @@ class Database:
             )
             form_id = int(cur.lastrowid)
             for position, question_def in enumerate(form_def["questions"], start=1):
-                if len(question_def) == 4:
+                choice_options: list[str] = []
+                if len(question_def) == 5:
+                    label, prompt, required, input_type, choice_options = question_def
+                elif len(question_def) == 4:
                     label, prompt, required, input_type = question_def
                 else:
                     label, prompt, required = question_def
@@ -605,12 +651,13 @@ class Database:
                 await db.execute(
                     """
                     INSERT INTO form_questions(
-                        form_id, label, prompt, position, required, input_type, created_at, updated_at
+                        form_id, label, prompt, position, required, input_type, choice_options_json, created_at, updated_at
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        form_id, label, prompt, position, int(required), str(input_type), now, now
+                        form_id, label, prompt, position, int(required), str(input_type),
+                        json.dumps(choice_options, ensure_ascii=False), now, now
                     ),
                 )
             await db.execute(
@@ -983,14 +1030,31 @@ class Database:
                     (form_id,),
                 )
             ).fetchall()
-            return [dict(row) for row in rows]
+            result = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    raw = json.loads(item.get("choice_options_json") or "[]")
+                    item["choice_options"] = [str(x) for x in raw if str(x).strip()] if isinstance(raw, list) else []
+                except (TypeError, json.JSONDecodeError):
+                    item["choice_options"] = []
+                result.append(item)
+            return result
 
     async def get_form_question(self, question_id: int) -> dict[str, Any] | None:
         async with self.connection() as db:
             row = await (
                 await db.execute("SELECT * FROM form_questions WHERE id=?", (question_id,))
             ).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            item = dict(row)
+            try:
+                raw = json.loads(item.get("choice_options_json") or "[]")
+                item["choice_options"] = [str(x) for x in raw if str(x).strip()] if isinstance(raw, list) else []
+            except (TypeError, json.JSONDecodeError):
+                item["choice_options"] = []
+            return item
 
     async def add_form_question(
         self,
@@ -999,11 +1063,13 @@ class Database:
         prompt: str,
         required: bool = True,
         input_type: str | None = None,
+        choice_options: list[str] | None = None,
     ) -> int:
         now = utc_now_iso()
         input_type = input_type or self.infer_question_input_type(label)
-        if input_type not in {"text", "date", "time", "contact", "guest_count"}:
+        if input_type not in {"text", "date", "time", "contact", "guest_count", "choice"}:
             input_type = "text"
+        choice_options = [str(x).strip() for x in (choice_options or []) if str(x).strip()][:20]
         async with self.connection() as db:
             row = await (
                 await db.execute(
@@ -1014,19 +1080,20 @@ class Database:
             cur = await db.execute(
                 """
                 INSERT INTO form_questions(
-                    form_id, label, prompt, position, required, input_type, created_at, updated_at
+                    form_id, label, prompt, position, required, input_type, choice_options_json, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    form_id, label, prompt, int(row["p"]), int(required), input_type, now, now
+                    form_id, label, prompt, int(row["p"]), int(required), input_type,
+                    json.dumps(choice_options, ensure_ascii=False), now, now
                 ),
             )
             await db.commit()
             return int(cur.lastrowid)
 
     async def update_form_question_field(self, question_id: int, field: str, value: Any) -> None:
-        if field not in {"label", "prompt", "position", "required", "input_type"}:
+        if field not in {"label", "prompt", "position", "required", "input_type", "choice_options_json"}:
             raise ValueError("Unsupported question field")
         async with self.connection() as db:
             await db.execute(
@@ -1034,6 +1101,23 @@ class Database:
                 (value, utc_now_iso(), question_id),
             )
             await db.commit()
+
+
+    async def update_form_question_options(self, question_id: int, options: list[str]) -> None:
+        clean: list[str] = []
+        seen: set[str] = set()
+        for value in options:
+            item = " ".join(str(value).strip().split())
+            key = item.casefold()
+            if not item or key in seen:
+                continue
+            seen.add(key)
+            clean.append(item[:80])
+            if len(clean) >= 20:
+                break
+        await self.update_form_question_field(
+            question_id, "choice_options_json", json.dumps(clean, ensure_ascii=False)
+        )
 
     async def delete_form_question(self, question_id: int) -> None:
         async with self.connection() as db:
@@ -1085,14 +1169,15 @@ class Database:
             await db.execute(
                 """
                 INSERT INTO form_sessions(
-                    chat_id, business_connection_id, form_id, form_message_id, keyboard_question_id, current_index, answers_json,
+                    chat_id, business_connection_id, form_id, form_message_id, keyboard_question_id, custom_choice_question_id, current_index, answers_json,
                     selected_addons_json, addons_confirmed, status, user_id, username, first_name, last_name, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, 0, 0, '{}', '[]', 0, 'active', ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, 0, 0, 0, '{}', '[]', 0, 'active', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     business_connection_id=excluded.business_connection_id,
                     form_id=excluded.form_id,
                     form_message_id=excluded.form_message_id,
                     keyboard_question_id=0,
+                    custom_choice_question_id=0,
                     current_index=0,
                     answers_json='{}',
                     selected_addons_json='[]',
@@ -1142,6 +1227,7 @@ class Database:
         business_connection_id: str | None = None,
         form_message_id: int | None = None,
         keyboard_question_id: int | None = None,
+        custom_choice_question_id: int | None = None,
         selected_addon_ids: list[int] | None = None,
         addons_confirmed: bool | int | None = None,
     ) -> None:
@@ -1165,6 +1251,9 @@ class Database:
         if keyboard_question_id is not None:
             fields.append("keyboard_question_id=?")
             values.append(keyboard_question_id)
+        if custom_choice_question_id is not None:
+            fields.append("custom_choice_question_id=?")
+            values.append(custom_choice_question_id)
         if selected_addon_ids is not None:
             fields.append("selected_addons_json=?")
             values.append(json.dumps([int(x) for x in selected_addon_ids], ensure_ascii=False))

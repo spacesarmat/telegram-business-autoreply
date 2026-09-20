@@ -34,6 +34,7 @@ QUESTION_TYPES = {
     "time": "🕐 Время",
     "contact": "📱 Контакт",
     "guest_count": "👥 Гости",
+    "choice": "🎛 Варианты",
 }
 
 StatusChangeCallback = Callable[[int, str], Awaitable[tuple[bool, str]]]
@@ -475,8 +476,26 @@ class WebAdmin:
         qs = await self.db.list_form_questions(fid)
         rows = ""
         for q in qs:
-            types = "".join(f'<option value="{k}" {"selected" if q.get("input_type") == k else ""}>{_e(v)}</option>' for k, v in QUESTION_TYPES.items())
-            rows += f'''<tr><td colspan="5"><form method="post" action="/admin/forms/{fid}/question/{int(q['id'])}"><div class="row3"><div class="field"><label>Поле</label><input name="label" value="{_e(q['label'])}"></div><div class="field"><label>Тип</label><select name="input_type">{types}</select></div><div class="field"><label>Позиция</label><input name="position" value="{int(q['position'])}"></div></div><div class="field"><label>Вопрос</label><input name="prompt" value="{_e(q['prompt'])}"></div><label><input style="width:auto" type="checkbox" name="required" value="1" {'checked' if q['required'] else ''}> обязательный</label> <button class="btn">Сохранить</button></form></td></tr>'''
+            types = "".join(
+                f'<option value="{k}" {"selected" if q.get("input_type") == k else ""}>{_e(v)}</option>'
+                for k, v in QUESTION_TYPES.items()
+            )
+            choice_values = "\n".join(str(x) for x in (q.get("choice_options") or []))
+            choice_editor = (
+                f'<div class="field"><label>Варианты кнопок — по одному на строку</label>'
+                f'<textarea name="choice_options" placeholder="Вариант 1\nВариант 2\n✨ Другое">{_e(choice_values)}</textarea>'
+                f'<div class="muted">Для типа «🎛 Варианты». Если есть «Другое», бот попросит клиента описать свой вариант.</div></div>'
+            )
+            rows += (
+                f'<tr><td colspan="5"><form method="post" action="/admin/forms/{fid}/question/{int(q["id"])}">'
+                f'<div class="row3"><div class="field"><label>Поле</label><input name="label" value="{_e(q["label"])}"></div>'
+                f'<div class="field"><label>Тип</label><select name="input_type">{types}</select></div>'
+                f'<div class="field"><label>Позиция</label><input name="position" value="{int(q["position"])}"></div></div>'
+                f'<div class="field"><label>Вопрос</label><input name="prompt" value="{_e(q["prompt"])}"></div>'
+                f'{choice_editor}'
+                f'<label><input style="width:auto" type="checkbox" name="required" value="1" {"checked" if q["required"] else ""}> обязательный</label> '
+                f'<button class="btn">Сохранить</button></form></td></tr>'
+            )
         content = f"""<div class="card"><form method="post" action="/admin/forms/{fid}"><div class="row"><div class="field"><label>Название</label><input name="name" value="{_e(form['name'])}"></div><div class="field"><label>Статус</label><select name="enabled"><option value="1" {'selected' if form['enabled'] else ''}>Включена</option><option value="0" {'selected' if not form['enabled'] else ''}>Выключена</option></select></div></div><button class="btn primary">Сохранить форму</button></form></div><div class="section"><h2>Вопросы</h2><div class="table-wrap"><table><tbody>{rows or '<tr><td class="muted">Вопросов нет</td></tr>'}</tbody></table></div><div class="card section"><form method="post" action="/admin/forms/{fid}/question"><div class="row"><div class="field"><label>Название поля</label><input name="label" required></div><div class="field"><label>Текст вопроса</label><input name="prompt" required></div></div><button class="btn">Добавить вопрос</button></form></div></div>"""
         return self.page(request, f"Форма: {form['name']}", content, active="forms")
 
@@ -507,10 +526,21 @@ class WebAdmin:
         prompt = str(data.get("prompt") or "").strip()[:500]
         qtype = str(data.get("input_type") or "text")
         pos = _parse_int(str(data.get("position") or ""), minimum=1, maximum=9999)
+        raw_options = str(data.get("choice_options") or "")
+        options = [" ".join(line.strip().split()) for line in raw_options.splitlines() if line.strip()]
         if not label or not prompt or qtype not in QUESTION_TYPES or pos is None:
             raise web.HTTPFound(f"/admin/forms/{fid}?err=" + quote("Проверьте вопрос"))
-        for field, value in {"label": label, "prompt": prompt, "input_type": qtype, "position": pos, "required": 1 if data.get("required") else 0}.items():
+        if qtype == "choice" and not (2 <= len(options) <= 20):
+            raise web.HTTPFound(
+                f"/admin/forms/{fid}?err=" + quote("Для типа «Варианты» укажите от 2 до 20 кнопок")
+            )
+        for field, value in {
+            "label": label, "prompt": prompt, "input_type": qtype, "position": pos,
+            "required": 1 if data.get("required") else 0,
+        }.items():
             await self.db.update_form_question_field(qid, field, value)
+        if qtype == "choice":
+            await self.db.update_form_question_options(qid, options)
         raise web.HTTPFound(f"/admin/forms/{fid}?ok=" + quote("Вопрос сохранён"))
 
     async def buttons(self, request: web.Request) -> web.Response:

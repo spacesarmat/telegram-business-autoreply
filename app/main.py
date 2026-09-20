@@ -42,6 +42,8 @@ from .keyboards import (
     admin_status_templates,
     admin_submissions_list,
     calendar_keyboard,
+    choice_custom_keyboard,
+    choice_keyboard,
     delete_confirm,
     end_time_slots_keyboard,
     form_addons,
@@ -232,6 +234,7 @@ QUESTION_TYPE_NAMES = {
     "time": "🕐 Время",
     "contact": "📱 Контакт",
     "guest_count": "👥 Количество гостей",
+    "choice": "🎛 Выбор из вариантов",
 }
 
 
@@ -274,6 +277,20 @@ def _normalize_guest_count_answer(value: str | None) -> str | None:
     if count <= 400:
         return GUEST_COUNT_OPTIONS[4]
     return GUEST_COUNT_OPTIONS[5]
+
+
+def _choice_is_other(value: str | None) -> bool:
+    return bool(value and "другое" in str(value).casefold())
+
+
+def _match_choice_option(question: dict, value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = " ".join(str(value).strip().casefold().split())
+    for option in question.get("choice_options") or []:
+        if raw == " ".join(str(option).strip().casefold().split()):
+            return str(option)
+    return None
 
 
 def _parse_date_answer(value: str | None) -> str | None:
@@ -1473,6 +1490,40 @@ async def send_current_form_question(
         )
         return
 
+    if input_type == "choice":
+        options = [str(x) for x in (question.get("choice_options") or []) if str(x).strip()]
+        if int(session.get("custom_choice_question_id") or 0) == int(question["id"]):
+            text = (
+                f"📝 {form['name']}\n\n"
+                f"Вопрос {index + 1} из {len(questions)}\n"
+                f"{question['prompt']}{suffix}\n\n"
+                "✨ Вы выбрали «Другое». Опишите формат мероприятия одним сообщением."
+            )
+            await _upsert_form_message(
+                bot, session, text=text,
+                reply_markup=choice_custom_keyboard(
+                    int(question["id"]),
+                    required=bool(question["required"]), can_go_back=index > 0,
+                ),
+            )
+            return
+        text = (
+            f"📝 {form['name']}\n\n"
+            f"Вопрос {index + 1} из {len(questions)}\n"
+            f"{question['prompt']}{suffix}\n\n"
+        )
+        if options:
+            text += "Выберите подходящий вариант кнопкой."
+            markup = choice_keyboard(
+                int(question["id"]), options,
+                required=bool(question["required"]), can_go_back=index > 0,
+            )
+        else:
+            text += "Варианты пока не настроены. Введите ответ вручную."
+            markup = form_question_nav(bool(question["required"]), index > 0)
+        await _upsert_form_message(bot, session, text=text, reply_markup=markup)
+        return
+
     if input_type == "contact":
         text = _contact_question_text(
             form,
@@ -1578,6 +1629,31 @@ async def handle_form_message(
                     reply_markup=form_question_nav(bool(question["required"]), index > 0),
                 )
             return True
+    elif input_type == "choice":
+        options = [str(x) for x in (question.get("choice_options") or []) if str(x).strip()]
+        if int(session.get("custom_choice_question_id") or 0) == int(question["id"]):
+            custom_text = (message.text or "").strip()
+            if not custom_text:
+                await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+                await send_current_form_question(bot, message.chat.id)
+                return True
+            answer = f"Другое: {custom_text}"
+        elif options:
+            matched = _match_choice_option(question, message.text)
+            if not matched:
+                await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+                await send_current_form_question(bot, message.chat.id)
+                return True
+            if _choice_is_other(matched):
+                await db.update_form_session(
+                    message.chat.id, custom_choice_question_id=int(question["id"])
+                )
+                await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+                await send_current_form_question(bot, message.chat.id)
+                return True
+            answer = matched
+        else:
+            answer = _message_answer_text(message)
     elif input_type == "guest_count":
         answer = _normalize_guest_count_answer(message.text)
         if not answer:
@@ -1678,6 +1754,7 @@ async def handle_form_message(
         answers=answers,
         status="confirm" if next_index >= len(questions) else "active",
         keyboard_question_id=0,
+        custom_choice_question_id=0,
     )
     await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
     await send_current_form_question(bot, message.chat.id)
@@ -2193,6 +2270,80 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer(f"Время: {selected}")
 
 
+@router.callback_query(F.data.startswith("choice:options:"))
+async def choice_back_to_options(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        question_id = int((callback.data or "").rsplit(":", 1)[1])
+    except (ValueError, TypeError):
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    questions = await db.list_form_questions(int(session["form_id"]))
+    index = int(session["current_index"])
+    if index < 0 or index >= len(questions) or int(questions[index]["id"]) != question_id:
+        await callback.answer("Эта кнопка уже неактивна", show_alert=True)
+        return
+    await db.update_form_session(callback.message.chat.id, custom_choice_question_id=0)
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer("Выберите вариант")
+
+
+@router.callback_query(F.data.startswith("choice:pick:"))
+async def choice_pick(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, _, question_raw, option_raw = (callback.data or "").split(":", 3)
+        question_id = int(question_raw)
+        option_index = int(option_raw)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректный вариант", show_alert=True)
+        return
+
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    if session.get("status") != "active":
+        await callback.answer("Нет активного вопроса", show_alert=True)
+        return
+    questions = await db.list_form_questions(int(session["form_id"]))
+    index = int(session["current_index"])
+    if index < 0 or index >= len(questions):
+        await callback.answer("Нет активного вопроса", show_alert=True)
+        return
+    question = questions[index]
+    if int(question["id"]) != question_id or _question_input_type(question) != "choice":
+        await callback.answer("Эта кнопка уже неактивна", show_alert=True)
+        return
+    options = [str(x) for x in (question.get("choice_options") or []) if str(x).strip()]
+    if option_index < 0 or option_index >= len(options):
+        await callback.answer("Вариант больше недоступен", show_alert=True)
+        await send_current_form_question(bot, callback.message.chat.id)
+        return
+    selected = options[option_index]
+    if _choice_is_other(selected):
+        await db.update_form_session(
+            callback.message.chat.id, custom_choice_question_id=int(question["id"])
+        )
+        await send_current_form_question(bot, callback.message.chat.id)
+        await callback.answer("Опишите свой вариант")
+        return
+
+    answers = dict(session["answers"])
+    answers[str(question["id"])] = selected
+    next_index = index + 1
+    await db.update_form_session(
+        callback.message.chat.id,
+        current_index=next_index,
+        answers=answers,
+        status="confirm" if next_index >= len(questions) else "active",
+        keyboard_question_id=0,
+        custom_choice_question_id=0,
+    )
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer(f"Выбрано: {selected}")
+
+
 @router.callback_query(F.data.startswith("guests:pick:"))
 async def guest_count_pick(callback: CallbackQuery, bot: Bot) -> None:
     try:
@@ -2295,6 +2446,7 @@ async def form_skip(callback: CallbackQuery, bot: Bot) -> None:
         answers=answers,
         status="confirm" if next_index >= len(questions) else "active",
         keyboard_question_id=0,
+        custom_choice_question_id=0,
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer("Пропущено")
@@ -2382,7 +2534,7 @@ async def form_back(callback: CallbackQuery, bot: Bot) -> None:
         return
     await db.update_form_session(
         callback.message.chat.id, current_index=target, status="active", keyboard_question_id=0,
-        addons_confirmed=False
+        custom_choice_question_id=0, addons_confirmed=False
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer()
@@ -3089,13 +3241,19 @@ async def admin_question_add_prompt(message: Message, state: FSMContext) -> None
 def _admin_question_text(question: dict) -> str:
     required = "да" if question["required"] else "нет"
     type_name = QUESTION_TYPE_NAMES.get(_question_input_type(question), "⌨️ Текст")
-    return (
+    text = (
         f"<b>{html.escape(question['label'])}</b>\n\n"
         f"Позиция: {question['position']}\n"
         f"Обязательный: {required}\n"
         f"Тип поля: {type_name}\n\n"
         f"<b>Вопрос пользователю:</b>\n{html.escape(question['prompt'])}"
     )
+    if _question_input_type(question) == "choice":
+        options = question.get("choice_options") or []
+        text += "\n\n<b>Варианты:</b>\n" + (
+            "\n".join(f"• {html.escape(str(x))}" for x in options) if options else "— не настроены"
+        )
+    return text
 
 
 @router.callback_query(F.data.startswith("adm:q:"))
@@ -3193,7 +3351,8 @@ async def admin_question_type_menu(callback: CallbackQuery) -> None:
             "📅 Дата — календарь + проверка занятости\n"
             "🕐 Время — свободные интервалы кнопками + ручной ввод\n"
             "📱 Контакт — ручной ввод телефона с проверкой; Telegram-контакт тоже принимается\n"
-            "👥 Гости — выбор диапазона количества гостей кнопками + ручной ввод числа",
+            "👥 Гости — выбор диапазона количества гостей кнопками + ручной ввод числа\n"
+            "🎛 Варианты — настраиваемые кнопки; «Другое» включает ручной ввод",
             reply_markup=admin_question_type(question_id),
         )
     await callback.answer()
@@ -3210,7 +3369,7 @@ async def admin_question_type_set(callback: CallbackQuery) -> None:
     except (ValueError, TypeError):
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    if input_type not in {"text", "date", "time", "contact", "guest_count"}:
+    if input_type not in {"text", "date", "time", "contact", "guest_count", "choice"}:
         await callback.answer("Неизвестный тип", show_alert=True)
         return
     question = await db.get_form_question(question_id)
@@ -3224,6 +3383,52 @@ async def admin_question_type_set(callback: CallbackQuery) -> None:
             _admin_question_text(question), reply_markup=admin_question_edit(question)
         )
     await callback.answer("Тип поля сохранён")
+
+
+@router.callback_query(F.data.startswith("adm:q_options:"))
+async def admin_question_options(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    question_id = int((callback.data or "").rsplit(":", 1)[1])
+    question = await db.get_form_question(question_id)
+    if not question:
+        await callback.answer("Вопрос не найден", show_alert=True)
+        return
+    await state.update_data(question_id=question_id)
+    await state.set_state(AdminStates.question_edit_options)
+    current = "\n".join(question.get("choice_options") or [])
+    text = (
+        "Отправьте варианты кнопок — каждый с новой строки (до 20).\n\n"
+        "Если среди вариантов есть «Другое», после его выбора бот попросит пользователя описать свой вариант.\n\n"
+        f"Текущие варианты:\n{current or '—'}"
+    )
+    if isinstance(callback.message, Message):
+        await callback.message.answer(text)
+    await callback.answer()
+
+
+@router.message(AdminStates.question_edit_options)
+async def admin_question_options_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    raw = message.text or ""
+    options = [" ".join(line.strip().split()) for line in raw.splitlines() if line.strip()]
+    if len(options) < 2:
+        await message.answer("Нужно минимум 2 варианта, каждый с новой строки.")
+        return
+    if len(options) > 20:
+        await message.answer("Можно указать максимум 20 вариантов.")
+        return
+    data = await state.get_data()
+    question_id = int(data["question_id"])
+    await db.update_form_question_options(question_id, options)
+    await db.update_form_question_field(question_id, "input_type", "choice")
+    await state.clear()
+    question = await db.get_form_question(question_id)
+    await message.answer(
+        "Варианты сохранены.", reply_markup=admin_question_edit(question)
+    )
 
 
 @router.callback_query(F.data.startswith("adm:q_pos:"))

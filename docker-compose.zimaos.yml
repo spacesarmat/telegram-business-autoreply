@@ -72,10 +72,12 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.8.0"
+  version: "1.8.1"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      Web administration panel with login, dashboard, requests, CRM fields, pricing, add-ons, availability, forms, menu buttons and core bot settings.
+      Adds a reusable choice-question type with editable inline options. The Factory rental
+      event format is now selected with buttons, with a custom text follow-up for Other.
     ru_RU: >
-      Веб-админка с авторизацией: заявки, CRM, тарифы, допуслуги, занятость, формы, кнопки меню и основные настройки бота.
+      Добавлен универсальный тип вопроса с вариантами-кнопками. Формат мероприятия в
+      «Аренде Фабрики» выбирается кнопками, а «Другое» открывает ручное уточнение.
