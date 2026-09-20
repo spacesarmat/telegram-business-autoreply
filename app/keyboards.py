@@ -146,7 +146,10 @@ def admin_main(enabled: bool) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📋 Заявки", callback_data="adm:reqs:all"),
         InlineKeyboardButton(text="📅 Занятость", callback_data="adm:availability"),
     )
-    builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"))
+    builder.row(
+        InlineKeyboardButton(text="💬 Шаблоны статусов", callback_data="adm:status_templates"),
+        InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
+    )
     return builder.as_markup()
 
 
@@ -397,6 +400,7 @@ def admin_submissions_list(submissions: list[dict], current_filter: str = "all")
         InlineKeyboardButton(text="💰 Оплач.", callback_data="adm:reqs:paid"),
         InlineKeyboardButton(text="❌ Отказ", callback_data="adm:reqs:cancelled"),
     )
+    builder.row(InlineKeyboardButton(text="🔎 Поиск заявки / клиента", callback_data="adm:req_search"))
     for item in submissions:
         status = str(item.get("status") or "new")
         icon = SUBMISSION_STATUS_LABELS.get(status, "•").split(" ", 1)[0]
@@ -426,10 +430,44 @@ def admin_submission_card(submission: dict) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🏁 Завершить", callback_data=f"adm:req_status:{sid}:completed"),
         InlineKeyboardButton(text="❌ Отказ", callback_data=f"adm:req_status:{sid}:cancelled"),
     )
+    builder.row(
+        InlineKeyboardButton(text="💵 Стоимость", callback_data=f"adm:req_amount:{sid}"),
+        InlineKeyboardButton(text="💳 Предоплата", callback_data=f"adm:req_prepayment:{sid}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🗒 Заметка", callback_data=f"adm:req_note:{sid}"),
+        InlineKeyboardButton(text="👤 История клиента", callback_data=f"adm:req_history:{sid}"),
+    )
     username = (submission.get("username") or "").strip()
     if username:
         builder.row(InlineKeyboardButton(text="💬 Открыть чат", url=f"https://t.me/{username}"))
     builder.row(InlineKeyboardButton(text="⬅️ К заявкам", callback_data="adm:reqs:all"))
+    return builder.as_markup()
+
+
+def admin_status_templates() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🆕 Новая", callback_data="adm:status_tpl:new"),
+        InlineKeyboardButton(text="🟡 В работе", callback_data="adm:status_tpl:in_progress"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="✅ Подтверждена", callback_data="adm:status_tpl:confirmed"),
+        InlineKeyboardButton(text="💰 Оплачена", callback_data="adm:status_tpl:paid"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🏁 Завершена", callback_data="adm:status_tpl:completed"),
+        InlineKeyboardButton(text="❌ Отказ", callback_data="adm:status_tpl:cancelled"),
+    )
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:home"))
+    return builder.as_markup()
+
+
+def admin_status_template_edit(status: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="✏️ Изменить шаблон", callback_data=f"adm:status_tpl_edit:{status}"))
+    builder.row(InlineKeyboardButton(text="♻️ По умолчанию", callback_data=f"adm:status_tpl_default:{status}"))
+    builder.row(InlineKeyboardButton(text="⬅️ К шаблонам", callback_data="adm:status_templates"))
     return builder.as_markup()
 
 

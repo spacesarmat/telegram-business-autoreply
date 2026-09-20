@@ -70,8 +70,12 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.4.3"
+  version: "1.5.0"
   update_at: "2026-09-20"
   release_notes:
-    en_US: Booking forms now support explicit start/end times and overnight intervals such as 21:00-05:00 with cross-midnight conflict protection.
-    ru_RU: Формы бронирования поддерживают время начала и окончания, включая интервалы через полночь, например 21:00-05:00, с проверкой пересечений.
+    en_US: >
+      Mini-CRM upgrade with request amounts, prepayments, internal notes, client history,
+      search and editable status notification templates.
+    ru_RU: >
+      Мини-CRM: стоимость и предоплата, внутренние заметки, история клиента,
+      поиск и редактируемые шаблоны уведомлений о статусах.

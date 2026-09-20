@@ -18,12 +18,51 @@ DEFAULT_SETTINGS = {
     "booking_day_end": "23:00",
     "booking_slot_minutes": "60",
     "booking_max_duration_hours": "18",
+    "crm_currency": "₽",
     "greeting": (
         "Здравствуйте! Спасибо за сообщение.\n\n"
         "Я отвечаю автоматически, если вы пишете впервые или после длительного перерыва. "
         "Выберите подходящий пункт ниже:"
     ),
 }
+
+DEFAULT_STATUS_TEMPLATES = {
+    "new": (
+        "🔔 Статус заявки №{id}\n\n{form}\n{status}\n\n"
+        "Заявка снова отмечена как новая.\n\n"
+        "Если есть вопросы, просто ответьте в этом чате."
+    ),
+    "in_progress": (
+        "🔔 Статус заявки №{id}\n\n{form}\n{status}\n\n"
+        "Заявка взята в работу.\n\n"
+        "Если есть вопросы, просто ответьте в этом чате."
+    ),
+    "confirmed": (
+        "🔔 Статус заявки №{id}\n\n{form}\n{status}\n\n"
+        "Заявка подтверждена.\n\n"
+        "Если есть вопросы, просто ответьте в этом чате."
+    ),
+    "paid": (
+        "🔔 Статус заявки №{id}\n\n{form}\n{status}\n\n"
+        "Оплата по заявке отмечена как полученная.\n\n"
+        "Стоимость: {amount}\nПредоплата / оплачено: {prepayment}\nОстаток: {balance}\n\n"
+        "Если есть вопросы, просто ответьте в этом чате."
+    ),
+    "completed": (
+        "🔔 Статус заявки №{id}\n\n{form}\n{status}\n\n"
+        "Заявка завершена. Спасибо!\n\n"
+        "Если есть вопросы, просто ответьте в этом чате."
+    ),
+    "cancelled": (
+        "🔔 Статус заявки №{id}\n\n{form}\n{status}\n\n"
+        "По заявке установлен статус «Отказ».\n\n"
+        "Если есть вопросы, просто ответьте в этом чате."
+    ),
+}
+
+for _status_key, _status_template in DEFAULT_STATUS_TEMPLATES.items():
+    DEFAULT_SETTINGS[f"status_template_{_status_key}"] = _status_template
+
 
 DEFAULT_BUTTONS = [
     (
@@ -239,6 +278,9 @@ class Database:
                     last_name TEXT,
                     answers_json TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'new',
+                    total_amount INTEGER NOT NULL DEFAULT 0,
+                    prepayment_amount INTEGER NOT NULL DEFAULT 0,
+                    internal_note TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT,
                     FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE SET NULL
@@ -254,6 +296,17 @@ class Database:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(source_submission_id) REFERENCES form_submissions(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS submission_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT,
+                    admin_user_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(submission_id) REFERENCES form_submissions(id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_form_questions_form_position
@@ -308,6 +361,12 @@ class Database:
                 await db.execute("ALTER TABLE form_submissions ADD COLUMN status TEXT NOT NULL DEFAULT 'new'")
             if "updated_at" not in submission_columns:
                 await db.execute("ALTER TABLE form_submissions ADD COLUMN updated_at TEXT")
+            if "total_amount" not in submission_columns:
+                await db.execute("ALTER TABLE form_submissions ADD COLUMN total_amount INTEGER NOT NULL DEFAULT 0")
+            if "prepayment_amount" not in submission_columns:
+                await db.execute("ALTER TABLE form_submissions ADD COLUMN prepayment_amount INTEGER NOT NULL DEFAULT 0")
+            if "internal_note" not in submission_columns:
+                await db.execute("ALTER TABLE form_submissions ADD COLUMN internal_note TEXT NOT NULL DEFAULT ''")
             await db.execute(
                 "UPDATE form_submissions SET updated_at=COALESCE(updated_at, created_at), "
                 "status=COALESCE(NULLIF(status, ''), 'new')"
@@ -385,6 +444,21 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_availability_date "
                 "ON availability_blocks(date_iso, start_time, end_time)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_submission_events_submission "
+                "ON submission_events(submission_id, created_at DESC)"
+            )
+            await db.execute(
+                """
+                INSERT INTO submission_events(submission_id, event_type, new_value, created_at)
+                SELECT s.id, 'created', s.form_name, s.created_at
+                FROM form_submissions s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM submission_events e
+                    WHERE e.submission_id=s.id AND e.event_type='created'
+                )
+                """
             )
 
             for key, value in DEFAULT_SETTINGS.items():
@@ -905,8 +979,13 @@ class Database:
                     now,
                 ),
             )
+            submission_id = int(cur.lastrowid)
+            await db.execute(
+                "INSERT INTO submission_events(submission_id, event_type, new_value, created_at) VALUES(?, 'created', ?, ?)",
+                (submission_id, form_name, now),
+            )
             await db.commit()
-            return int(cur.lastrowid)
+            return submission_id
 
     async def list_submissions(self, status: str | None = None, limit: int = 30) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
@@ -937,16 +1016,126 @@ class Database:
             result["answers"] = _decode_answers(result.get("answers_json"))
             return result
 
-    async def update_submission_status(self, submission_id: int, status: str) -> None:
+    async def update_submission_status(
+        self, submission_id: int, status: str, admin_user_id: int | None = None
+    ) -> None:
         allowed = {"new", "in_progress", "confirmed", "paid", "completed", "cancelled"}
         if status not in allowed:
             raise ValueError("Unsupported submission status")
         async with self.connection() as db:
+            current = await (
+                await db.execute("SELECT status FROM form_submissions WHERE id=?", (submission_id,))
+            ).fetchone()
+            old_status = str(current["status"] or "new") if current else None
+            now = utc_now_iso()
             await db.execute(
                 "UPDATE form_submissions SET status=?, updated_at=? WHERE id=?",
-                (status, utc_now_iso(), submission_id),
+                (status, now, submission_id),
             )
+            if current and old_status != status:
+                await db.execute(
+                    """
+                    INSERT INTO submission_events(
+                        submission_id, event_type, old_value, new_value, admin_user_id, created_at
+                    ) VALUES(?, 'status', ?, ?, ?, ?)
+                    """,
+                    (submission_id, old_status, status, admin_user_id, now),
+                )
             await db.commit()
+
+    async def update_submission_crm_field(
+        self,
+        submission_id: int,
+        field: str,
+        value: Any,
+        admin_user_id: int | None = None,
+    ) -> None:
+        allowed = {"total_amount", "prepayment_amount", "internal_note"}
+        if field not in allowed:
+            raise ValueError("Unsupported CRM field")
+        async with self.connection() as db:
+            row = await (
+                await db.execute(f"SELECT {field} FROM form_submissions WHERE id=?", (submission_id,))
+            ).fetchone()
+            if not row:
+                return
+            old_value = row[field]
+            now = utc_now_iso()
+            await db.execute(
+                f"UPDATE form_submissions SET {field}=?, updated_at=? WHERE id=?",
+                (value, now, submission_id),
+            )
+            if str(old_value or "") != str(value or ""):
+                await db.execute(
+                    """
+                    INSERT INTO submission_events(
+                        submission_id, event_type, old_value, new_value, admin_user_id, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (submission_id, field, str(old_value or ""), str(value or ""), admin_user_id, now),
+                )
+            await db.commit()
+
+    async def search_submissions(self, query: str, limit: int = 30) -> list[dict[str, Any]]:
+        query = query.strip()
+        if not query:
+            return []
+        normalized = query[1:] if query.startswith("@") else query
+        limit = max(1, min(int(limit), 100))
+        like = f"%{normalized}%"
+        sql = """
+            SELECT * FROM form_submissions
+            WHERE CAST(id AS TEXT)=?
+               OR form_name LIKE ? COLLATE NOCASE
+               OR COALESCE(username, '') LIKE ? COLLATE NOCASE
+               OR COALESCE(first_name, '') LIKE ? COLLATE NOCASE
+               OR COALESCE(last_name, '') LIKE ? COLLATE NOCASE
+               OR answers_json LIKE ? COLLATE NOCASE
+               OR COALESCE(internal_note, '') LIKE ? COLLATE NOCASE
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+        """
+        async with self.connection() as db:
+            rows = await (
+                await db.execute(sql, (normalized, like, like, like, like, like, like, limit))
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["answers"] = _decode_answers(item.get("answers_json"))
+                result.append(item)
+            return result
+
+    async def list_client_submissions(
+        self, *, user_id: int | None, chat_id: int | None, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 50))
+        if user_id:
+            sql = "SELECT * FROM form_submissions WHERE user_id=? ORDER BY created_at DESC, id DESC LIMIT ?"
+            args = (user_id, limit)
+        elif chat_id:
+            sql = "SELECT * FROM form_submissions WHERE chat_id=? ORDER BY created_at DESC, id DESC LIMIT ?"
+            args = (chat_id, limit)
+        else:
+            return []
+        async with self.connection() as db:
+            rows = await (await db.execute(sql, args)).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["answers"] = _decode_answers(item.get("answers_json"))
+                result.append(item)
+            return result
+
+    async def list_submission_events(self, submission_id: int, limit: int = 12) -> list[dict[str, Any]]:
+        async with self.connection() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT * FROM submission_events WHERE submission_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (submission_id, max(1, min(int(limit), 50))),
+                )
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     async def submission_status_counts(self) -> dict[str, int]:
         async with self.connection() as db:

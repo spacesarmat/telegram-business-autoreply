@@ -25,3 +25,9 @@ class AdminStates(StatesGroup):
 
     availability_date = State()
     availability_period = State()
+
+    submission_search = State()
+    submission_amount = State()
+    submission_prepayment = State()
+    submission_note = State()
+    status_template = State()

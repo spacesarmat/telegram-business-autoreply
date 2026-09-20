@@ -17,7 +17,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message
 
 from .config import Settings, load_settings
-from .db import Database, utc_now_iso
+from .db import DEFAULT_STATUS_TEMPLATES, Database, utc_now_iso
 from .keyboards import (
     admin_availability,
     admin_button_edit,
@@ -32,6 +32,8 @@ from .keyboards import (
     admin_question_edit,
     admin_question_type,
     admin_submission_card,
+    admin_status_template_edit,
+    admin_status_templates,
     admin_submissions_list,
     calendar_keyboard,
     delete_confirm,
@@ -470,28 +472,41 @@ SUBMISSION_STATUS_NAMES = {
 BOOKING_STATUSES = {"confirmed", "paid", "completed"}
 
 
-def _submission_status_notification_text(submission: dict, new_status: str) -> str:
-    """Build a concise client-facing status update for the same Business chat."""
-    submission_id = int(submission["id"])
-    form_name = str(submission.get("form_name") or "Заявка")
+def _money_text(value: int | str | None, currency: str = "₽") -> str:
+    try:
+        number = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        number = 0
+    return f"{number:,}".replace(",", " ") + f" {currency}" if number else "—"
+
+
+async def _submission_status_notification_text(submission: dict, new_status: str) -> str:
+    """Build a client-facing status update from an editable admin template."""
     status_text = SUBMISSION_STATUS_NAMES.get(new_status, new_status)
-
-    specific = {
-        "new": "Заявка снова отмечена как новая.",
-        "in_progress": "Заявка взята в работу.",
-        "confirmed": "Заявка подтверждена.",
-        "paid": "Оплата по заявке отмечена как полученная.",
-        "completed": "Заявка завершена. Спасибо!",
-        "cancelled": "По заявке установлен статус «Отказ».",
-    }.get(new_status, f"Статус заявки изменён: {status_text}.")
-
-    return (
-        f"🔔 Статус заявки №{submission_id}\n\n"
-        f"{form_name}\n"
-        f"{status_text}\n\n"
-        f"{specific}\n"
-        "Если есть вопросы, просто ответьте в этом чате."
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    amount = max(0, int(submission.get("total_amount") or 0))
+    prepayment = max(0, int(submission.get("prepayment_amount") or 0))
+    balance = max(0, amount - prepayment) if amount else 0
+    template = await db.get_setting(
+        f"status_template_{new_status}", DEFAULT_STATUS_TEMPLATES.get(new_status, "{status}")
     )
+    template = template or DEFAULT_STATUS_TEMPLATES.get(new_status, "{status}")
+    full_name = " ".join(
+        part for part in [submission.get("first_name"), submission.get("last_name")] if part
+    ).strip() or "клиент"
+    values = {
+        "{id}": str(submission.get("id") or ""),
+        "{form}": str(submission.get("form_name") or "Заявка"),
+        "{status}": status_text,
+        "{client}": full_name,
+        "{amount}": _money_text(amount, currency),
+        "{prepayment}": _money_text(prepayment, currency),
+        "{balance}": _money_text(balance, currency),
+    }
+    result = str(template)
+    for token, value in values.items():
+        result = result.replace(token, value)
+    return result[:4000]
 
 
 async def _notify_submission_status_change(
@@ -520,7 +535,7 @@ async def _notify_submission_status_change(
         await bot.send_message(
             chat_id=int(chat_id),
             business_connection_id=str(business_connection_id),
-            text=_submission_status_notification_text(submission, new_status),
+            text=await _submission_status_notification_text(submission, new_status),
             parse_mode=None,
         )
         return True, None
@@ -538,10 +553,19 @@ async def _submission_admin_text(submission: dict) -> str:
         part for part in [submission.get("first_name"), submission.get("last_name")] if part
     ).strip() or "Без имени"
     status = SUBMISSION_STATUS_NAMES.get(str(submission.get("status") or "new"), "•")
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    total_amount = max(0, int(submission.get("total_amount") or 0))
+    prepayment = max(0, int(submission.get("prepayment_amount") or 0))
+    balance = max(0, total_amount - prepayment) if total_amount else 0
     lines = [
         f"<b>Заявка №{submission['id']}</b>",
         f"Статус: {status}",
         f"Форма: <b>{html.escape(str(submission['form_name']))}</b>",
+        "",
+        f"💵 Стоимость: <b>{html.escape(_money_text(total_amount, currency))}</b>",
+        f"💳 Предоплата: <b>{html.escape(_money_text(prepayment, currency))}</b>",
+        f"🧾 Остаток: <b>{html.escape(_money_text(balance, currency))}</b>",
+        f"🗒 Заметка: {html.escape(str(submission.get('internal_note') or '—'))}",
         "",
         f"Клиент: {html.escape(full_name)}",
         f"Telegram: @{html.escape(str(submission['username']))}" if submission.get("username") else "Telegram: —",
@@ -2670,7 +2694,7 @@ async def admin_request_status(callback: CallbackQuery, bot: Bot) -> None:
                 show_alert=True,
             )
             return
-    await db.update_submission_status(submission_id, new_status)
+    await db.update_submission_status(submission_id, new_status, callback.from_user.id)
     if new_status in BOOKING_STATUSES and interval:
         await db.replace_submission_availability(
             submission_id,
@@ -2705,6 +2729,314 @@ async def admin_request_status(callback: CallbackQuery, bot: Bot) -> None:
             f"Статус сохранён, но клиент не уведомлён: {reason}",
             show_alert=True,
         )
+
+
+def _parse_admin_money(text: str | None) -> int | None:
+    raw = (text or "").strip().casefold().replace("₽", "").replace("руб.", "").replace("руб", "").strip()
+    if not raw:
+        return None
+    if raw in {"0", "-", "нет"}:
+        return 0
+    if not re.fullmatch(r"\d[\d\s_]*", raw):
+        return None
+    try:
+        value = int(re.sub(r"[\s_]", "", raw))
+    except ValueError:
+        return None
+    return value if 0 <= value <= 1_000_000_000 else None
+
+
+@router.callback_query(F.data == "adm:req_search")
+async def admin_request_search_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminStates.submission_search)
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            "<b>🔎 Поиск заявок</b>\n\n"
+            "Введите номер заявки, имя, @username, телефон, название формы или текст из заявки."
+        )
+    await callback.answer()
+
+
+@router.message(AdminStates.submission_search)
+async def admin_request_search_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    query = (message.text or "").strip()
+    if len(query) < 2 and not query.isdigit():
+        await message.answer("Введите хотя бы 2 символа или номер заявки.")
+        return
+    items = await db.search_submissions(query, limit=30)
+    await state.clear()
+    text = (
+        "<b>🔎 Результаты поиска</b>\n\n"
+        f"Запрос: <code>{html.escape(query)}</code>\n"
+        f"Найдено: {len(items)}"
+    )
+    await message.answer(text, reply_markup=admin_submissions_list(items, "all"))
+
+
+async def _start_submission_field_edit(callback: CallbackQuery, state: FSMContext, field: str) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        sid = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    submission = await db.get_submission(sid)
+    if not submission:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(submission_id=sid)
+    if field == "amount":
+        await state.set_state(AdminStates.submission_amount)
+        prompt = "💵 Введите полную стоимость заявки. Например: 90000\n\n0 — очистить сумму."
+    elif field == "prepayment":
+        await state.set_state(AdminStates.submission_prepayment)
+        prompt = "💳 Введите сумму предоплаты / уже полученной оплаты. Например: 30000\n\n0 — очистить."
+    else:
+        await state.set_state(AdminStates.submission_note)
+        prompt = "🗒 Введите внутреннюю заметку. Клиент её не увидит.\n\nОтправьте - чтобы очистить заметку."
+    if isinstance(callback.message, Message):
+        await callback.message.answer(prompt)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:req_amount:"))
+async def admin_request_amount_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _start_submission_field_edit(callback, state, "amount")
+
+
+@router.callback_query(F.data.startswith("adm:req_prepayment:"))
+async def admin_request_prepayment_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _start_submission_field_edit(callback, state, "prepayment")
+
+
+@router.callback_query(F.data.startswith("adm:req_note:"))
+async def admin_request_note_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _start_submission_field_edit(callback, state, "note")
+
+
+async def _finish_submission_field_edit(message: Message, state: FSMContext, field: str) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    data = await state.get_data()
+    sid = int(data.get("submission_id") or 0)
+    submission = await db.get_submission(sid)
+    if not submission:
+        await state.clear()
+        await message.answer("Заявка не найдена.")
+        return
+    if field in {"total_amount", "prepayment_amount"}:
+        value = _parse_admin_money(message.text)
+        if value is None:
+            await message.answer("Введите сумму цифрами, например 90000 или 90 000. Для очистки — 0.")
+            return
+        if field == "prepayment_amount" and int(submission.get("total_amount") or 0) and value > int(submission.get("total_amount") or 0):
+            await message.answer("Предоплата не может быть больше полной стоимости заявки.")
+            return
+        if field == "total_amount" and value and int(submission.get("prepayment_amount") or 0) > value:
+            await message.answer("Стоимость не может быть меньше уже указанной предоплаты.")
+            return
+    else:
+        raw = (message.text or "").strip()
+        value = "" if raw == "-" else raw
+        if len(value) > 1500:
+            await message.answer("Заметка слишком длинная. Максимум 1500 символов.")
+            return
+    await db.update_submission_crm_field(
+        sid,
+        field,
+        value,
+        message.from_user.id if message.from_user else None,
+    )
+    await state.clear()
+    updated = await db.get_submission(sid)
+    if updated:
+        await message.answer(
+            await _submission_admin_text(updated),
+            reply_markup=admin_submission_card(updated),
+        )
+    else:
+        await message.answer("✅ Карточка заявки обновлена.")
+
+
+@router.message(AdminStates.submission_amount)
+async def admin_request_amount_save(message: Message, state: FSMContext) -> None:
+    await _finish_submission_field_edit(message, state, "total_amount")
+
+
+@router.message(AdminStates.submission_prepayment)
+async def admin_request_prepayment_save(message: Message, state: FSMContext) -> None:
+    await _finish_submission_field_edit(message, state, "prepayment_amount")
+
+
+@router.message(AdminStates.submission_note)
+async def admin_request_note_save(message: Message, state: FSMContext) -> None:
+    await _finish_submission_field_edit(message, state, "internal_note")
+
+
+@router.callback_query(F.data.startswith("adm:req_history:"))
+async def admin_request_history(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        sid = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    submission = await db.get_submission(sid)
+    if not submission:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    history = await db.list_client_submissions(
+        user_id=submission.get("user_id"),
+        chat_id=submission.get("chat_id"),
+        limit=10,
+    )
+    events = await db.list_submission_events(sid, limit=8)
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    lines = ["<b>👤 История клиента</b>", ""]
+    for item in history:
+        status = SUBMISSION_STATUS_NAMES.get(str(item.get("status") or "new"), "•")
+        amount = _money_text(item.get("total_amount"), currency)
+        lines.append(
+            f"{status} · №{item['id']} · {html.escape(str(item['form_name']))} · {html.escape(amount)}"
+        )
+    if not history:
+        lines.append("Других заявок пока нет.")
+    lines.extend(["", "<b>Последние изменения этой заявки</b>"])
+    event_names = {
+        "created": "Создана",
+        "status": "Статус",
+        "total_amount": "Стоимость",
+        "prepayment_amount": "Предоплата",
+        "internal_note": "Заметка",
+    }
+    for event in events:
+        event_type = str(event.get("event_type"))
+        name = event_names.get(event_type, event_type)
+        event_value = str(event.get("new_value") or "—")
+        if event_type == "status":
+            event_value = SUBMISSION_STATUS_NAMES.get(event_value, event_value)
+        lines.append(
+            f"• {html.escape(name)}: {html.escape(event_value)} · "
+            f"{html.escape(str(event.get('created_at') or '')[:16])}"
+        )
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=admin_submission_card(submission),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:status_templates")
+async def admin_status_templates_open(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            "<b>💬 Шаблоны статусов</b>\n\n"
+            "Тексты отправляются клиенту при смене статуса. Выберите статус для просмотра или редактирования.",
+            reply_markup=admin_status_templates(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:status_tpl:"))
+async def admin_status_template_open(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    status = (callback.data or "").rsplit(":", 1)[1]
+    if status not in SUBMISSION_STATUS_NAMES:
+        await callback.answer("Неизвестный статус", show_alert=True)
+        return
+    template = await db.get_setting(
+        f"status_template_{status}", DEFAULT_STATUS_TEMPLATES[status]
+    )
+    text = (
+        f"<b>{SUBMISSION_STATUS_NAMES[status]}</b>\n\n"
+        f"<pre>{html.escape(str(template or ''))}</pre>\n\n"
+        "Переменные: <code>{id}</code>, <code>{form}</code>, <code>{status}</code>, "
+        "<code>{client}</code>, <code>{amount}</code>, <code>{prepayment}</code>, <code>{balance}</code>."
+    )
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            text,
+            reply_markup=admin_status_template_edit(status),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:status_tpl_edit:"))
+async def admin_status_template_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    status = (callback.data or "").rsplit(":", 1)[1]
+    if status not in SUBMISSION_STATUS_NAMES:
+        await callback.answer("Неизвестный статус", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(status_template_key=status)
+    await state.set_state(AdminStates.status_template)
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            f"Отправьте новый шаблон для статуса {SUBMISSION_STATUS_NAMES[status]}.\n\n"
+            "Можно использовать {id}, {form}, {status}, {client}, {amount}, {prepayment}, {balance}."
+        )
+    await callback.answer()
+
+
+@router.message(AdminStates.status_template)
+async def admin_status_template_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    data = await state.get_data()
+    status = str(data.get("status_template_key") or "")
+    if status not in SUBMISSION_STATUS_NAMES:
+        await state.clear()
+        return
+    value = message.text or ""
+    if not value.strip() or len(value) > 3500:
+        await message.answer("Шаблон должен содержать текст и быть короче 3500 символов.")
+        return
+    await db.set_setting(f"status_template_{status}", value)
+    await state.clear()
+    await message.answer(
+        "✅ Шаблон сохранён.",
+        reply_markup=admin_status_template_edit(status),
+    )
+
+
+@router.callback_query(F.data.startswith("adm:status_tpl_default:"))
+async def admin_status_template_default(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    status = (callback.data or "").rsplit(":", 1)[1]
+    if status not in DEFAULT_STATUS_TEMPLATES:
+        await callback.answer("Неизвестный статус", show_alert=True)
+        return
+    await db.set_setting(f"status_template_{status}", DEFAULT_STATUS_TEMPLATES[status])
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            f"<b>{SUBMISSION_STATUS_NAMES[status]}</b>\n\n"
+            f"<pre>{html.escape(DEFAULT_STATUS_TEMPLATES[status])}</pre>",
+            reply_markup=admin_status_template_edit(status),
+        )
+    await callback.answer("Шаблон восстановлен")
 
 
 @router.callback_query(F.data == "adm:availability")
