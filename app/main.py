@@ -34,7 +34,6 @@ from .keyboards import (
     admin_submission_card,
     admin_submissions_list,
     calendar_keyboard,
-    contact_request_keyboard,
     delete_confirm,
     form_confirmation,
     form_question_nav,
@@ -407,6 +406,64 @@ async def _submission_admin_text(submission: dict) -> str:
     return "\n".join(lines)
 
 
+def _normalize_phone_answer(value: str | None) -> str | None:
+    """Validate and normalize a manually entered phone number.
+
+    We intentionally do not assume a country. Accept common separators, require
+    7-15 digits (E.164 maximum), preserve a leading + and convert 00-prefix to +.
+    """
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw or len(raw) > 40:
+        return None
+    # Only phone-like punctuation is accepted; letters and arbitrary text are rejected.
+    if not re.fullmatch(r"\+?[0-9][0-9\s().\-]*", raw) and not re.fullmatch(
+        r"00[0-9][0-9\s().\-]*", raw
+    ):
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if not 7 <= len(digits) <= 15:
+        return None
+    if raw.startswith("00"):
+        international = digits[2:]
+        if not 7 <= len(international) <= 15:
+            return None
+        return "+" + international
+    if raw.startswith("+"):
+        return "+" + digits
+    return digits
+
+
+def _contact_question_text(
+    form: dict,
+    question: dict,
+    *,
+    index: int,
+    total: int,
+    suffix: str = "",
+    error: str | None = None,
+) -> str:
+    lines = [
+        f"📝 {form['name']}",
+        "",
+        f"Вопрос {index + 1} из {total}",
+        f"{question['prompt']}{suffix}",
+        "",
+    ]
+    if error:
+        lines.extend([f"⚠️ {error}", ""])
+    lines.extend(
+        [
+            "Введите номер вручную, например:",
+            "+7 999 123-45-67",
+            "",
+            "Допустимо от 7 до 15 цифр. Если Telegram позволяет отправить контакт через вложение, можно прислать свой контакт — бот тоже его примет.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _message_answer_text(message: Message) -> str | None:
     if message.text and message.text.strip():
         return message.text.strip()
@@ -595,13 +652,20 @@ async def send_current_form_question(
         )
         return
 
-    text = (
-        f"📝 {form['name']}\n\n"
-        f"Вопрос {index + 1} из {len(questions)}\n"
-        f"{question['prompt']}{suffix}"
-    )
     if input_type == "contact":
-        text += "\n\nНажмите «📱 Поделиться своим контактом» внизу или введите номер вручную."
+        text = _contact_question_text(
+            form,
+            question,
+            index=index,
+            total=len(questions),
+            suffix=suffix,
+        )
+    else:
+        text = (
+            f"📝 {form['name']}\n\n"
+            f"Вопрос {index + 1} из {len(questions)}\n"
+            f"{question['prompt']}{suffix}"
+        )
 
     await _upsert_form_message(
         bot,
@@ -609,21 +673,6 @@ async def send_current_form_question(
         text=text,
         reply_markup=form_question_nav(bool(question["required"]), index > 0),
     )
-
-    if input_type == "contact" and int(session.get("keyboard_question_id") or 0) != int(question["id"]):
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                business_connection_id=session["business_connection_id"],
-                text="📱 Можно отправить свой номер одной кнопкой:",
-                parse_mode=None,
-                reply_markup=contact_request_keyboard(),
-            )
-            await db.update_form_session(
-                chat_id, keyboard_question_id=int(question["id"])
-            )
-        except TelegramAPIError:
-            logger.exception("Не удалось показать кнопку запроса контакта в chat_id=%s", chat_id)
 
 
 async def handle_form_message(
@@ -655,25 +704,58 @@ async def handle_form_message(
     input_type = _question_input_type(question)
 
     if input_type == "contact":
+        raw_phone: str | None
         if message.contact:
             if (
                 message.contact.user_id
                 and message.from_user
                 and int(message.contact.user_id) != int(message.from_user.id)
             ):
+                await _delete_form_answer_message(
+                    bot, message, session, can_delete_all_messages
+                )
+                form = await db.get_form(int(session["form_id"]))
+                if form:
+                    await _upsert_form_message(
+                        bot,
+                        session,
+                        text=_contact_question_text(
+                            form,
+                            question,
+                            index=index,
+                            total=len(questions),
+                            error="Отправлен чужой контакт. Укажите свой номер вручную или пришлите свой контакт.",
+                        ),
+                        reply_markup=form_question_nav(bool(question["required"]), index > 0),
+                    )
+                return True
+            raw_phone = message.contact.phone_number
+        else:
+            raw_phone = message.text
+
+        answer = _normalize_phone_answer(raw_phone)
+        if not answer:
+            await _delete_form_answer_message(
+                bot, message, session, can_delete_all_messages
+            )
+            form = await db.get_form(int(session["form_id"]))
+            if form:
                 await _upsert_form_message(
                     bot,
                     session,
-                    text=(
-                        "Пожалуйста, поделитесь именно своим контактом кнопкой ниже "
-                        "или введите свой номер вручную."
+                    text=_contact_question_text(
+                        form,
+                        question,
+                        index=index,
+                        total=len(questions),
+                        error=(
+                            "Не похоже на номер телефона. Введите 7–15 цифр с кодом страны, "
+                            "например +7 999 123-45-67."
+                        ),
                     ),
                     reply_markup=form_question_nav(bool(question["required"]), index > 0),
                 )
-                return True
-            answer = message.contact.phone_number.strip()
-        else:
-            answer = (message.text or "").strip() or None
+            return True
     elif input_type == "date":
         answer = _parse_date_answer(message.text)
         if not answer:
@@ -2058,7 +2140,7 @@ async def admin_question_type_menu(callback: CallbackQuery) -> None:
             "⌨️ Текст — обычный ответ\n"
             "📅 Дата — календарь + проверка занятости\n"
             "🕐 Время — свободные интервалы кнопками + ручной ввод\n"
-            "📱 Контакт — кнопка «Поделиться своим контактом» + ручной ввод",
+            "📱 Контакт — ручной ввод телефона с проверкой; Telegram-контакт тоже принимается",
             reply_markup=admin_question_type(question_id),
         )
     await callback.answer()

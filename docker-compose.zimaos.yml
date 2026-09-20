@@ -70,8 +70,8 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.4.1"
+  version: "1.4.2"
   update_at: "2026-09-20"
   release_notes:
-    en_US: Customers now receive a Telegram Business message in the original chat whenever an admin changes a request status.
-    ru_RU: При изменении статуса заявки клиент получает уведомление в исходном личном Telegram Business-чате.
+    en_US: Contact fields now use reliable manual phone entry with validation and normalization; Telegram contact messages are still accepted when available.
+    ru_RU: Поля контакта теперь используют надёжный ручной ввод телефона с проверкой и нормализацией; Telegram-контакты также принимаются, если доступны.

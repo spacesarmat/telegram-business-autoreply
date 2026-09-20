@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-)
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
@@ -100,16 +95,6 @@ def calendar_keyboard(
     builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:menu"))
     builder.row(InlineKeyboardButton(text="❌ Отменить заявку", callback_data="form:cancel"))
     return builder.as_markup()
-
-
-def contact_request_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Поделиться своим контактом", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-        input_field_placeholder="Нажмите кнопку или введите номер вручную",
-        selective=True,
-    )
 
 
 def form_question_nav(required: bool, can_go_back: bool) -> InlineKeyboardMarkup:
