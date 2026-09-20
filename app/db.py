@@ -49,11 +49,11 @@ DEFAULT_FORMS: list[dict[str, Any]] = [
         "button_title": "Заказать мероприятие",
         "name": "Заказать мероприятие",
         "questions": [
-            ("Дата", "На какую дату планируется мероприятие?", True),
+            ("Дата", "На какую дату планируется мероприятие?", True, "date"),
             ("Формат", "Какой формат мероприятия планируется?", True),
             ("Количество гостей", "Сколько примерно будет гостей?", True),
             ("Место", "Где планируется мероприятие / какая площадка нужна?", False),
-            ("Телефон", "Оставьте контактный телефон для связи.", True),
+            ("Телефон", "Оставьте контактный телефон для связи.", True, "contact"),
             ("Комментарий", "Дополнительные пожелания или комментарий.", False),
         ],
     },
@@ -65,7 +65,7 @@ DEFAULT_FORMS: list[dict[str, Any]] = [
             ("Даты аренды", "На какие даты нужна аренда?", True),
             ("Получение", "Доставка или самовывоз?", True),
             ("Адрес", "Укажите адрес доставки / место использования.", False),
-            ("Телефон", "Оставьте контактный телефон для связи.", True),
+            ("Телефон", "Оставьте контактный телефон для связи.", True, "contact"),
             ("Комментарий", "Дополнительные пожелания или комментарий.", False),
         ],
     },
@@ -73,12 +73,12 @@ DEFAULT_FORMS: list[dict[str, Any]] = [
         "button_title": "Аренда Фабрики",
         "name": "Аренда Фабрики",
         "questions": [
-            ("Дата", "На какую дату нужна аренда Фабрики?", True),
+            ("Дата", "На какую дату нужна аренда Фабрики?", True, "date"),
             ("Время", "Во сколько планируется начало?", True),
             ("Продолжительность", "На сколько часов нужна площадка?", True),
             ("Количество гостей", "Сколько примерно будет гостей?", True),
             ("Формат", "Какой формат мероприятия планируется?", True),
-            ("Телефон", "Оставьте контактный телефон для связи.", True),
+            ("Телефон", "Оставьте контактный телефон для связи.", True, "contact"),
             ("Комментарий", "Дополнительные пожелания или комментарий.", False),
         ],
     },
@@ -87,7 +87,7 @@ DEFAULT_FORMS: list[dict[str, Any]] = [
         "name": "Другой вопрос",
         "questions": [
             ("Вопрос", "Опишите, пожалуйста, ваш вопрос.", True),
-            ("Телефон", "Оставьте контактный телефон, если удобно.", False),
+            ("Телефон", "Оставьте контактный телефон, если удобно.", False, "contact"),
         ],
     },
 ]
@@ -112,6 +112,15 @@ def _decode_answers(raw: str | None) -> dict[str, str]:
 class Database:
     def __init__(self, path: str):
         self.path = path
+
+    @staticmethod
+    def infer_question_input_type(label: str) -> str:
+        normalized = " ".join(label.strip().casefold().split())
+        if normalized == "дата":
+            return "date"
+        if normalized in {"телефон", "контакт", "контактный телефон"}:
+            return "contact"
+        return "text"
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -181,6 +190,7 @@ class Database:
                     prompt TEXT NOT NULL,
                     position INTEGER NOT NULL DEFAULT 100,
                     required INTEGER NOT NULL DEFAULT 1,
+                    input_type TEXT NOT NULL DEFAULT 'text',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE CASCADE
@@ -198,6 +208,7 @@ class Database:
                     business_connection_id TEXT NOT NULL,
                     form_id INTEGER NOT NULL,
                     form_message_id INTEGER,
+                    keyboard_question_id INTEGER NOT NULL DEFAULT 0,
                     current_index INTEGER NOT NULL DEFAULT 0,
                     answers_json TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL DEFAULT 'active',
@@ -245,6 +256,26 @@ class Database:
             }
             if "form_message_id" not in session_columns:
                 await db.execute("ALTER TABLE form_sessions ADD COLUMN form_message_id INTEGER")
+            if "keyboard_question_id" not in session_columns:
+                await db.execute(
+                    "ALTER TABLE form_sessions ADD COLUMN keyboard_question_id INTEGER NOT NULL DEFAULT 0"
+                )
+
+            question_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(form_questions)")).fetchall()
+            }
+            if "input_type" not in question_columns:
+                await db.execute(
+                    "ALTER TABLE form_questions ADD COLUMN input_type TEXT NOT NULL DEFAULT 'text'"
+                )
+                await db.execute(
+                    "UPDATE form_questions SET input_type='date' WHERE trim(label) IN ('Дата', 'дата', 'ДАТА')"
+                )
+                await db.execute(
+                    "UPDATE form_questions SET input_type='contact' "
+                    "WHERE trim(label) IN ('Телефон', 'телефон', 'ТЕЛЕФОН', 'Контакт', 'контакт', 'КОНТАКТ', 'Контактный телефон', 'контактный телефон')"
+                )
 
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
@@ -290,13 +321,22 @@ class Database:
                 (form_def["name"], now, now),
             )
             form_id = int(cur.lastrowid)
-            for position, (label, prompt, required) in enumerate(form_def["questions"], start=1):
+            for position, question_def in enumerate(form_def["questions"], start=1):
+                if len(question_def) == 4:
+                    label, prompt, required, input_type = question_def
+                else:
+                    label, prompt, required = question_def
+                    input_type = self.infer_question_input_type(str(label))
                 await db.execute(
                     """
-                    INSERT INTO form_questions(form_id, label, prompt, position, required, created_at, updated_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO form_questions(
+                        form_id, label, prompt, position, required, input_type, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (form_id, label, prompt, position, int(required), now, now),
+                    (
+                        form_id, label, prompt, position, int(required), str(input_type), now, now
+                    ),
                 )
             await db.execute(
                 "INSERT OR REPLACE INTO button_forms(button_id, form_id) VALUES(?, ?)",
@@ -547,8 +587,18 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
-    async def add_form_question(self, form_id: int, label: str, prompt: str, required: bool = True) -> int:
+    async def add_form_question(
+        self,
+        form_id: int,
+        label: str,
+        prompt: str,
+        required: bool = True,
+        input_type: str | None = None,
+    ) -> int:
         now = utc_now_iso()
+        input_type = input_type or self.infer_question_input_type(label)
+        if input_type not in {"text", "date", "contact"}:
+            input_type = "text"
         async with self.connection() as db:
             row = await (
                 await db.execute(
@@ -558,16 +608,20 @@ class Database:
             ).fetchone()
             cur = await db.execute(
                 """
-                INSERT INTO form_questions(form_id, label, prompt, position, required, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO form_questions(
+                    form_id, label, prompt, position, required, input_type, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (form_id, label, prompt, int(row["p"]), int(required), now, now),
+                (
+                    form_id, label, prompt, int(row["p"]), int(required), input_type, now, now
+                ),
             )
             await db.commit()
             return int(cur.lastrowid)
 
     async def update_form_question_field(self, question_id: int, field: str, value: Any) -> None:
-        if field not in {"label", "prompt", "position", "required"}:
+        if field not in {"label", "prompt", "position", "required", "input_type"}:
             raise ValueError("Unsupported question field")
         async with self.connection() as db:
             await db.execute(
@@ -626,13 +680,14 @@ class Database:
             await db.execute(
                 """
                 INSERT INTO form_sessions(
-                    chat_id, business_connection_id, form_id, form_message_id, current_index, answers_json, status,
+                    chat_id, business_connection_id, form_id, form_message_id, keyboard_question_id, current_index, answers_json, status,
                     user_id, username, first_name, last_name, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, 0, '{}', 'active', ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, 0, 0, '{}', 'active', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     business_connection_id=excluded.business_connection_id,
                     form_id=excluded.form_id,
                     form_message_id=excluded.form_message_id,
+                    keyboard_question_id=0,
                     current_index=0,
                     answers_json='{}',
                     status='active',
@@ -678,6 +733,7 @@ class Database:
         status: str | None = None,
         business_connection_id: str | None = None,
         form_message_id: int | None = None,
+        keyboard_question_id: int | None = None,
     ) -> None:
         fields: list[str] = []
         values: list[Any] = []
@@ -696,6 +752,9 @@ class Database:
         if form_message_id is not None:
             fields.append("form_message_id=?")
             values.append(form_message_id)
+        if keyboard_question_id is not None:
+            fields.append("keyboard_question_id=?")
+            values.append(keyboard_question_id)
         fields.append("updated_at=?")
         values.append(utc_now_iso())
         values.append(chat_id)

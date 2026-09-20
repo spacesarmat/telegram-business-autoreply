@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
@@ -13,6 +18,90 @@ def public_menu(buttons: list[dict], columns: int = 1) -> InlineKeyboardMarkup |
         builder.button(text=button["title"], callback_data=f"pub:{button['id']}")
     builder.adjust(columns)
     return builder.as_markup()
+
+
+MONTH_NAMES_RU = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def calendar_keyboard(
+    question_id: int,
+    year: int,
+    month: int,
+    weeks: list[list[int]],
+    *,
+    required: bool,
+    can_go_back: bool,
+    today_iso: str,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{MONTH_NAMES_RU[month - 1]} {year}", callback_data="cal:noop"
+        )
+    )
+    builder.row(
+        *[InlineKeyboardButton(text=day, callback_data="cal:noop") for day in WEEKDAYS_RU]
+    )
+    for week in weeks:
+        row: list[InlineKeyboardButton] = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(text="·", callback_data="cal:noop"))
+                continue
+            iso = f"{year:04d}-{month:02d}-{day:02d}"
+            label = f"•{day}" if iso == today_iso else str(day)
+            row.append(
+                InlineKeyboardButton(
+                    text=label, callback_data=f"cal:day:{question_id}:{iso}"
+                )
+            )
+        builder.row(*row)
+
+    prev_month = month - 1
+    prev_year = year
+    if prev_month == 0:
+        prev_month = 12
+        prev_year -= 1
+    next_month = month + 1
+    next_year = year
+    if next_month == 13:
+        next_month = 1
+        next_year += 1
+    builder.row(
+        InlineKeyboardButton(
+            text="◀️", callback_data=f"cal:nav:{question_id}:{prev_year:04d}-{prev_month:02d}"
+        ),
+        InlineKeyboardButton(
+            text="Сегодня", callback_data=f"cal:today:{question_id}"
+        ),
+        InlineKeyboardButton(
+            text="▶️", callback_data=f"cal:nav:{question_id}:{next_year:04d}-{next_month:02d}"
+        ),
+    )
+    row: list[InlineKeyboardButton] = []
+    if can_go_back:
+        row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data="form:back"))
+    if not required:
+        row.append(InlineKeyboardButton(text="⏭ Пропустить", callback_data="form:skip"))
+    if row:
+        builder.row(*row)
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:menu"))
+    builder.row(InlineKeyboardButton(text="❌ Отменить заявку", callback_data="form:cancel"))
+    return builder.as_markup()
+
+
+def contact_request_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поделиться своим контактом", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Нажмите кнопку или введите номер вручную",
+        selective=True,
+    )
 
 
 def form_question_nav(required: bool, can_go_back: bool) -> InlineKeyboardMarkup:
@@ -169,6 +258,13 @@ def admin_question_edit(question: dict) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🏷 Поле", callback_data=f"adm:q_label:{question['id']}"),
         InlineKeyboardButton(text="💬 Вопрос", callback_data=f"adm:q_prompt:{question['id']}"),
     )
+    type_labels = {"text": "⌨️ Текст", "date": "📅 Дата", "contact": "📱 Контакт"}
+    builder.row(
+        InlineKeyboardButton(
+            text=f"Тип: {type_labels.get(question.get('input_type', 'text'), '⌨️ Текст')}",
+            callback_data=f"adm:q_type_menu:{question['id']}",
+        )
+    )
     builder.row(
         InlineKeyboardButton(text="🔢 Позиция", callback_data=f"adm:q_pos:{question['id']}"),
         InlineKeyboardButton(
@@ -207,3 +303,18 @@ def admin_form_bindings(form_id: int, buttons: list[dict], bound_ids: set[int]) 
         )
     builder.row(InlineKeyboardButton(text="⬅️ К форме", callback_data=f"adm:form:{form_id}"))
     return builder.as_markup()
+
+def admin_question_type(question_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="⌨️ Текст", callback_data=f"adm:q_type:{question_id}:text"),
+        InlineKeyboardButton(text="📅 Дата", callback_data=f"adm:q_type:{question_id}:date"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📱 Контакт", callback_data=f"adm:q_type:{question_id}:contact")
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:q:{question_id}")
+    )
+    return builder.as_markup()
+

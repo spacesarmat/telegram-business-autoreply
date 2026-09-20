@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import html
 import logging
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,9 @@ from .keyboards import (
     admin_main,
     admin_question_delete_confirm,
     admin_question_edit,
+    admin_question_type,
+    calendar_keyboard,
+    contact_request_keyboard,
     delete_confirm,
     form_confirmation,
     form_question_nav,
@@ -157,6 +161,38 @@ async def render_admin_button(button: dict) -> tuple[str, object]:
     return text, admin_button_edit(button)
 
 
+QUESTION_TYPE_NAMES = {
+    "text": "⌨️ Текст",
+    "date": "📅 Дата",
+    "contact": "📱 Контакт",
+}
+
+
+def _question_input_type(question: dict) -> str:
+    value = str(question.get("input_type") or "text")
+    return value if value in QUESTION_TYPE_NAMES else "text"
+
+
+def _parse_date_answer(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = value.strip()
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            parsed = datetime.strptime(raw, fmt).date()
+            return parsed.strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return None
+
+
+def _date_from_answer(value: str | None):
+    normalized = _parse_date_answer(value)
+    if not normalized:
+        return None
+    return datetime.strptime(normalized, "%d.%m.%Y").date()
+
+
 def _message_answer_text(message: Message) -> str | None:
     if message.text and message.text.strip():
         return message.text.strip()
@@ -252,7 +288,9 @@ async def _form_callback_session(callback: CallbackQuery) -> dict | None:
     return session
 
 
-async def send_current_form_question(bot: Bot, chat_id: int) -> None:
+async def send_current_form_question(
+    bot: Bot, chat_id: int, *, calendar_year: int | None = None, calendar_month: int | None = None
+) -> None:
     session = await db.get_form_session(chat_id)
     if not session:
         return
@@ -270,7 +308,9 @@ async def send_current_form_question(bot: Bot, chat_id: int) -> None:
 
     index = max(0, int(session["current_index"]))
     if index >= len(questions):
-        await db.update_form_session(chat_id, current_index=len(questions), status="confirm")
+        await db.update_form_session(
+            chat_id, current_index=len(questions), status="confirm", keyboard_question_id=0
+        )
         session = await db.get_form_session(chat_id)
         if not session:
             return
@@ -283,21 +323,68 @@ async def send_current_form_question(bot: Bot, chat_id: int) -> None:
         return
 
     question = questions[index]
+    input_type = _question_input_type(question)
     suffix = "\n\nЭтот вопрос необязательный — его можно пропустить." if not question["required"] else ""
     existing = session["answers"].get(str(question["id"]))
     if existing:
         suffix += f"\n\nТекущий ответ: {existing}"
+
+    if input_type == "date":
+        today = datetime.now().date()
+        selected = _date_from_answer(existing)
+        year = calendar_year or (selected.year if selected else today.year)
+        month = calendar_month or (selected.month if selected else today.month)
+        if year < today.year - 1:
+            year, month = today.year, today.month
+        if year > today.year + 6:
+            year, month = today.year + 6, 12
+        text = (
+            f"📝 {form['name']}\n\n"
+            f"Вопрос {index + 1} из {len(questions)}\n"
+            f"{question['prompt']}{suffix}\n\n"
+            "Выберите день в календаре или введите дату вручную в формате ДД.ММ.ГГГГ."
+        )
+        markup = calendar_keyboard(
+            int(question["id"]),
+            year,
+            month,
+            calendar.monthcalendar(year, month),
+            required=bool(question["required"]),
+            can_go_back=index > 0,
+            today_iso=today.isoformat(),
+        )
+        await _upsert_form_message(bot, session, text=text, reply_markup=markup)
+        return
+
     text = (
         f"📝 {form['name']}\n\n"
         f"Вопрос {index + 1} из {len(questions)}\n"
         f"{question['prompt']}{suffix}"
     )
+    if input_type == "contact":
+        text += "\n\nНажмите «📱 Поделиться своим контактом» внизу или введите номер вручную."
+
     await _upsert_form_message(
         bot,
         session,
         text=text,
         reply_markup=form_question_nav(bool(question["required"]), index > 0),
     )
+
+    if input_type == "contact" and int(session.get("keyboard_question_id") or 0) != int(question["id"]):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                business_connection_id=session["business_connection_id"],
+                text="📱 Можно отправить свой номер одной кнопкой:",
+                parse_mode=None,
+                reply_markup=contact_request_keyboard(),
+            )
+            await db.update_form_session(
+                chat_id, keyboard_question_id=int(question["id"])
+            )
+        except TelegramAPIError:
+            logger.exception("Не удалось показать кнопку запроса контакта в chat_id=%s", chat_id)
 
 
 async def handle_form_message(
@@ -325,13 +412,43 @@ async def handle_form_message(
         await send_current_form_question(bot, message.chat.id)
         return True
 
-    answer = _message_answer_text(message)
+    question = questions[index]
+    input_type = _question_input_type(question)
+
+    if input_type == "contact":
+        if message.contact:
+            if (
+                message.contact.user_id
+                and message.from_user
+                and int(message.contact.user_id) != int(message.from_user.id)
+            ):
+                await _upsert_form_message(
+                    bot,
+                    session,
+                    text=(
+                        "Пожалуйста, поделитесь именно своим контактом кнопкой ниже "
+                        "или введите свой номер вручную."
+                    ),
+                    reply_markup=form_question_nav(bool(question["required"]), index > 0),
+                )
+                return True
+            answer = message.contact.phone_number.strip()
+        else:
+            answer = (message.text or "").strip() or None
+    elif input_type == "date":
+        answer = _parse_date_answer(message.text)
+        if not answer:
+            await send_current_form_question(bot, message.chat.id)
+            return True
+    else:
+        answer = _message_answer_text(message)
+
     if not answer:
         await _upsert_form_message(
             bot,
             session,
-            text="Пожалуйста, отправьте ответ текстом. Также можно отправить контакт или геолокацию.",
-            reply_markup=form_question_nav(bool(questions[index]["required"]), index > 0),
+            text="Пожалуйста, отправьте ответ текстом.",
+            reply_markup=form_question_nav(bool(question["required"]), index > 0),
         )
         return True
 
@@ -340,7 +457,7 @@ async def handle_form_message(
             bot,
             session,
             text="Ответ слишком длинный. Пожалуйста, сократите его до 1500 символов.",
-            reply_markup=form_question_nav(bool(questions[index]["required"]), index > 0),
+            reply_markup=form_question_nav(bool(question["required"]), index > 0),
         )
         return True
 
@@ -352,6 +469,7 @@ async def handle_form_message(
         current_index=next_index,
         answers=answers,
         status="confirm" if next_index >= len(questions) else "active",
+        keyboard_question_id=0,
     )
     await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
     await send_current_form_question(bot, message.chat.id)
@@ -640,6 +758,105 @@ async def on_public_button(callback: CallbackQuery, bot: Bot) -> None:
             pass
 
 
+@router.callback_query(F.data == "cal:noop")
+async def calendar_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+async def _calendar_session_question(callback: CallbackQuery, question_id: int) -> tuple[dict, dict] | None:
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return None
+    if session["status"] != "active":
+        await callback.answer("Нет активного вопроса", show_alert=True)
+        return None
+    questions = await db.list_form_questions(int(session["form_id"]))
+    index = int(session["current_index"])
+    if index < 0 or index >= len(questions):
+        await callback.answer("Нет активного вопроса", show_alert=True)
+        return None
+    question = questions[index]
+    if int(question["id"]) != question_id or _question_input_type(question) != "date":
+        await callback.answer("Этот календарь уже неактивен", show_alert=True)
+        return None
+    return session, question
+
+
+@router.callback_query(F.data.startswith("cal:nav:"))
+async def calendar_navigate(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, _, question_raw, ym = (callback.data or "").split(":", 3)
+        question_id = int(question_raw)
+        year, month = [int(x) for x in ym.split("-", 1)]
+        datetime(year, month, 1)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректная дата", show_alert=True)
+        return
+    data = await _calendar_session_question(callback, question_id)
+    if not data or not isinstance(callback.message, Message):
+        return
+    await send_current_form_question(
+        bot, callback.message.chat.id, calendar_year=year, calendar_month=month
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cal:today:"))
+async def calendar_today(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        question_id = int((callback.data or "").rsplit(":", 1)[1])
+    except (ValueError, TypeError):
+        await callback.answer("Некорректная дата", show_alert=True)
+        return
+    data = await _calendar_session_question(callback, question_id)
+    if not data or not isinstance(callback.message, Message):
+        return
+    session, question = data
+    selected = datetime.now().date().strftime("%d.%m.%Y")
+    answers = dict(session["answers"])
+    answers[str(question["id"])] = selected
+    questions = await db.list_form_questions(int(session["form_id"]))
+    next_index = int(session["current_index"]) + 1
+    await db.update_form_session(
+        callback.message.chat.id,
+        current_index=next_index,
+        answers=answers,
+        status="confirm" if next_index >= len(questions) else "active",
+        keyboard_question_id=0,
+    )
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer(f"Дата: {selected}")
+
+
+@router.callback_query(F.data.startswith("cal:day:"))
+async def calendar_select_day(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, _, question_raw, iso = (callback.data or "").split(":", 3)
+        question_id = int(question_raw)
+        selected_date = datetime.strptime(iso, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        await callback.answer("Некорректная дата", show_alert=True)
+        return
+    data = await _calendar_session_question(callback, question_id)
+    if not data or not isinstance(callback.message, Message):
+        return
+    session, question = data
+    selected = selected_date.strftime("%d.%m.%Y")
+    answers = dict(session["answers"])
+    answers[str(question["id"])] = selected
+    questions = await db.list_form_questions(int(session["form_id"]))
+    next_index = int(session["current_index"]) + 1
+    await db.update_form_session(
+        callback.message.chat.id,
+        current_index=next_index,
+        answers=answers,
+        status="confirm" if next_index >= len(questions) else "active",
+        keyboard_question_id=0,
+    )
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer(f"Дата: {selected}")
+
+
 @router.callback_query(F.data == "form:menu")
 async def form_main_menu(callback: CallbackQuery, bot: Bot) -> None:
     if not isinstance(callback.message, Message) or not callback.message.business_connection_id:
@@ -700,6 +917,7 @@ async def form_skip(callback: CallbackQuery, bot: Bot) -> None:
         current_index=next_index,
         answers=answers,
         status="confirm" if next_index >= len(questions) else "active",
+        keyboard_question_id=0,
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer("Пропущено")
@@ -722,7 +940,7 @@ async def form_back(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Это первый вопрос", show_alert=True)
         return
     await db.update_form_session(
-        callback.message.chat.id, current_index=target, status="active"
+        callback.message.chat.id, current_index=target, status="active", keyboard_question_id=0
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer()
@@ -734,7 +952,7 @@ async def form_edit_answers(callback: CallbackQuery, bot: Bot) -> None:
     if not session or not isinstance(callback.message, Message):
         return
     await db.update_form_session(
-        callback.message.chat.id, current_index=0, status="active"
+        callback.message.chat.id, current_index=0, status="active", keyboard_question_id=0
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer("Можно изменить ответы")
@@ -1381,6 +1599,18 @@ async def admin_question_add_prompt(message: Message, state: FSMContext) -> None
     )
 
 
+def _admin_question_text(question: dict) -> str:
+    required = "да" if question["required"] else "нет"
+    type_name = QUESTION_TYPE_NAMES.get(_question_input_type(question), "⌨️ Текст")
+    return (
+        f"<b>{html.escape(question['label'])}</b>\n\n"
+        f"Позиция: {question['position']}\n"
+        f"Обязательный: {required}\n"
+        f"Тип поля: {type_name}\n\n"
+        f"<b>Вопрос пользователю:</b>\n{html.escape(question['prompt'])}"
+    )
+
+
 @router.callback_query(F.data.startswith("adm:q:"))
 async def admin_question_open(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
@@ -1391,13 +1621,7 @@ async def admin_question_open(callback: CallbackQuery) -> None:
     if not question:
         await callback.answer("Вопрос не найден", show_alert=True)
         return
-    required = "да" if question["required"] else "нет"
-    text = (
-        f"<b>{html.escape(question['label'])}</b>\n\n"
-        f"Позиция: {question['position']}\n"
-        f"Обязательный: {required}\n\n"
-        f"<b>Вопрос пользователю:</b>\n{html.escape(question['prompt'])}"
-    )
+    text = _admin_question_text(question)
     if isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=admin_question_edit(question))
     await callback.answer()
@@ -1465,6 +1689,54 @@ async def admin_question_prompt_save(message: Message, state: FSMContext) -> Non
     await message.answer("Текст вопроса сохранён.")
 
 
+@router.callback_query(F.data.startswith("adm:q_type_menu:"))
+async def admin_question_type_menu(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    question_id = int((callback.data or "").rsplit(":", 1)[1])
+    question = await db.get_form_question(question_id)
+    if not question:
+        await callback.answer("Вопрос не найден", show_alert=True)
+        return
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            "Выберите тип ответа для этого вопроса:\n\n"
+            "⌨️ Текст — обычный ответ\n"
+            "📅 Дата — календарь + ручной ввод\n"
+            "📱 Контакт — кнопка «Поделиться своим контактом» + ручной ввод",
+            reply_markup=admin_question_type(question_id),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:q_type:"))
+async def admin_question_type_set(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, _, question_raw, input_type = (callback.data or "").split(":", 3)
+        question_id = int(question_raw)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    if input_type not in {"text", "date", "contact"}:
+        await callback.answer("Неизвестный тип", show_alert=True)
+        return
+    question = await db.get_form_question(question_id)
+    if not question:
+        await callback.answer("Вопрос не найден", show_alert=True)
+        return
+    await db.update_form_question_field(question_id, "input_type", input_type)
+    question = await db.get_form_question(question_id)
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            _admin_question_text(question), reply_markup=admin_question_edit(question)
+        )
+    await callback.answer("Тип поля сохранён")
+
+
 @router.callback_query(F.data.startswith("adm:q_pos:"))
 async def admin_question_position(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
@@ -1513,13 +1785,7 @@ async def admin_question_required(callback: CallbackQuery) -> None:
         question_id, "required", 0 if question["required"] else 1
     )
     question = await db.get_form_question(question_id)
-    required = "да" if question["required"] else "нет"
-    text = (
-        f"<b>{html.escape(question['label'])}</b>\n\n"
-        f"Позиция: {question['position']}\n"
-        f"Обязательный: {required}\n\n"
-        f"<b>Вопрос пользователю:</b>\n{html.escape(question['prompt'])}"
-    )
+    text = _admin_question_text(question)
     if isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=admin_question_edit(question))
     await callback.answer("Готово")

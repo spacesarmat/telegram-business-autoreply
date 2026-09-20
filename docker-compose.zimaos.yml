@@ -70,8 +70,8 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.3.3"
+  version: "1.3.4"
   update_at: "2026-09-20"
   release_notes:
-    en_US: Completed requests now remain in the same personal Telegram Business chat instead of being sent to the admin bot.
-    ru_RU: Готовая заявка теперь остаётся в том же личном Telegram Business-чате и не отправляется отдельным сообщением в админ-бот.
+    en_US: Forms now support calendar date selection and a native Telegram button for sharing the user's own contact.
+    ru_RU: В формах добавлены календарь для выбора даты и нативная кнопка Telegram «Поделиться своим контактом».
