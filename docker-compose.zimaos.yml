@@ -1,0 +1,77 @@
+name: telegram-business-autoreply
+
+services:
+  telegram-business-autoreply:
+    image: ghcr.io/spacesarmat/tgautoreply:latest
+    container_name: telegram-business-autoreply
+    cpu_shares: 90
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.00"
+        reservations:
+          memory: 128M
+          cpus: "0.10"
+    environment:
+      BOT_TOKEN: "PASTE_BOT_TOKEN_HERE"
+      ADMIN_IDS: "PASTE_YOUR_TELEGRAM_USER_ID_HERE"
+      DATABASE_PATH: /data/bot.db
+      LOG_LEVEL: INFO
+      STATUS_PORT: "8080"
+      TZ: Europe/Moscow
+    labels:
+      icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/telegram.png
+    network_mode: bridge
+    ports:
+      - target: 8080
+        published: "18080"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /DATA/AppData/telegram-business-autoreply/data
+        target: /data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()" || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  author: spacesarmat
+  category: Utilities
+  description:
+    en_US: >
+      Telegram Business auto-reply assistant for a Premium/Business account.
+      Replies to first-time or returning contacts, shows configurable inline
+      buttons, stores settings in SQLite, and is administered directly in Telegram.
+    ru_RU: >
+      Автоответчик Telegram Business для Premium/Business-аккаунта. Отвечает
+      пользователям при первом обращении или после длительного перерыва, показывает
+      настраиваемые inline-кнопки, хранит настройки в SQLite и администрируется
+      непосредственно через Telegram.
+  developer: spacesarmat
+  icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/telegram.png
+  id: io.github.spacesarmat.telegram-business-autoreply
+  index: /
+  main: telegram-business-autoreply
+  port_map: "18080"
+  scheme: http
+  tagline:
+    en_US: Telegram Business auto-reply with editable buttons and responses.
+    ru_RU: Автоответчик Telegram Business с конструктором кнопок и ответов.
+  title:
+    en_US: Telegram AutoReply
+    ru_RU: Telegram Автоответчик
+  version: "1.2.0"
+  update_at: "2026-09-20"
+  release_notes:
+    en_US: Uses a prebuilt multi-architecture GHCR image for one-click ZimaOS installation.
+    ru_RU: Использует готовый multi-arch образ GHCR для установки в ZimaOS без локальной сборки.
