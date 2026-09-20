@@ -656,6 +656,9 @@ def admin_pricing_form(form_id: int, pricing: dict, currency: str = "₽") -> In
         InlineKeyboardButton(text="⏱ Включено часов", callback_data=f"adm:pricing_hours:{form_id}"),
     )
     builder.row(
+        InlineKeyboardButton(text="📝 Описание базы", callback_data=f"adm:pricing_description:{form_id}"),
+    )
+    builder.row(
         InlineKeyboardButton(text="➕ Доп. час", callback_data=f"adm:pricing_extra:{form_id}"),
     )
     builder.row(

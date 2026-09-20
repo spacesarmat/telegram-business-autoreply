@@ -75,12 +75,12 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "2.0.2"
+  version: "2.0.3"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      Adds a direct-chat Menu Button, inline Menu shortcuts for Business replies, blocks past booking dates,
-      and adds an admin-only test mode that runs client forms without creating real CRM submissions.
+      Adds an editable base-price description to every tariff so customers can see what is included in the base rental amount.
+      The description is editable from Telegram Admin and Web Admin and is stored with each submission pricing snapshot.
     ru_RU: >
-      Добавлена кнопка меню в ЛС с ботом, inline-меню в Business-ответах, запрет бронирования прошедших дат
-      и тестовый режим администратора без создания реальных CRM-заявок.
+      Добавлено редактируемое описание базовой стоимости тарифа: администратор может указать, что входит в сумму аренды.
+      Описание меняется из Telegram Admin и Web Admin и сохраняется в снимке расчёта заявки.

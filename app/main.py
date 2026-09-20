@@ -933,6 +933,7 @@ async def _calculate_form_pricing(
         return None
 
     base_amount = max(0, int(pricing.get("base_amount") or 0))
+    base_description = str(pricing.get("base_description") or "").strip()
     included_hours = max(0, int(pricing.get("included_hours") or 0))
     extra_hour_amount = max(0, int(pricing.get("extra_hour_amount") or 0))
     included_minutes = included_hours * 60
@@ -971,6 +972,7 @@ async def _calculate_form_pricing(
         "currency": currency,
         "duration_minutes": duration_minutes,
         "base_amount": base_amount,
+        "base_description": base_description,
         "included_hours": included_hours,
         "extra_hour_amount": extra_hour_amount,
         "extra_hours": extra_hours,
@@ -991,7 +993,10 @@ def _pricing_calculation_text(calculation: dict | None) -> str | None:
     rental_amount = int(calculation.get("rental_amount") or amount)
     addons = list(calculation.get("addons") or [])
     addons_total = int(calculation.get("addons_total") or 0)
+    surcharges = list(calculation.get("surcharges") or [])
+    surcharge_total = int(calculation.get("surcharge_total") or 0)
     base = int(calculation.get("base_amount") or 0)
+    base_description = str(calculation.get("base_description") or "").strip()
     included = int(calculation.get("included_hours") or 0)
     extra_rate = int(calculation.get("extra_hour_amount") or 0)
     extra_hours = int(calculation.get("extra_hours") or 0)
@@ -1024,6 +1029,8 @@ def _pricing_calculation_text(calculation: dict | None) -> str | None:
         lines.append(f"Тариф: {tariff}.")
     elif base:
         lines.append(f"Фиксированная стоимость: {_money_text(base, currency)}.")
+    if base_description:
+        lines.extend(["", "В базовую стоимость входит:", base_description, ""])
     lines.append(f"Продолжительность: {duration_text}.")
     lines.append("Итоговая стоимость может быть скорректирована администратором.")
     return "\n".join(lines)
@@ -1045,6 +1052,7 @@ async def _pricing_admin_text(form: dict, pricing: dict) -> str:
     currency = str(await db.get_setting("crm_currency", "₽") or "₽")
     enabled = bool(pricing.get("enabled"))
     base = max(0, int(pricing.get("base_amount") or 0))
+    base_description = str(pricing.get("base_description") or "").strip()
     included = max(0, int(pricing.get("included_hours") or 0))
     extra = max(0, int(pricing.get("extra_hour_amount") or 0))
     buffer_before = max(0, int(pricing.get("buffer_before_minutes") or 0))
@@ -1058,6 +1066,7 @@ async def _pricing_admin_text(form: dict, pricing: dict) -> str:
         "",
         f"Расчёт: {'🟢 включён' if enabled else '⚪ выключен'}",
         f"Базовая стоимость: <b>{html.escape(_money_text(base, currency))}</b>",
+        f"Описание базы: {html.escape(base_description) if base_description else '—'}",
         f"В базовую стоимость включено: <b>{included} ч</b>",
         f"Каждый начатый дополнительный час: <b>{html.escape(_money_text(extra, currency))}</b>",
         f"Технический буфер до: <b>{html.escape(_duration_minutes_text(buffer_before))}</b>",
@@ -4191,6 +4200,16 @@ async def _pricing_edit_start(
             "Например: <code>60000</code> или <code>60 000</code>.\n\n"
             f"Сейчас: {_money_text(pricing.get('base_amount'), str(await db.get_setting('crm_currency', '₽') or '₽'))}"
         )
+    elif field == "base_description":
+        await state.set_state(AdminStates.pricing_base_description)
+        current = str(pricing.get("base_description") or "").strip() or "—"
+        prompt = (
+            "Введите пояснение к базовой стоимости — что именно входит в указанную сумму.\n"
+            "Можно использовать несколько строк. Например:\n\n"
+            "<code>До 6 часов аренды\nМебель площадки\nБазовая уборка\nДежурный администратор</code>\n\n"
+            "Чтобы удалить описание, отправьте <code>-</code>.\n\n"
+            f"Сейчас:\n{html.escape(current)}"
+        )
     elif field == "included_hours":
         await state.set_state(AdminStates.pricing_included_hours)
         prompt = (
@@ -4233,6 +4252,11 @@ async def admin_pricing_base_start(callback: CallbackQuery, state: FSMContext) -
     await _pricing_edit_start(callback, state, field="base_amount")
 
 
+@router.callback_query(F.data.startswith("adm:pricing_description:"))
+async def admin_pricing_description_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _pricing_edit_start(callback, state, field="base_description")
+
+
 @router.callback_query(F.data.startswith("adm:pricing_hours:"))
 async def admin_pricing_hours_start(callback: CallbackQuery, state: FSMContext) -> None:
     await _pricing_edit_start(callback, state, field="included_hours")
@@ -4265,7 +4289,16 @@ async def _pricing_save_value(
         await state.clear()
         await message.answer("Форма не найдена.")
         return
-    if field == "included_hours":
+    if field == "base_description":
+        raw = (message.text or "").strip()
+        if not raw:
+            await message.answer("Введите описание или отправьте - для удаления.")
+            return
+        value = "" if raw == "-" else raw
+        if len(value) > 1500:
+            await message.answer("Описание слишком длинное. Максимум 1500 символов.")
+            return
+    elif field == "included_hours":
         raw = (message.text or "").strip()
         if not re.fullmatch(r"\d{1,2}", raw):
             await message.answer("Введите количество часов целым числом, например 6 или 0.")
@@ -4299,6 +4332,11 @@ async def _pricing_save_value(
 @router.message(AdminStates.pricing_base_amount)
 async def admin_pricing_base_save(message: Message, state: FSMContext) -> None:
     await _pricing_save_value(message, state, field="base_amount")
+
+
+@router.message(AdminStates.pricing_base_description)
+async def admin_pricing_description_save(message: Message, state: FSMContext) -> None:
+    await _pricing_save_value(message, state, field="base_description")
 
 
 @router.message(AdminStates.pricing_included_hours)

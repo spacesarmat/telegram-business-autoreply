@@ -329,6 +329,7 @@ class Database:
                     form_id INTEGER PRIMARY KEY,
                     enabled INTEGER NOT NULL DEFAULT 0,
                     base_amount INTEGER NOT NULL DEFAULT 0,
+                    base_description TEXT NOT NULL DEFAULT '',
                     included_hours INTEGER NOT NULL DEFAULT 0,
                     extra_hour_amount INTEGER NOT NULL DEFAULT 0,
                     buffer_before_minutes INTEGER NOT NULL DEFAULT 0,
@@ -593,6 +594,10 @@ class Database:
                 row["name"]
                 for row in await (await db.execute("PRAGMA table_info(form_pricing)")).fetchall()
             }
+            if "base_description" not in pricing_columns:
+                await db.execute(
+                    "ALTER TABLE form_pricing ADD COLUMN base_description TEXT NOT NULL DEFAULT ''"
+                )
             if "buffer_before_minutes" not in pricing_columns:
                 await db.execute(
                     "ALTER TABLE form_pricing ADD COLUMN buffer_before_minutes INTEGER NOT NULL DEFAULT 0"
@@ -956,6 +961,7 @@ class Database:
                 "form_id": form_id,
                 "enabled": 0,
                 "base_amount": 0,
+                "base_description": "",
                 "included_hours": 0,
                 "extra_hour_amount": 0,
                 "buffer_before_minutes": 0,
@@ -970,6 +976,7 @@ class Database:
                     SELECT f.*,
                            COALESCE(p.enabled, 0) AS pricing_enabled,
                            COALESCE(p.base_amount, 0) AS base_amount,
+                           COALESCE(p.base_description, '') AS base_description,
                            COALESCE(p.included_hours, 0) AS included_hours,
                            COALESCE(p.extra_hour_amount, 0) AS extra_hour_amount,
                            COALESCE(p.buffer_before_minutes, 0) AS buffer_before_minutes,
@@ -985,7 +992,7 @@ class Database:
 
     async def update_form_pricing(self, form_id: int, field: str, value: Any) -> None:
         allowed = {
-            "enabled", "base_amount", "included_hours", "extra_hour_amount",
+            "enabled", "base_amount", "base_description", "included_hours", "extra_hour_amount",
             "buffer_before_minutes", "buffer_after_minutes"
         }
         if field not in allowed:

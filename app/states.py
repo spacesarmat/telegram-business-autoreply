@@ -34,6 +34,7 @@ class AdminStates(StatesGroup):
     status_template = State()
 
     pricing_base_amount = State()
+    pricing_base_description = State()
     pricing_included_hours = State()
     pricing_extra_hour_amount = State()
     pricing_buffer_before = State()
