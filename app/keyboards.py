@@ -356,6 +356,35 @@ def time_slots_keyboard(
     return builder.as_markup()
 
 
+def end_time_slots_keyboard(
+    question_id: int,
+    options: list[tuple[str, str]],
+    busy_values: set[str],
+    *,
+    required: bool,
+    can_go_back: bool,
+) -> InlineKeyboardMarkup:
+    """Keyboard for event end time, including next-day labels such as 05:00 +1д."""
+    builder = InlineKeyboardBuilder()
+    for value, label in options:
+        compact = value.replace(":", "")
+        if value in busy_values:
+            builder.button(text=f"× {label}", callback_data=f"time:busy:{question_id}:{compact}")
+        else:
+            builder.button(text=label, callback_data=f"time:pick:{question_id}:{compact}")
+    builder.adjust(3)
+    row: list[InlineKeyboardButton] = []
+    if can_go_back:
+        row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data="form:back"))
+    if not required:
+        row.append(InlineKeyboardButton(text="⏭ Пропустить", callback_data="form:skip"))
+    if row:
+        builder.row(*row)
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:menu"))
+    builder.row(InlineKeyboardButton(text="❌ Отменить заявку", callback_data="form:cancel"))
+    return builder.as_markup()
+
+
 def admin_submissions_list(submissions: list[dict], current_filter: str = "all") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(

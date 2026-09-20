@@ -35,6 +35,7 @@ from .keyboards import (
     admin_submissions_list,
     calendar_keyboard,
     delete_confirm,
+    end_time_slots_keyboard,
     form_confirmation,
     form_question_nav,
     public_menu,
@@ -272,36 +273,190 @@ async def _busy_time_slots(date_iso: str | None, slots: list[str]) -> set[str]:
     return busy
 
 
-def _extract_booking_slot(questions: list[dict], answers: dict[str, str]) -> tuple[str, str | None, str | None] | None:
+def _is_end_time_question(question: dict) -> bool:
+    label = str(question.get("label") or "").strip().casefold()
+    prompt = str(question.get("prompt") or "").strip().casefold()
+    markers = ("оконч", "до сколь", "конец", "заверш")
+    return _question_input_type(question) == "time" and any(
+        marker in label or marker in prompt for marker in markers
+    )
+
+
+def _find_start_time(questions: list[dict], answers: dict[str, str]) -> str | None:
+    time_values: list[str] = []
+    has_explicit_end = any(_is_end_time_question(q) for q in questions)
+    for question in questions:
+        if _question_input_type(question) != "time":
+            continue
+        parsed = _parse_time_answer(answers.get(str(question["id"])))
+        if not parsed:
+            continue
+        time_values.append(parsed)
+        if not _is_end_time_question(question):
+            return parsed
+    if not has_explicit_end and time_values:
+        return time_values[0]
+    return None
+
+
+def _find_end_time(questions: list[dict], answers: dict[str, str]) -> str | None:
+    time_values: list[str] = []
+    for question in questions:
+        if _question_input_type(question) != "time":
+            continue
+        parsed = _parse_time_answer(answers.get(str(question["id"])))
+        if not parsed:
+            continue
+        time_values.append(parsed)
+        if _is_end_time_question(question):
+            return parsed
+    return time_values[1] if len(time_values) >= 2 else None
+
+
+async def _max_booking_duration_minutes() -> int:
+    try:
+        hours = int(await db.get_setting("booking_max_duration_hours", "18") or 18)
+    except ValueError:
+        hours = 18
+    return max(1, min(hours, 23)) * 60
+
+
+def _booking_interval(
+    questions: list[dict], answers: dict[str, str]
+) -> dict | None:
+    """Return booking metadata and one/two same-day availability segments.
+
+    If the end clock is earlier than the start clock, the event is considered to
+    finish on the following day. Example: 21:00 -> 05:00 becomes two segments:
+    21:00-24:00 on day one and 00:00-05:00 on day two.
+    """
     date_iso = _selected_date_iso(questions, answers)
     if not date_iso:
         return None
-    start_time: str | None = None
+
+    start_time = _find_start_time(questions, answers)
+    end_time = _find_end_time(questions, answers)
     duration_minutes: int | None = None
-    for question in questions:
-        value = answers.get(str(question["id"]))
-        label = str(question.get("label") or "").casefold()
-        if _question_input_type(question) == "time" or "время" in label:
-            parsed = _parse_time_answer(value)
-            if parsed:
-                start_time = parsed
-        if "продолж" in label or "длитель" in label:
-            if value:
-                match = re.search(r"(\d+(?:[.,]\d+)?)", value)
-                if match:
-                    try:
-                        duration_minutes = max(15, int(float(match.group(1).replace(",", ".")) * 60))
-                    except ValueError:
-                        pass
+
+    # Backward compatibility for old submissions that still contain duration.
+    if not end_time:
+        for question in questions:
+            label = str(question.get("label") or "").casefold()
+            if "продолж" not in label and "длитель" not in label:
+                continue
+            value = answers.get(str(question["id"]))
+            if not value:
+                continue
+            match = re.search(r"(\d+(?:[.,]\d+)?)", value)
+            if match:
+                try:
+                    duration_minutes = max(15, int(float(match.group(1).replace(",", ".")) * 60))
+                except ValueError:
+                    pass
+            break
+
     if not start_time:
-        return date_iso, None, None
-    if duration_minutes is None:
-        duration_minutes = 60
-    end_minutes = _time_to_minutes(start_time) + duration_minutes
-    end_time = _minutes_to_time(min(end_minutes, 23 * 60 + 59))
-    if end_time <= start_time:
-        end_time = "23:59"
-    return date_iso, start_time, end_time
+        return {
+            "date_iso": date_iso,
+            "start_time": None,
+            "end_time": None,
+            "end_date_iso": date_iso,
+            "overnight": False,
+            "duration_minutes": None,
+            "segments": [(date_iso, None, None)],
+        }
+
+    start_minutes = _time_to_minutes(start_time)
+    start_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
+
+    if end_time:
+        end_minutes_clock = _time_to_minutes(end_time)
+        overnight = end_minutes_clock <= start_minutes
+        end_total = end_minutes_clock + (24 * 60 if overnight else 0)
+        duration_minutes = end_total - start_minutes
+    else:
+        if duration_minutes is None:
+            duration_minutes = 60
+        end_total = start_minutes + duration_minutes
+        overnight = end_total >= 24 * 60
+        end_minutes_clock = end_total % (24 * 60)
+        end_time = f"{end_minutes_clock // 60:02d}:{end_minutes_clock % 60:02d}"
+
+    end_date = start_date + timedelta(days=1 if overnight else 0)
+    if overnight:
+        segments = [
+            (date_iso, start_time, "24:00"),
+            (end_date.isoformat(), "00:00", end_time),
+        ]
+    else:
+        segments = [(date_iso, start_time, end_time)]
+
+    return {
+        "date_iso": date_iso,
+        "start_time": start_time,
+        "end_time": end_time,
+        "end_date_iso": end_date.isoformat(),
+        "overnight": overnight,
+        "duration_minutes": duration_minutes,
+        "segments": segments,
+    }
+
+
+async def _booking_interval_conflicts(
+    interval: dict | None, *, exclude_submission_id: int | None = None
+) -> bool:
+    if not interval:
+        return False
+    for date_iso, start_time, end_time in interval["segments"]:
+        if await db.booking_conflicts(
+            date_iso, start_time, end_time, exclude_submission_id=exclude_submission_id
+        ):
+            return True
+    return False
+
+
+async def _booking_end_time_options(
+    questions: list[dict], answers: dict[str, str]
+) -> tuple[list[tuple[str, str]], set[str]]:
+    start_time = _find_start_time(questions, answers)
+    if not start_time:
+        slots = await _booking_time_slots()
+        return [(slot, slot) for slot in slots], set()
+
+    try:
+        step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
+    except ValueError:
+        step = 60
+    step = max(15, min(step, 240))
+    max_duration = await _max_booking_duration_minutes()
+    start_minutes = _time_to_minutes(start_time)
+
+    options: list[tuple[str, str]] = []
+    busy: set[str] = set()
+    end_question = next((q for q in questions if _is_end_time_question(q)), None)
+    for offset in range(step, max_duration + 1, step):
+        total = start_minutes + offset
+        value_minutes = total % (24 * 60)
+        value = f"{value_minutes // 60:02d}:{value_minutes % 60:02d}"
+        label = f"{value} +1д" if total >= 24 * 60 else value
+        options.append((value, label))
+
+        if end_question:
+            temp_answers = dict(answers)
+            temp_answers[str(end_question["id"])] = value
+            if await _booking_interval_conflicts(_booking_interval(questions, temp_answers)):
+                busy.add(value)
+    return options, busy
+
+
+def _booking_interval_summary(interval: dict | None) -> str | None:
+    if not interval or not interval.get("start_time") or not interval.get("end_time"):
+        return None
+    duration = int(interval.get("duration_minutes") or 0)
+    hours, minutes = divmod(duration, 60)
+    duration_text = f"{hours} ч" if not minutes else f"{hours} ч {minutes} мин"
+    next_day = " (+1 день)" if interval.get("overnight") else ""
+    return f"{interval['start_time']}–{interval['end_time']}{next_day} · {duration_text}"
 
 
 SUBMISSION_STATUS_NAMES = {
@@ -399,6 +554,9 @@ async def _submission_admin_text(submission: dict) -> str:
         for question in questions:
             value = answers.get(str(question["id"])) or "—"
             lines.append(f"<b>{html.escape(str(question['label']))}:</b> {html.escape(str(value))}")
+        interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
+        if interval_summary:
+            lines.extend(["", f"<b>🕐 Интервал:</b> {html.escape(interval_summary)}"])
     else:
         for key, value in answers.items():
             lines.append(f"<b>Поле {html.escape(str(key))}:</b> {html.escape(str(value))}")
@@ -479,6 +637,9 @@ def _form_preview_text(form: dict, questions: list[dict], answers: dict[str, str
     for question in questions:
         answer = answers.get(str(question["id"])) or "—"
         lines.append(f"{question['label']}: {answer}")
+    interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
+    if interval_summary:
+        lines.extend(["", f"🕐 Интервал: {interval_summary}"])
     lines.append("")
     lines.append("Если всё верно, нажмите «Отправить заявку».")
     return "\n".join(lines)
@@ -632,14 +793,46 @@ async def send_current_form_question(
         return
 
     if input_type == "time":
-        slots = await _booking_time_slots()
         date_iso = _selected_date_iso(questions, session["answers"])
+        if _is_end_time_question(question):
+            options, busy_values = await _booking_end_time_options(questions, session["answers"])
+            start_time = _find_start_time(questions, session["answers"])
+            text = (
+                f"📝 {form['name']}\n\n"
+                f"Вопрос {index + 1} из {len(questions)}\n"
+                f"{question['prompt']}{suffix}\n\n"
+            )
+            if start_time:
+                text += (
+                    f"Начало: {start_time}. Выберите время окончания.\n"
+                    "Время после полуночи отмечено «+1д» и относится к следующему дню.\n"
+                    "Можно также ввести время вручную в формате ЧЧ:ММ."
+                )
+            else:
+                text += "Сначала укажите время начала или введите окончание вручную в формате ЧЧ:ММ."
+            if date_iso:
+                text += "\n× — этот интервал пересекается с уже занятой бронью."
+            await _upsert_form_message(
+                bot,
+                session,
+                text=text,
+                reply_markup=end_time_slots_keyboard(
+                    int(question["id"]),
+                    options,
+                    busy_values,
+                    required=bool(question["required"]),
+                    can_go_back=index > 0,
+                ),
+            )
+            return
+
+        slots = await _booking_time_slots()
         busy_slots = await _busy_time_slots(date_iso, slots)
         text = (
             f"📝 {form['name']}\n\n"
             f"Вопрос {index + 1} из {len(questions)}\n"
             f"{question['prompt']}{suffix}\n\n"
-            "Выберите свободное время или введите его вручную в формате ЧЧ:ММ."
+            "Выберите свободное время начала или введите его вручную в формате ЧЧ:ММ."
         )
         if date_iso:
             text += "\n× — время уже занято."
@@ -768,18 +961,58 @@ async def handle_form_message(
     elif input_type == "time":
         answer = _parse_time_answer(message.text)
         if not answer:
+            await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
             await send_current_form_question(bot, message.chat.id)
             return True
-        date_iso = _selected_date_iso(questions, session["answers"])
-        if date_iso:
-            try:
-                step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
-            except ValueError:
-                step = 60
-            end_time = _minutes_to_time(min(_time_to_minutes(answer) + max(15, step), 23 * 60 + 59))
-            if await db.booking_conflicts(date_iso, answer, end_time):
+
+        temp_answers = dict(session["answers"])
+        temp_answers[str(question["id"])] = answer
+        interval = _booking_interval(questions, temp_answers)
+
+        if _is_end_time_question(question) and interval and interval.get("start_time"):
+            max_duration = await _max_booking_duration_minutes()
+            if int(interval.get("duration_minutes") or 0) > max_duration:
+                await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+                await _upsert_form_message(
+                    bot,
+                    session,
+                    text=(
+                        f"⚠️ Слишком длинный интервал. Максимум — {max_duration // 60} ч.\n\n"
+                        "Выберите другое время окончания."
+                    ),
+                    reply_markup=form_question_nav(bool(question["required"]), index > 0),
+                )
+                return True
+            if await _booking_interval_conflicts(interval):
+                await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
                 await send_current_form_question(bot, message.chat.id)
                 return True
+        else:
+            date_iso = _selected_date_iso(questions, temp_answers)
+            existing_end = _find_end_time(questions, temp_answers)
+            if existing_end and interval:
+                max_duration = await _max_booking_duration_minutes()
+                if int(interval.get("duration_minutes") or 0) > max_duration:
+                    await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+                    await send_current_form_question(bot, message.chat.id)
+                    return True
+                if await _booking_interval_conflicts(interval):
+                    await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+                    await send_current_form_question(bot, message.chat.id)
+                    return True
+            elif date_iso:
+                try:
+                    step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
+                except ValueError:
+                    step = 60
+                end_minutes = _time_to_minutes(answer) + max(15, step)
+                end_time = f"{min(end_minutes, 24 * 60) // 60:02d}:{min(end_minutes, 24 * 60) % 60:02d}"
+                if end_minutes >= 24 * 60:
+                    end_time = "24:00"
+                if await db.booking_conflicts(date_iso, answer, end_time):
+                    await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+                    await send_current_form_question(bot, message.chat.id)
+                    return True
     else:
         answer = _message_answer_text(message)
 
@@ -828,6 +1061,9 @@ def _submission_chat_text(
     for question in questions:
         value = answers.get(str(question["id"])) or "—"
         lines.append(f"{question['label']}: {value}")
+    interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
+    if interval_summary:
+        lines.extend(["", f"🕐 Интервал: {interval_summary}"])
     lines.extend(
         [
             "",
@@ -1250,18 +1486,46 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
     if not data or not isinstance(callback.message, Message):
         return
     session, question, questions = data
-    date_iso = _selected_date_iso(questions, session["answers"])
-    try:
-        step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
-    except ValueError:
-        step = 60
-    end_time = _minutes_to_time(min(_time_to_minutes(selected) + max(15, step), 23 * 60 + 59))
-    if date_iso and await db.booking_conflicts(date_iso, selected, end_time):
-        await callback.answer("Это время уже занято", show_alert=True)
-        await send_current_form_question(bot, callback.message.chat.id)
-        return
     answers = dict(session["answers"])
     answers[str(question["id"])] = selected
+    interval = _booking_interval(questions, answers)
+
+    if _is_end_time_question(question) and interval and interval.get("start_time"):
+        max_duration = await _max_booking_duration_minutes()
+        if int(interval.get("duration_minutes") or 0) > max_duration:
+            await callback.answer(
+                f"Максимальный интервал — {max_duration // 60} ч.", show_alert=True
+            )
+            return
+        if await _booking_interval_conflicts(interval):
+            await callback.answer("Этот интервал пересекается с занятой бронью", show_alert=True)
+            await send_current_form_question(bot, callback.message.chat.id)
+            return
+    else:
+        date_iso = _selected_date_iso(questions, answers)
+        existing_end = _find_end_time(questions, answers)
+        if existing_end and interval:
+            max_duration = await _max_booking_duration_minutes()
+            if int(interval.get("duration_minutes") or 0) > max_duration:
+                await callback.answer(
+                    f"Максимальный интервал — {max_duration // 60} ч.", show_alert=True
+                )
+                return
+            if await _booking_interval_conflicts(interval):
+                await callback.answer("Этот интервал пересекается с занятой бронью", show_alert=True)
+                await send_current_form_question(bot, callback.message.chat.id)
+                return
+        elif date_iso:
+            try:
+                step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
+            except ValueError:
+                step = 60
+            end_minutes = _time_to_minutes(selected) + max(15, step)
+            end_time = "24:00" if end_minutes >= 24 * 60 else _minutes_to_time(end_minutes)
+            if await db.booking_conflicts(date_iso, selected, end_time):
+                await callback.answer("Это время уже занято", show_alert=True)
+                await send_current_form_question(bot, callback.message.chat.id)
+                return
     next_index = int(session["current_index"]) + 1
     await db.update_form_session(
         callback.message.chat.id,
@@ -1271,7 +1535,10 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
         keyboard_question_id=0,
     )
     await send_current_form_question(bot, callback.message.chat.id)
-    await callback.answer(f"Время: {selected}")
+    if _is_end_time_question(question) and interval and interval.get("overnight"):
+        await callback.answer(f"Окончание: {selected} (+1 день)")
+    else:
+        await callback.answer(f"Время: {selected}")
 
 
 @router.callback_query(F.data == "form:menu")
@@ -1400,23 +1667,27 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             await send_current_form_question(bot, callback.message.chat.id)
             return
 
-    booking_slot = _extract_booking_slot(questions, session["answers"])
-    if booking_slot:
-        date_iso, start_time, end_time = booking_slot
-        if await db.booking_conflicts(date_iso, start_time, end_time):
-            target_index = 0
+    booking_interval = _booking_interval(questions, session["answers"])
+    if booking_interval and await _booking_interval_conflicts(booking_interval):
+        target_index = 0
+        if booking_interval.get("start_time"):
             for idx, question in enumerate(questions):
-                if _question_input_type(question) == ("time" if start_time else "date"):
+                if _question_input_type(question) == "time" and not _is_end_time_question(question):
                     target_index = idx
                     break
-            await db.update_form_session(
-                callback.message.chat.id, current_index=target_index, status="active"
-            )
-            await callback.answer(
-                "Выбранные дата/время уже заняты. Выберите другой вариант.", show_alert=True
-            )
-            await send_current_form_question(bot, callback.message.chat.id)
-            return
+        else:
+            for idx, question in enumerate(questions):
+                if _question_input_type(question) == "date":
+                    target_index = idx
+                    break
+        await db.update_form_session(
+            callback.message.chat.id, current_index=target_index, status="active"
+        )
+        await callback.answer(
+            "Выбранный интервал уже занят. Выберите другую дату или время.", show_alert=True
+        )
+        await send_current_form_question(bot, callback.message.chat.id)
+        return
 
     submission_id = await db.create_form_submission(session, str(form["name"]))
     await _upsert_form_message(
@@ -2389,26 +2660,22 @@ async def admin_request_status(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer(f"Статус уже: {SUBMISSION_STATUS_NAMES[new_status]}")
         return
     questions = await db.list_form_questions(int(submission["form_id"])) if submission.get("form_id") else []
-    slot = _extract_booking_slot(questions, submission.get("answers") or {}) if questions else None
-    if new_status in BOOKING_STATUSES and slot:
-        date_iso, start_time, end_time = slot
-        if await db.booking_conflicts(
-            date_iso, start_time, end_time, exclude_submission_id=submission_id
+    interval = _booking_interval(questions, submission.get("answers") or {}) if questions else None
+    if new_status in BOOKING_STATUSES and interval:
+        if await _booking_interval_conflicts(
+            interval, exclude_submission_id=submission_id
         ):
             await callback.answer(
-                "Нельзя подтвердить: дата/время уже заняты. Проверьте раздел «Занятость».",
+                "Нельзя подтвердить: интервал пересекается с занятой бронью. Проверьте раздел «Занятость».",
                 show_alert=True,
             )
             return
     await db.update_submission_status(submission_id, new_status)
-    if new_status in BOOKING_STATUSES and slot:
-        date_iso, start_time, end_time = slot
-        await db.add_availability_block(
-            date_iso,
-            start_time,
-            end_time,
+    if new_status in BOOKING_STATUSES and interval:
+        await db.replace_submission_availability(
+            submission_id,
+            interval["segments"],
             note=f"Заявка №{submission_id}: {submission['form_name']}",
-            source_submission_id=submission_id,
         )
     else:
         await db.delete_submission_availability(submission_id)
@@ -2486,6 +2753,7 @@ async def admin_availability_date_save(message: Message, state: FSMContext) -> N
         "Теперь укажите период:\n\n"
         "• <code>весь день</code>\n"
         "• <code>18:00-23:00</code>\n"
+        "• через полночь: <code>21:00-05:00</code>\n"
         "• можно добавить заметку: <code>18:00-23:00 | монтаж</code>"
     )
 
@@ -2499,20 +2767,26 @@ async def admin_availability_period_save(message: Message, state: FSMContext) ->
     period = period_raw.strip().casefold()
     note = note_raw.strip() or None
     start_time = end_time = None
+    overnight = False
     if period not in {"весь день", "весьдень", "all", "day"}:
         match = re.fullmatch(r"\s*(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})\s*", period_raw)
         if not match:
-            await message.answer("Введите «весь день» или интервал, например 18:00-23:00.")
+            await message.answer("Введите «весь день» или интервал, например 18:00-23:00 или 21:00-05:00.")
             return
         start_time = _parse_time_answer(match.group(1))
         end_time = _parse_time_answer(match.group(2))
-        if not start_time or not end_time or _time_to_minutes(end_time) <= _time_to_minutes(start_time):
-            await message.answer("Конец интервала должен быть позже начала.")
+        if not start_time or not end_time or end_time == start_time:
+            await message.answer("Укажите разные корректные времена начала и окончания.")
             return
+        overnight = _time_to_minutes(end_time) < _time_to_minutes(start_time)
     data = await state.get_data()
-    await db.add_availability_block(
-        str(data["availability_date"]), start_time, end_time, note=note
-    )
+    date_iso = str(data["availability_date"])
+    if start_time and end_time and overnight:
+        next_date = (datetime.strptime(date_iso, "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
+        await db.add_availability_block(date_iso, start_time, "24:00", note=note)
+        await db.add_availability_block(next_date, "00:00", end_time, note=note)
+    else:
+        await db.add_availability_block(date_iso, start_time, end_time, note=note)
     await state.clear()
     await message.answer("✅ Блокировка добавлена.")
     blocks = await db.list_availability_blocks(start_date=datetime.now().date().isoformat(), limit=30)
@@ -2529,7 +2803,11 @@ async def admin_availability_delete(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer("Некорректная блокировка", show_alert=True)
         return
-    await db.delete_availability_block(block_id)
+    block = await db.get_availability_block(block_id)
+    if block and block.get("source_submission_id"):
+        await db.delete_submission_availability(int(block["source_submission_id"]))
+    else:
+        await db.delete_availability_block(block_id)
     blocks = await db.list_availability_blocks(start_date=datetime.now().date().isoformat(), limit=30)
     if isinstance(callback.message, Message):
         await callback.message.edit_reply_markup(reply_markup=admin_availability(blocks))

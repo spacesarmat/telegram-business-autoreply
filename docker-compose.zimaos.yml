@@ -70,8 +70,8 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.4.2"
+  version: "1.4.3"
   update_at: "2026-09-20"
   release_notes:
-    en_US: Contact fields now use reliable manual phone entry with validation and normalization; Telegram contact messages are still accepted when available.
-    ru_RU: Поля контакта теперь используют надёжный ручной ввод телефона с проверкой и нормализацией; Telegram-контакты также принимаются, если доступны.
+    en_US: Booking forms now support explicit start/end times and overnight intervals such as 21:00-05:00 with cross-midnight conflict protection.
+    ru_RU: Формы бронирования поддерживают время начала и окончания, включая интервалы через полночь, например 21:00-05:00, с проверкой пересечений.

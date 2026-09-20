@@ -17,6 +17,7 @@ DEFAULT_SETTINGS = {
     "booking_day_start": "10:00",
     "booking_day_end": "23:00",
     "booking_slot_minutes": "60",
+    "booking_max_duration_hours": "18",
     "greeting": (
         "Здравствуйте! Спасибо за сообщение.\n\n"
         "Я отвечаю автоматически, если вы пишете впервые или после длительного перерыва. "
@@ -77,8 +78,8 @@ DEFAULT_FORMS: list[dict[str, Any]] = [
         "name": "Аренда Фабрики",
         "questions": [
             ("Дата", "На какую дату нужна аренда Фабрики?", True, "date"),
-            ("Время", "Во сколько планируется начало?", True, "time"),
-            ("Продолжительность", "На сколько часов нужна площадка?", True),
+            ("Время начала", "Во сколько планируется начало?", True, "time"),
+            ("Окончание", "До скольки планируется мероприятие?", True, "time"),
             ("Количество гостей", "Сколько примерно будет гостей?", True),
             ("Формат", "Какой формат мероприятия планируется?", True),
             ("Телефон", "Оставьте контактный телефон для связи.", True, "contact"),
@@ -121,7 +122,7 @@ class Database:
         normalized = " ".join(label.strip().casefold().split())
         if normalized == "дата":
             return "date"
-        if normalized in {"время", "время начала", "начало"}:
+        if normalized in {"время", "время начала", "начало", "окончание", "время окончания", "конец", "до скольки"}:
             return "time"
         if normalized in {"телефон", "контакт", "контактный телефон"}:
             return "contact"
@@ -249,7 +250,7 @@ class Database:
                     start_time TEXT,
                     end_time TEXT,
                     note TEXT,
-                    source_submission_id INTEGER UNIQUE,
+                    source_submission_id INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(source_submission_id) REFERENCES form_submissions(id) ON DELETE CASCADE
@@ -315,6 +316,67 @@ class Database:
                 "UPDATE form_questions SET input_type='time' "
                 "WHERE input_type='text' AND trim(label) IN ('Время', 'время', 'ВРЕМЯ', 'Время начала', 'время начала', 'Начало', 'начало')"
             )
+
+            # v1.4.3: стандартная форма аренды использует явные время начала и окончания.
+            # Мигрируем только нетронутые стандартные вопросы, чтобы не перезаписать кастомные формы.
+            migrated_interval = await (
+                await db.execute("SELECT value FROM settings WHERE key='factory_interval_v143'")
+            ).fetchone()
+            if not migrated_interval:
+                factory_forms = await (
+                    await db.execute("SELECT id FROM forms WHERE trim(name)='Аренда Фабрики'")
+                ).fetchall()
+                for factory_form in factory_forms:
+                    form_id = int(factory_form["id"])
+                    await db.execute(
+                        "UPDATE form_questions SET label='Время начала', input_type='time', updated_at=? "
+                        "WHERE form_id=? AND trim(label)='Время' AND trim(prompt)='Во сколько планируется начало?'",
+                        (utc_now_iso(), form_id),
+                    )
+                    await db.execute(
+                        "UPDATE form_questions SET label='Окончание', prompt='До скольки планируется мероприятие?', "
+                        "input_type='time', updated_at=? "
+                        "WHERE form_id=? AND trim(label)='Продолжительность' "
+                        "AND trim(prompt)='На сколько часов нужна площадка?'",
+                        (utc_now_iso(), form_id),
+                    )
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings(key, value) VALUES('factory_interval_v143', '1')"
+                )
+
+            # v1.4.3: одна подтверждённая заявка может занимать две даты,
+            # поэтому source_submission_id больше не UNIQUE. Старую таблицу
+            # перестраиваем один раз, сохраняя все существующие блокировки.
+            availability_indexes = await (
+                await db.execute("PRAGMA index_list(availability_blocks)")
+            ).fetchall()
+            if any(int(row["unique"]) == 1 and str(row["origin"]) == "u" for row in availability_indexes):
+                await db.execute("ALTER TABLE availability_blocks RENAME TO availability_blocks_v142")
+                await db.execute(
+                    """
+                    CREATE TABLE availability_blocks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        date_iso TEXT NOT NULL,
+                        start_time TEXT,
+                        end_time TEXT,
+                        note TEXT,
+                        source_submission_id INTEGER,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(source_submission_id) REFERENCES form_submissions(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                await db.execute(
+                    """
+                    INSERT INTO availability_blocks(
+                        id, date_iso, start_time, end_time, note, source_submission_id, created_at, updated_at
+                    )
+                    SELECT id, date_iso, start_time, end_time, note, source_submission_id, created_at, updated_at
+                    FROM availability_blocks_v142
+                    """
+                )
+                await db.execute("DROP TABLE availability_blocks_v142")
 
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_form_submissions_status "
@@ -921,6 +983,44 @@ class Database:
             )
             await db.commit()
             return int(cur.lastrowid)
+
+    async def replace_submission_availability(
+        self,
+        submission_id: int,
+        segments: list[tuple[str, str | None, str | None]],
+        *,
+        note: str | None = None,
+    ) -> None:
+        """Replace every availability row owned by a submission.
+
+        A booking that crosses midnight is stored as two rows: one up to 24:00
+        on the start date and one from 00:00 on the following date.
+        """
+        now = utc_now_iso()
+        async with self.connection() as db:
+            await db.execute(
+                "DELETE FROM availability_blocks WHERE source_submission_id=?",
+                (submission_id,),
+            )
+            for date_iso, start_time, end_time in segments:
+                await db.execute(
+                    """
+                    INSERT INTO availability_blocks(
+                        date_iso, start_time, end_time, note, source_submission_id, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        date_iso, start_time, end_time, note, submission_id, now, now
+                    ),
+                )
+            await db.commit()
+
+    async def get_availability_block(self, block_id: int) -> dict[str, Any] | None:
+        async with self.connection() as db:
+            row = await (
+                await db.execute("SELECT * FROM availability_blocks WHERE id=?", (block_id,))
+            ).fetchone()
+            return dict(row) if row else None
 
     async def delete_availability_block(self, block_id: int) -> None:
         async with self.connection() as db:
