@@ -116,3 +116,7 @@ WEB_ADMIN_USERS=manager1:StrongPassword123:manager,viewer1:AnotherPassword123:vi
 
 После обновления откройте `/admin → 💰 Тарифы` или Web Admin → `Тарифы`, выберите форму и заполните «Описание базовой стоимости».
 
+
+## v2.1.0: публичный HTTPS
+
+Для локальной Web Admin достаточно `http://IP_ZIMAOS:18080`. Для публичной `/book`, Telegram Mini App, внешних webhook и ЮKassa нужен HTTPS reverse proxy/domain, направленный на порт 18080. Не публикуйте сам Web Admin без HTTPS и сильного пароля. Mini App URL, API, webhooks и ЮKassa включаются в `Web Admin → 🏭 Операции`. В webhook-настройках ЮKassa укажите `https://ВАШ_ДОМЕН/payments/yookassa/webhook`.

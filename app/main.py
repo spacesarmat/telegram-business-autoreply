@@ -17,9 +17,11 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands
+from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, MenuButtonWebApp, WebAppInfo
 
 from .advanced import AdvancedService
+from .operations import OperationsService
+from .payments import PaymentService
 from .backup import BackupManager
 from .config import Settings, load_settings
 from .concurrency import ConcurrencyMiddleware, UpdateConcurrencyGuard
@@ -58,6 +60,7 @@ from .keyboards import (
     public_menu,
     public_menu_button,
     time_slots_keyboard,
+    venue_keyboard,
 )
 from .reminders import ReminderService
 from .states import AdminStates
@@ -69,6 +72,8 @@ settings: Settings = load_settings()
 APP_TIMEZONE = ZoneInfo(settings.timezone_name)
 db = Database(settings.database_path)
 advanced = AdvancedService(db, APP_TIMEZONE)
+operations = OperationsService(db, APP_TIMEZONE)
+payments = PaymentService(db)
 router = Router(name="main")
 concurrency_guard = UpdateConcurrencyGuard(settings.max_concurrent_updates)
 
@@ -265,6 +270,7 @@ QUESTION_TYPE_NAMES = {
     "contact": "📱 Контакт",
     "guest_count": "👥 Количество гостей",
     "choice": "🎛 Выбор из вариантов",
+    "venue": "🏭 Зал / площадка",
     "file": "📎 Файл / фото",
 }
 
@@ -394,16 +400,28 @@ def _selected_date_iso(questions: list[dict], answers: dict[str, str]) -> str | 
     return None
 
 
-async def _rule_month_availability(form_id: int, year: int, month: int) -> tuple[set[str], set[str]]:
+async def _selected_venue(form_id: int, questions: list[dict], answers: dict[str, str]) -> dict | None:
+    for question in questions:
+        if _question_input_type(question) != "venue":
+            continue
+        return await operations.resolve_venue(form_id, answers.get(str(question["id"])))
+    venues = await operations.venues_for_form(form_id)
+    return venues[0] if len(venues) == 1 else None
+
+
+async def _rule_month_availability(form_id: int, year: int, month: int, venue_id: int | None = None) -> tuple[set[str], set[str]]:
     full: set[str] = set()
     partial: set[str] = set()
     rule = await advanced.get_rule(form_id)
     closed = set(int(x) for x in rule.get("closed_weekdays") or []) if rule.get("enabled") else set()
     recurring = await advanced.list_recurring_blocks(form_id)
+    venue_rule = await operations.get_venue_rule(form_id, venue_id) if venue_id else {"enabled": 0, "closed_weekdays": []}
+    venue_closed = set(int(x) for x in venue_rule.get("closed_weekdays") or []) if venue_rule.get("enabled") else set()
+    venue_recurring = await operations.list_venue_recurring_blocks(form_id, venue_id) if venue_id else []
     for day_num in range(1, calendar.monthrange(year, month)[1] + 1):
         day = datetime(year, month, day_num).date()
         iso = day.isoformat()
-        if day.weekday() in closed:
+        if day.weekday() in closed or day.weekday() in venue_closed:
             full.add(iso)
             continue
         for block in recurring:
@@ -413,17 +431,25 @@ async def _rule_month_availability(form_id: int, year: int, month: int) -> tuple
                 full.add(iso)
                 break
             partial.add(iso)
+        if iso in full:
+            continue
+        for block in venue_recurring:
+            if not block.get("enabled") or int(block.get("weekday") if block.get("weekday") is not None else -1) != day.weekday():
+                continue
+            if not block.get("start_time") or not block.get("end_time"):
+                full.add(iso)
+                break
+            partial.add(iso)
     partial -= full
     return full, partial
 
 
-async def _date_fully_busy(date_iso: str) -> bool:
-    blocks = await db.list_availability_blocks(date_iso=date_iso, limit=200)
-    return any(not block.get("start_time") or not block.get("end_time") for block in blocks)
+async def _date_fully_busy(date_iso: str, venue_id: int | None = None) -> bool:
+    return await operations.date_fully_busy(date_iso, venue_id)
 
 
 async def _busy_time_slots(
-    date_iso: str | None, slots: list[str], form_id: int | None = None
+    date_iso: str | None, slots: list[str], form_id: int | None = None, venue_id: int | None = None
 ) -> set[str]:
     if not date_iso:
         return set()
@@ -434,7 +460,7 @@ async def _busy_time_slots(
             step = 60
         step = max(15, min(step, 240))
         start_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
-        pricing = await db.get_form_pricing(form_id)
+        pricing = await operations.get_effective_pricing(form_id, venue_id)
         before = int(pricing.get("buffer_before_minutes") or 0)
         after = int(pricing.get("buffer_after_minutes") or 0)
         busy: set[str] = set()
@@ -460,24 +486,17 @@ async def _busy_time_slots(
                 "segments": segments,
             }
             if await _booking_interval_conflicts(
-                interval, buffer_before_minutes=before, buffer_after_minutes=after
+                interval, buffer_before_minutes=before, buffer_after_minutes=after, venue_id=venue_id
             ):
                 busy.add(slot)
         return busy
 
-    blocks = await db.list_availability_blocks(date_iso=date_iso, limit=200)
     busy: set[str] = set()
     for slot in slots:
-        point = _time_to_minutes(slot)
-        for block in blocks:
-            if not block.get("start_time") or not block.get("end_time"):
-                busy.add(slot)
-                break
-            start = _time_to_minutes(str(block["start_time"]))
-            end = _time_to_minutes(str(block["end_time"]))
-            if start <= point < end:
-                busy.add(slot)
-                break
+        end_total = _time_to_minutes(slot) + 60
+        end_time = f"{(end_total % (24*60)) // 60:02d}:{(end_total % 60):02d}"
+        if await operations.availability_conflicts(venue_id=venue_id, date_iso=date_iso, start_time=slot, end_time=end_time):
+            busy.add(slot)
     return busy
 
 
@@ -685,22 +704,25 @@ def _booking_interval_with_buffers(
 
 async def _booking_interval_conflicts(
     interval: dict | None, *, exclude_submission_id: int | None = None,
-    buffer_before_minutes: int = 0, buffer_after_minutes: int = 0
+    buffer_before_minutes: int = 0, buffer_after_minutes: int = 0,
+    venue_id: int | None = None, hold_token: str = ""
 ) -> bool:
     if not interval:
         return False
     buffered = _booking_interval_with_buffers(interval, buffer_before_minutes, buffer_after_minutes)
     segments = (buffered or {}).get("technical_segments") or interval.get("segments") or []
     for date_iso, start_time, end_time in segments:
-        if await db.booking_conflicts(
-            date_iso, start_time, end_time, exclude_submission_id=exclude_submission_id
+        if await operations.availability_conflicts(
+            venue_id=venue_id, date_iso=date_iso, start_time=start_time, end_time=end_time,
+            exclude_submission_id=exclude_submission_id, exclude_hold_token=hold_token
         ):
             return True
     return False
 
 
 async def _booking_interval_block_reason_for_form(
-    form_id: int, interval: dict | None, *, exclude_submission_id: int | None = None
+    form_id: int, interval: dict | None, *, exclude_submission_id: int | None = None,
+    venue_id: int | None = None, hold_token: str = ""
 ) -> str | None:
     """Return a user-facing reason why a booking interval is unavailable.
 
@@ -716,7 +738,11 @@ async def _booking_interval_block_reason_for_form(
     if rule_violation:
         return str(rule_violation)
 
-    pricing = await db.get_form_pricing(form_id)
+    venue_rule_violation = await operations.venue_rule_violation(form_id, venue_id, interval)
+    if venue_rule_violation:
+        return str(venue_rule_violation)
+
+    pricing = await operations.get_effective_pricing(form_id, venue_id)
     before = int(pricing.get("buffer_before_minutes") or 0)
     after = int(pricing.get("buffer_after_minutes") or 0)
     buffered = _booking_interval_with_buffers(interval, before, after)
@@ -724,23 +750,28 @@ async def _booking_interval_block_reason_for_form(
     recurring_violation = await advanced.recurring_violation(form_id, recurring_segments)
     if recurring_violation:
         return str(recurring_violation)
+    venue_recurring_violation = await operations.venue_recurring_violation(form_id, venue_id, recurring_segments)
+    if venue_recurring_violation:
+        return str(venue_recurring_violation)
 
     if await _booking_interval_conflicts(
         interval,
         exclude_submission_id=exclude_submission_id,
         buffer_before_minutes=before,
         buffer_after_minutes=after,
+        venue_id=venue_id, hold_token=hold_token,
     ):
         return "Интервал пересекается с существующей бронью, занятостью или техническим буфером."
     return None
 
 
 async def _booking_interval_conflicts_for_form(
-    form_id: int, interval: dict | None, *, exclude_submission_id: int | None = None
+    form_id: int, interval: dict | None, *, exclude_submission_id: int | None = None,
+    venue_id: int | None = None, hold_token: str = ""
 ) -> bool:
     return (
         await _booking_interval_block_reason_for_form(
-            form_id, interval, exclude_submission_id=exclude_submission_id
+            form_id, interval, exclude_submission_id=exclude_submission_id, venue_id=venue_id, hold_token=hold_token
         )
     ) is not None
 
@@ -769,7 +800,9 @@ async def _booking_end_time_options(
     step = max(15, min(step, 240))
     max_duration = await _max_booking_duration_minutes()
     start_minutes = _time_to_minutes(start_time)
-    pricing = await db.get_form_pricing(form_id)
+    venue = await _selected_venue(form_id, questions, answers)
+    venue_id = int(venue["id"]) if venue else None
+    pricing = await operations.get_effective_pricing(form_id, venue_id)
     before = int(pricing.get("buffer_before_minutes") or 0)
     after = int(pricing.get("buffer_after_minutes") or 0)
 
@@ -787,7 +820,7 @@ async def _booking_end_time_options(
             temp_answers = dict(answers)
             temp_answers[str(end_question["id"])] = value
             reason = await _booking_interval_block_reason_for_form(
-                form_id, _booking_interval(questions, temp_answers)
+                form_id, _booking_interval(questions, temp_answers), venue_id=venue_id
             )
             if reason:
                 blocked[value] = reason
@@ -922,7 +955,9 @@ async def _calculate_form_pricing(
     rate acts as a straight hourly tariff; base_amount may still be used as
     a fixed starting fee.
     """
-    pricing = await db.get_form_pricing(form_id)
+    venue = await _selected_venue(form_id, questions, answers)
+    venue_id = int(venue["id"]) if venue else None
+    pricing = await operations.get_effective_pricing(form_id, venue_id)
     if not pricing.get("enabled"):
         return None
     interval = _booking_interval(questions, answers)
@@ -982,6 +1017,9 @@ async def _calculate_form_pricing(
         "overnight": bool(interval.get("overnight")),
         "buffer_before_minutes": max(0, int(pricing.get("buffer_before_minutes") or 0)),
         "buffer_after_minutes": max(0, int(pricing.get("buffer_after_minutes") or 0)),
+        "venue_id": venue_id,
+        "venue_name": str(venue.get("name") or "") if venue else "",
+        "venue_override": bool(pricing.get("venue_override")),
     }
 
 
@@ -1171,6 +1209,52 @@ async def _notify_submission_status_change(
         return False, str(exc)
 
 
+async def _notify_waitlist_for_submission(bot: Bot, submission: dict) -> int:
+    """Notify waiting clients when a cancelled booking frees their requested slot."""
+    if not submission.get("form_id"):
+        return 0
+    questions = await db.list_form_questions(int(submission["form_id"]))
+    interval = _booking_interval(questions, submission.get("answers") or {}) if questions else None
+    if not interval:
+        return 0
+    venue_id = int(submission.get("venue_id") or 0) or None
+    sent = 0
+    for entry in await operations.list_waitlist(status="waiting", limit=500):
+        if str(entry.get("date_iso") or "") != str(interval.get("date_iso") or ""):
+            continue
+        ev = int(entry.get("venue_id") or 0) or None
+        if venue_id and ev and ev != venue_id:
+            continue
+        est = str(entry.get("start_time") or "")
+        een = str(entry.get("end_time") or "")
+        ist = str(interval.get("start_time") or "")
+        ien = str(interval.get("end_time") or "")
+        if est and een and ist and ien and not operations._overlap(est, een, ist, ien):
+            continue
+        connection_id = entry.get("business_connection_id")
+        if not connection_id:
+            connection = await db.latest_business_connection()
+            if connection and connection.get("enabled") and connection.get("can_reply"):
+                connection_id = connection.get("id")
+        if not connection_id:
+            continue
+        venue = await operations.get_venue(ev) if ev else None
+        text = (
+            "🔔 Освободилось время, которое вы ждали.\n\n"
+            f"Дата: {entry.get('date_iso')}\n"
+            f"Время: {est or '—'}–{een or '—'}\n"
+            f"Зал: {(venue or {}).get('name') or '—'}\n\n"
+            "Если бронь ещё актуальна, откройте меню и создайте заявку — слот доступен, пока его не занял другой клиент."
+        )
+        try:
+            await bot.send_message(chat_id=int(entry["chat_id"]), business_connection_id=str(connection_id), text=text, parse_mode=None, reply_markup=public_menu_button())
+            await operations.set_waitlist_status(int(entry["id"]), "notified")
+            sent += 1
+        except TelegramAPIError:
+            logger.warning("Не удалось уведомить лист ожидания entry=%s", entry.get("id"), exc_info=True)
+    return sent
+
+
 async def _notify_submission_amount_change(
     bot: Bot, submission: dict, old_amount: int, new_amount: int
 ) -> tuple[bool, str | None]:
@@ -1268,7 +1352,9 @@ async def _submission_admin_text(submission: dict) -> str:
         interval_summary = _booking_interval_summary(interval)
         if interval_summary:
             lines.extend(["", f"<b>🕐 Интервал:</b> {html.escape(interval_summary)}"])
-            pricing = await db.get_form_pricing(int(submission["form_id"]))
+            pricing = await operations.get_effective_pricing(
+            int(submission["form_id"]), int(submission.get("venue_id") or 0) or None
+        )
             before = int(pricing.get("buffer_before_minutes") or 0)
             after = int(pricing.get("buffer_after_minutes") or 0)
             if before or after:
@@ -1467,6 +1553,26 @@ async def _form_callback_session(callback: CallbackQuery) -> dict | None:
     return session
 
 
+async def _ensure_session_hold(session: dict, form: dict, questions: list[dict]) -> tuple[bool, str]:
+    if _is_test_session(session):
+        return True, ""
+    interval = _booking_interval(questions, session.get("answers") or {})
+    if not interval:
+        return True, ""
+    venue = await _selected_venue(int(form["id"]), questions, session.get("answers") or {})
+    if not venue:
+        return False, "Сначала выберите зал / площадку."
+    pricing = await operations.get_effective_pricing(int(form["id"]), int(venue["id"]))
+    buffered = _booking_interval_with_buffers(
+        interval, int(pricing.get("buffer_before_minutes") or 0), int(pricing.get("buffer_after_minutes") or 0)
+    )
+    segments = (buffered or {}).get("technical_segments") or interval.get("segments") or []
+    return await operations.acquire_hold(
+        form_id=int(form["id"]), venue_id=int(venue["id"]), chat_id=int(session["chat_id"]),
+        submission_token=str(session.get("submission_token") or ""), segments=segments,
+    )
+
+
 async def send_current_form_question(
     bot: Bot, chat_id: int, *, calendar_year: int | None = None, calendar_month: int | None = None
 ) -> None:
@@ -1531,6 +1637,14 @@ async def send_current_form_question(
         session = await db.get_form_session(chat_id)
         if not session:
             return
+        hold_ok, hold_info = await _ensure_session_hold(session, form, questions)
+        if not hold_ok:
+            await _upsert_form_message(
+                bot, session,
+                text=f"⚠️ {hold_info}\n\nПока вы заполняли заявку, выбранный интервал стал недоступен. Нажмите «Изменить ответы» и выберите другое время.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Изменить ответы", callback_data="form:edit")],[InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:home")]]),
+            )
+            return
         selected_rows = await _selected_addon_rows(
             int(form["id"]), session.get("selected_addon_ids") or []
         )
@@ -1555,6 +1669,24 @@ async def send_current_form_question(
     if existing:
         suffix += f"\n\nТекущий ответ: {existing}"
 
+    if input_type == "venue":
+        venues = await operations.venues_for_form(int(form["id"]))
+        text = (
+            f"📝 {form['name']}\n\n"
+            f"Вопрос {index + 1} из {len(questions)}\n"
+            f"{question['prompt']}{suffix}\n\n"
+            "Выберите площадку / зал."
+        )
+        if not venues:
+            text += "\n⚠️ Для этой формы пока не настроено ни одной площадки."
+        await _upsert_form_message(
+            bot, session, text=text,
+            reply_markup=venue_keyboard(
+                int(question["id"]), venues, required=bool(question["required"]), can_go_back=index > 0
+            ) if venues else form_question_nav(bool(question["required"]), index > 0),
+        )
+        return
+
     if input_type == "date":
         today = local_today()
         selected = _date_from_answer(existing)
@@ -1571,8 +1703,10 @@ async def send_current_form_question(
             "Выберите день в календаре или введите дату вручную в формате ДД.ММ.ГГГГ.\n"
             "Прошедшие даты недоступны. × — дата занята полностью, • — есть занятые часы."
         )
-        full_busy_dates, partial_busy_dates = await db.month_availability(year, month)
-        rule_full, rule_partial = await _rule_month_availability(int(form["id"]), year, month)
+        venue = await _selected_venue(int(form["id"]), questions, session["answers"])
+        venue_id = int(venue["id"]) if venue else None
+        full_busy_dates, partial_busy_dates = await operations.month_availability(year, month, venue_id)
+        rule_full, rule_partial = await _rule_month_availability(int(form["id"]), year, month, venue_id)
         full_busy_dates |= rule_full
         partial_busy_dates |= rule_partial
         partial_busy_dates -= full_busy_dates
@@ -1632,7 +1766,9 @@ async def send_current_form_question(
             return
 
         slots = await _booking_time_slots()
-        busy_slots = await _busy_time_slots(date_iso, slots, int(form["id"]))
+        venue = await _selected_venue(int(form["id"]), questions, session["answers"])
+        venue_id = int(venue["id"]) if venue else None
+        busy_slots = await _busy_time_slots(date_iso, slots, int(form["id"]), venue_id)
         text = (
             f"📝 {form['name']}\n\n"
             f"Вопрос {index + 1} из {len(questions)}\n"
@@ -1851,6 +1987,14 @@ async def handle_form_message(
             await _upsert_form_message(bot, session, text="Не удалось сохранить файл. Попробуйте отправить его ещё раз.", reply_markup=form_question_nav(bool(question["required"]), index > 0))
             return True
         answer = f"attachment:{stored_name}|{original_name[:180]}"
+    elif input_type == "venue":
+        raw = (message.text or "").strip()
+        venue = await operations.resolve_venue(int(session["form_id"]), raw)
+        if not venue:
+            await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+            await send_current_form_question(bot, message.chat.id)
+            return True
+        answer = str(venue["name"])
     elif input_type == "choice":
         options = [str(x) for x in (question.get("choice_options") or []) if str(x).strip()]
         if int(session.get("custom_choice_question_id") or 0) == int(question["id"]):
@@ -1892,7 +2036,9 @@ async def handle_form_message(
             await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
             await send_current_form_question(bot, message.chat.id)
             return True
-        if parsed_date and await _date_fully_busy(parsed_date.isoformat()):
+        venue = await _selected_venue(int(session["form_id"]), questions, session["answers"])
+        venue_id = int(venue["id"]) if venue else None
+        if parsed_date and await _date_fully_busy(parsed_date.isoformat(), venue_id):
             await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
             await send_current_form_question(bot, message.chat.id)
             return True
@@ -1906,6 +2052,8 @@ async def handle_form_message(
         temp_answers = dict(session["answers"])
         temp_answers[str(question["id"])] = answer
         interval = _booking_interval(questions, temp_answers)
+        selected_venue = await _selected_venue(int(session["form_id"]), questions, temp_answers)
+        selected_venue_id = int(selected_venue["id"]) if selected_venue else None
 
         if _is_end_time_question(question) and interval and interval.get("start_time"):
             max_duration = await _max_booking_duration_minutes()
@@ -1921,7 +2069,7 @@ async def handle_form_message(
                     reply_markup=form_question_nav(bool(question["required"]), index > 0),
                 )
                 return True
-            reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval)
+            reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval, venue_id=selected_venue_id)
             if reason:
                 await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
                 options, blocked = await _booking_end_time_options(
@@ -1949,7 +2097,7 @@ async def handle_form_message(
                     await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
                     await send_current_form_question(bot, message.chat.id)
                     return True
-                if await _booking_interval_conflicts_for_form(int(session["form_id"]), interval):
+                if await _booking_interval_conflicts_for_form(int(session["form_id"]), interval, venue_id=selected_venue_id):
                     await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
                     await send_current_form_question(bot, message.chat.id)
                     return True
@@ -1960,7 +2108,7 @@ async def handle_form_message(
                 if start_reason:
                     await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
                     slots = await _booking_time_slots()
-                    busy_slots = await _busy_time_slots(date_iso, slots, int(session["form_id"]))
+                    busy_slots = await _busy_time_slots(date_iso, slots, int(session["form_id"]), selected_venue_id)
                     await _upsert_form_message(
                         bot,
                         session,
@@ -2518,13 +2666,15 @@ async def calendar_today(callback: CallbackQuery, bot: Bot) -> None:
         return
     session, question = data
     today_date = local_today()
-    if await _date_fully_busy(today_date.isoformat()):
+    questions = await db.list_form_questions(int(session["form_id"]))
+    venue = await _selected_venue(int(session["form_id"]), questions, session["answers"])
+    venue_id = int(venue["id"]) if venue else None
+    if await _date_fully_busy(today_date.isoformat(), venue_id):
         await callback.answer("Сегодня дата полностью занята", show_alert=True)
         return
     selected = today_date.strftime("%d.%m.%Y")
     answers = dict(session["answers"])
     answers[str(question["id"])] = selected
-    questions = await db.list_form_questions(int(session["form_id"]))
     next_index = int(session["current_index"]) + 1
     await db.update_form_session(
         callback.message.chat.id,
@@ -2553,13 +2703,15 @@ async def calendar_select_day(callback: CallbackQuery, bot: Bot) -> None:
     if selected_date < local_today():
         await callback.answer("Нельзя выбрать дату раньше сегодняшней.", show_alert=True)
         return
-    if await _date_fully_busy(selected_date.isoformat()):
+    questions = await db.list_form_questions(int(session["form_id"]))
+    venue = await _selected_venue(int(session["form_id"]), questions, session["answers"])
+    venue_id = int(venue["id"]) if venue else None
+    if await _date_fully_busy(selected_date.isoformat(), venue_id):
         await callback.answer("Эта дата полностью занята", show_alert=True)
         return
     selected = selected_date.strftime("%d.%m.%Y")
     answers = dict(session["answers"])
     answers[str(question["id"])] = selected
-    questions = await db.list_form_questions(int(session["form_id"]))
     next_index = int(session["current_index"]) + 1
     await db.update_form_session(
         callback.message.chat.id,
@@ -2613,7 +2765,9 @@ async def time_busy(callback: CallbackQuery) -> None:
     answers = dict(session["answers"])
     answers[str(question["id"])] = selected
     interval = _booking_interval(questions, answers)
-    reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval)
+    selected_venue = await _selected_venue(int(session["form_id"]), questions, answers)
+    selected_venue_id = int(selected_venue["id"]) if selected_venue else None
+    reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval, venue_id=selected_venue_id)
     await callback.answer(reason or "Этот вариант времени недоступен.", show_alert=True)
 
 
@@ -2637,6 +2791,8 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
     answers = dict(session["answers"])
     answers[str(question["id"])] = selected
     interval = _booking_interval(questions, answers)
+    selected_venue = await _selected_venue(int(session["form_id"]), questions, answers)
+    selected_venue_id = int(selected_venue["id"]) if selected_venue else None
 
     if _is_end_time_question(question) and interval and interval.get("start_time"):
         max_duration = await _max_booking_duration_minutes()
@@ -2645,7 +2801,7 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
                 f"Максимальный интервал — {max_duration // 60} ч.", show_alert=True
             )
             return
-        reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval)
+        reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval, venue_id=selected_venue_id)
         if reason:
             await callback.answer(reason, show_alert=True)
             await send_current_form_question(bot, callback.message.chat.id)
@@ -2660,7 +2816,7 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
                     f"Максимальный интервал — {max_duration // 60} ч.", show_alert=True
                 )
                 return
-            reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval)
+            reason = await _booking_interval_block_reason_for_form(int(session["form_id"]), interval, venue_id=selected_venue_id)
             if reason:
                 await callback.answer(reason, show_alert=True)
                 await send_current_form_question(bot, callback.message.chat.id)
@@ -2775,6 +2931,43 @@ async def choice_pick(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer(f"Выбрано: {selected}")
 
 
+@router.callback_query(F.data.startswith("venue:pick:"))
+async def venue_pick(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, _, question_raw, venue_raw = (callback.data or "").split(":", 3)
+        question_id = int(question_raw)
+        venue_id = int(venue_raw)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректный зал", show_alert=True)
+        return
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message) or session.get("status") != "active":
+        return
+    questions = await db.list_form_questions(int(session["form_id"]))
+    index = int(session["current_index"])
+    if index < 0 or index >= len(questions):
+        await callback.answer("Нет активного вопроса", show_alert=True)
+        return
+    question = questions[index]
+    if int(question["id"]) != question_id or _question_input_type(question) != "venue":
+        await callback.answer("Эта кнопка уже неактивна", show_alert=True)
+        return
+    venue = await operations.get_venue(venue_id)
+    allowed = {int(v["id"]) for v in await operations.venues_for_form(int(session["form_id"]))}
+    if not venue or venue_id not in allowed or not venue.get("enabled"):
+        await callback.answer("Зал больше недоступен", show_alert=True)
+        await send_current_form_question(bot, callback.message.chat.id)
+        return
+    answers = dict(session["answers"]); answers[str(question["id"])] = str(venue["name"])
+    next_index = index + 1
+    await db.update_form_session(
+        callback.message.chat.id, current_index=next_index, answers=answers,
+        status="confirm" if next_index >= len(questions) else "active", keyboard_question_id=0,
+    )
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer(f"Зал: {venue['name']}")
+
+
 @router.callback_query(F.data.startswith("guests:pick:"))
 async def guest_count_pick(callback: CallbackQuery, bot: Bot) -> None:
     try:
@@ -2843,6 +3036,8 @@ async def form_main_menu(callback: CallbackQuery, bot: Bot) -> None:
     if menu_message_id is None:
         await callback.answer("Не удалось открыть меню", show_alert=True)
         return
+    if session:
+        await operations.release_holds(str(session.get("submission_token") or ""))
     await db.delete_form_session(callback.message.chat.id)
     await callback.answer("Главное меню")
 
@@ -2853,6 +3048,7 @@ async def form_cancel(callback: CallbackQuery, bot: Bot) -> None:
     if not session or not isinstance(callback.message, Message):
         return
     await _upsert_form_message(bot, session, text="Заявка отменена.", reply_markup=None)
+    await operations.release_holds(str(session.get("submission_token") or ""))
     await db.delete_form_session(callback.message.chat.id)
     await callback.answer("Отменено")
 
@@ -2969,6 +3165,7 @@ async def form_back(callback: CallbackQuery, bot: Bot) -> None:
     if target < 0:
         await callback.answer("Это первый вопрос", show_alert=True)
         return
+    await operations.release_holds(str(session.get("submission_token") or ""))
     await db.update_form_session(
         callback.message.chat.id, current_index=target, status="active", keyboard_question_id=0,
         custom_choice_question_id=0, addons_confirmed=False
@@ -2982,12 +3179,44 @@ async def form_edit_answers(callback: CallbackQuery, bot: Bot) -> None:
     session = await _form_callback_session(callback)
     if not session or not isinstance(callback.message, Message):
         return
+    await operations.release_holds(str(session.get("submission_token") or ""))
     await db.update_form_session(
         callback.message.chat.id, current_index=0, status="active", keyboard_question_id=0,
         addons_confirmed=False
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer("Можно изменить ответы")
+
+
+async def _nearest_alternative_dates(form_id: int, questions: list[dict], answers: dict[str, str], venue_id: int | None, limit: int = 5) -> list[str]:
+    date_question = next((q for q in questions if _question_input_type(q) == "date"), None)
+    if not date_question:
+        return []
+    current = _date_from_answer(answers.get(str(date_question["id"]))) or local_today()
+    result: list[str] = []
+    for offset in range(1, 31):
+        candidate = current + timedelta(days=offset)
+        temp = dict(answers); temp[str(date_question["id"])] = candidate.strftime("%d.%m.%Y")
+        interval = _booking_interval(questions, temp)
+        if not interval:
+            continue
+        reason = await _booking_interval_block_reason_for_form(form_id, interval, venue_id=venue_id)
+        if not reason:
+            result.append(candidate.isoformat())
+            if len(result) >= limit:
+                break
+    return result
+
+
+def _conflict_actions(alternatives: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for iso in alternatives:
+        dt = datetime.strptime(iso, "%Y-%m-%d").date()
+        rows.append([InlineKeyboardButton(text=f"📅 {dt.strftime('%d.%m.%Y')}", callback_data=f"form:altdate:{iso}")])
+    rows.append([InlineKeyboardButton(text="🔔 В лист ожидания", callback_data="form:waitlist")])
+    rows.append([InlineKeyboardButton(text="✏️ Изменить ответы", callback_data="form:edit")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.callback_query(F.data == "form:submit")
@@ -3029,30 +3258,28 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             await send_current_form_question(bot, callback.message.chat.id)
             return
 
+    venue = await _selected_venue(int(form["id"]), questions, session["answers"])
+    venue_id = int(venue["id"]) if venue else None
     booking_interval = _booking_interval(questions, session["answers"])
     rule_violation = await advanced.booking_rule_violation(int(form["id"]), booking_interval) if booking_interval else None
     if rule_violation:
         await callback.answer(rule_violation[:190], show_alert=True)
         return
-    if booking_interval and await _booking_interval_conflicts_for_form(int(form["id"]), booking_interval):
-        target_index = 0
-        if booking_interval.get("start_time"):
-            for idx, question in enumerate(questions):
-                if _question_input_type(question) == "time" and not _is_end_time_question(question):
-                    target_index = idx
-                    break
-        else:
-            for idx, question in enumerate(questions):
-                if _question_input_type(question) == "date":
-                    target_index = idx
-                    break
-        await db.update_form_session(
-            callback.message.chat.id, current_index=target_index, status="active"
+    if booking_interval and await _booking_interval_conflicts_for_form(
+        int(form["id"]), booking_interval, venue_id=venue_id, hold_token=str(session.get("submission_token") or "")
+    ):
+        alternatives = await _nearest_alternative_dates(int(form["id"]), questions, session["answers"], venue_id)
+        alt_text = "\n".join(f"• {datetime.strptime(x, '%Y-%m-%d').strftime('%d.%m.%Y')}" for x in alternatives) or "Подходящих дат в ближайшие 30 дней не найдено."
+        await _upsert_form_message(
+            bot, session,
+            text=(
+                "⚠️ Выбранный интервал уже занят или временно удерживается другим клиентом.\n\n"
+                "Ближайшие даты с тем же временем:\n" + alt_text +
+                "\n\nМожно выбрать альтернативу, изменить заявку или встать в лист ожидания."
+            ),
+            reply_markup=_conflict_actions(alternatives),
         )
-        await callback.answer(
-            "Выбранный интервал уже занят. Выберите другую дату или время.", show_alert=True
-        )
-        await send_current_form_question(bot, callback.message.chat.id)
+        await callback.answer("Интервал недоступен")
         return
 
     selected_addons = await _selected_addon_rows(
@@ -3097,6 +3324,10 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
         calculated_amount=calculated_amount,
         pricing_details=pricing_details,
     )
+    await db.set_submission_venue(submission_id, venue_id)
+    await operations.ensure_submission_public_token(submission_id)
+    await operations.release_holds(str(session.get("submission_token") or ""), consumed=True)
+    await operations.emit_webhook("submission.created", {"id": submission_id, "form": str(form["name"]), "venue_id": venue_id})
     await _upsert_form_message(
         bot,
         session,
@@ -3108,6 +3339,52 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
     )
     await db.delete_form_session(callback.message.chat.id)
     await callback.answer("Заявка сохранена в этом чате")
+
+
+@router.callback_query(F.data.startswith("form:altdate:"))
+async def form_alternative_date(callback: CallbackQuery, bot: Bot) -> None:
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    try:
+        iso = (callback.data or "").split(":", 2)[2]
+        date_value = datetime.strptime(iso, "%Y-%m-%d").date()
+    except Exception:
+        await callback.answer("Некорректная дата", show_alert=True); return
+    questions = await db.list_form_questions(int(session["form_id"]))
+    q = next((x for x in questions if _question_input_type(x) == "date"), None)
+    if not q:
+        await callback.answer("В форме нет даты", show_alert=True); return
+    answers=dict(session["answers"]); answers[str(q["id"])]=date_value.strftime("%d.%m.%Y")
+    await operations.release_holds(str(session.get("submission_token") or ""))
+    await db.update_form_session(callback.message.chat.id,answers=answers,status="active",current_index=len(questions),addons_confirmed=True)
+    await send_current_form_question(bot,callback.message.chat.id)
+    await callback.answer(f"Дата: {date_value.strftime('%d.%m.%Y')}")
+
+
+@router.callback_query(F.data == "form:waitlist")
+async def form_waitlist(callback: CallbackQuery, bot: Bot) -> None:
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    if _is_test_session(session):
+        await callback.answer("В тестовом режиме лист ожидания не создаётся", show_alert=True); return
+    questions=await db.list_form_questions(int(session["form_id"]))
+    interval=_booking_interval(questions,session["answers"])
+    venue=await _selected_venue(int(session["form_id"]),questions,session["answers"])
+    if not interval:
+        await callback.answer("Не удалось определить дату и время",show_alert=True); return
+    entry_id=await operations.add_waitlist(
+        form_id=int(session["form_id"]), venue_id=int(venue["id"]) if venue else None,
+        chat_id=int(session["chat_id"]), business_connection_id=_telegram_business_id(session.get("business_connection_id")),
+        user_id=session.get("user_id"), username=session.get("username"), date_iso=str(interval["date_iso"]),
+        start_time=str(interval.get("start_time") or ""), end_time=str(interval.get("end_time") or ""),
+        note="Добавлено клиентом из формы",
+    )
+    await operations.release_holds(str(session.get("submission_token") or ""))
+    await _upsert_form_message(bot,session,text=f"🔔 Вы добавлены в лист ожидания №{entry_id}. Если слот освободится, администратор сможет связаться с вами.",reply_markup=public_menu_button())
+    await db.delete_form_session(callback.message.chat.id)
+    await callback.answer("Добавлено в лист ожидания")
 
 
 @router.message(Command("start", "admin"))
@@ -3880,7 +4157,7 @@ async def admin_question_type_set(callback: CallbackQuery) -> None:
     except (ValueError, TypeError):
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    if input_type not in {"text", "date", "time", "contact", "guest_count", "choice", "file"}:
+    if input_type not in {"text", "date", "time", "contact", "guest_count", "choice", "venue", "file"}:
         await callback.answer("Неизвестный тип", show_alert=True)
         return
     question = await db.get_form_question(question_id)
@@ -4682,7 +4959,8 @@ async def _apply_submission_status_change(
     interval = _booking_interval(questions, submission.get("answers") or {}) if questions else None
     if new_status in BOOKING_STATUSES and interval:
         if await _booking_interval_conflicts_for_form(
-            int(submission["form_id"]), interval, exclude_submission_id=submission_id
+            int(submission["form_id"]), interval, exclude_submission_id=submission_id,
+            venue_id=int(submission.get("venue_id") or 0) or None
         ):
             return False, "Интервал пересекается с занятой бронью"
 
@@ -4704,10 +4982,17 @@ async def _apply_submission_status_change(
             submission_id,
             segments,
             note=f"Заявка №{submission_id}: {submission['form_name']}{buffer_note}",
+            venue_id=int(submission.get("venue_id") or 0) or None,
         )
     else:
         await db.delete_submission_availability(submission_id)
 
+    if new_status == "cancelled":
+        await _notify_waitlist_for_submission(bot, submission)
+    await operations.emit_webhook(
+        "submission.status_changed",
+        {"id": submission_id, "old_status": old_status, "new_status": new_status},
+    )
     updated = await db.get_submission(submission_id)
     if not updated:
         return True, f"{SUBMISSION_STATUS_NAMES[new_status]}"
@@ -4736,6 +5021,10 @@ async def _apply_submission_amount_change(
         return True, "Стоимость не изменилась"
     await db.update_submission_crm_field(
         submission_id, "total_amount", new_amount, admin_user_id
+    )
+    await operations.emit_webhook(
+        "submission.amount_changed",
+        {"id": submission_id, "old_amount": old_amount, "new_amount": new_amount},
     )
     updated = await db.get_submission(submission_id)
     if not updated:
@@ -4774,7 +5063,8 @@ async def admin_request_status(callback: CallbackQuery, bot: Bot) -> None:
     interval = _booking_interval(questions, submission.get("answers") or {}) if questions else None
     if new_status in BOOKING_STATUSES and interval:
         if await _booking_interval_conflicts_for_form(
-            int(submission["form_id"]), interval, exclude_submission_id=submission_id
+            int(submission["form_id"]), interval, exclude_submission_id=submission_id,
+            venue_id=int(submission.get("venue_id") or 0) or None
         ):
             await callback.answer(
                 "Нельзя подтвердить: интервал пересекается с занятой бронью. Проверьте раздел «Занятость».",
@@ -4799,6 +5089,7 @@ async def admin_request_status(callback: CallbackQuery, bot: Bot) -> None:
             submission_id,
             segments,
             note=f"Заявка №{submission_id}: {submission['form_name']}{buffer_note}",
+            venue_id=int(submission.get("venue_id") or 0) or None,
         )
     else:
         await db.delete_submission_availability(submission_id)
@@ -5310,6 +5601,8 @@ async def main() -> None:
     )
     await db.init()
     await advanced.init()
+    await operations.init()
+    await payments.init()
 
     bot = Bot(
         token=settings.bot_token,
@@ -5343,6 +5636,19 @@ async def main() -> None:
                 connection_id = connection.get("id")
         if not connection_id:
             return False, "Не найдено активное Business-соединение"
+        provider=str(await db.get_setting("payment_provider","off") or "off").strip().lower()
+        if provider=="yookassa":
+            total=max(0,int(submission.get("total_amount") or 0)); pre=max(0,int(submission.get("prepayment_amount") or 0))
+            if not pre:
+                percent=int(await db.get_setting("payment_default_percent","30") or 30); pre=(total*percent+99)//100 if total else 0
+            return_url=str(await db.get_setting("payment_return_url","") or "").strip()
+            if not return_url:
+                return False,"Для ЮKassa укажите payment_return_url (публичный HTTPS адрес)"
+            url,provider_info=await payments.create_payment_url(submission,pre,return_url)
+            if not url:
+                return False,provider_info
+            text=text.replace("__PAYMENT_URL__",url)
+            await operations.emit_webhook("payment.created",{"submission_id":submission_id,"provider":"yookassa","payment":provider_info,"amount":pre})
         try:
             await bot.send_message(
                 chat_id=int(submission["chat_id"]),
@@ -5367,6 +5673,8 @@ async def main() -> None:
         backup_manager=backup_manager,
         reminder_service=reminder_service,
         advanced=advanced,
+        operations=operations,
+        payments=payments,
         users_config=settings.web_admin_users,
         on_payment_link=web_payment_link,
     )
@@ -5388,7 +5696,15 @@ async def main() -> None:
     # Telegram system Menu Button is available in a direct chat with the bot.
     # Business chats with the Premium account do not expose the bot's system menu button,
     # therefore those chats also receive an inline «☰ Меню» button on final responses.
-    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    miniapp_enabled = (await db.get_setting("miniapp_enabled", "0")) == "1"
+    miniapp_url = str(await db.get_setting("miniapp_url", "") or "").strip()
+    if miniapp_enabled and miniapp_url.startswith("https://"):
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="Бронирование", web_app=WebAppInfo(url=miniapp_url))
+        )
+        logger.info("Telegram Mini App menu button enabled: %s", miniapp_url)
+    else:
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
     me = await bot.get_me()
     logger.info(

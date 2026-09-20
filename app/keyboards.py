@@ -373,7 +373,7 @@ def admin_question_edit(question: dict) -> InlineKeyboardMarkup:
     )
     type_labels = {
         "text": "⌨️ Текст", "date": "📅 Дата", "time": "🕐 Время",
-        "contact": "📱 Контакт", "guest_count": "👥 Гости", "choice": "🎛 Варианты", "file": "📎 Файл"
+        "contact": "📱 Контакт", "guest_count": "👥 Гости", "choice": "🎛 Варианты", "venue": "🏭 Зал", "file": "📎 Файл"
     }
     builder.row(
         InlineKeyboardButton(
@@ -439,6 +439,7 @@ def admin_question_type(question_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🎛 Варианты", callback_data=f"adm:q_type:{question_id}:choice"),
     )
     builder.row(
+        InlineKeyboardButton(text="🏭 Зал / площадка", callback_data=f"adm:q_type:{question_id}:venue"),
         InlineKeyboardButton(text="📎 Файл / фото", callback_data=f"adm:q_type:{question_id}:file"),
     )
     builder.row(
@@ -446,6 +447,29 @@ def admin_question_type(question_id: int) -> InlineKeyboardMarkup:
     )
     return builder.as_markup()
 
+
+
+def venue_keyboard(
+    question_id: int,
+    venues: list[dict],
+    *,
+    required: bool,
+    can_go_back: bool,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for venue in venues:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🏭 {venue['name']}",
+                callback_data=f"venue:pick:{question_id}:{venue['id']}",
+            )
+        )
+    if not required:
+        builder.row(InlineKeyboardButton(text="⏭ Пропустить", callback_data="form:skip"))
+    if can_go_back:
+        builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="form:back"))
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:home"))
+    return builder.as_markup()
 
 
 SUBMISSION_STATUS_LABELS = {

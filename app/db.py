@@ -1655,6 +1655,7 @@ class Database:
         end_time: str | None = None,
         note: str | None = None,
         source_submission_id: int | None = None,
+        venue_id: int | None = None,
     ) -> int:
         now = utc_now_iso()
         async with self.connection() as db:
@@ -1666,10 +1667,10 @@ class Database:
             cur = await db.execute(
                 """
                 INSERT INTO availability_blocks(
-                    date_iso, start_time, end_time, note, source_submission_id, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                    date_iso, start_time, end_time, note, source_submission_id, venue_id, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (date_iso, start_time, end_time, note, source_submission_id, now, now),
+                (date_iso, start_time, end_time, note, source_submission_id, venue_id, now, now),
             )
             await db.commit()
             return int(cur.lastrowid)
@@ -1680,6 +1681,7 @@ class Database:
         segments: list[tuple[str, str | None, str | None]],
         *,
         note: str | None = None,
+        venue_id: int | None = None,
     ) -> None:
         """Replace every availability row owned by a submission.
 
@@ -1696,13 +1698,18 @@ class Database:
                 await db.execute(
                     """
                     INSERT INTO availability_blocks(
-                        date_iso, start_time, end_time, note, source_submission_id, created_at, updated_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                        date_iso, start_time, end_time, note, source_submission_id, created_at, updated_at, venue_id
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        date_iso, start_time, end_time, note, submission_id, now, now
+                        date_iso, start_time, end_time, note, submission_id, now, now, venue_id
                     ),
                 )
+            await db.commit()
+
+    async def set_submission_venue(self, submission_id: int, venue_id: int | None) -> None:
+        async with self.connection() as db:
+            await db.execute("UPDATE form_submissions SET venue_id=?, updated_at=? WHERE id=?", (venue_id, utc_now_iso(), submission_id))
             await db.commit()
 
     async def get_availability_block(self, block_id: int) -> dict[str, Any] | None:

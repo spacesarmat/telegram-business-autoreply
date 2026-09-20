@@ -75,12 +75,10 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "2.0.3"
-  update_at: "2026-09-20"
+  version: "2.1.0"
+  update_at: "2026-09-21"
   release_notes:
     en_US: >
-      Adds an editable base-price description to every tariff so customers can see what is included in the base rental amount.
-      The description is editable from Telegram Admin and Web Admin and is stored with each submission pricing snapshot.
+      Multi-venue operations release: two halls, venue-specific availability, tariffs and rules, slot holds, waitlist, resources, managers/tasks, deposits, packages, public booking, API/webhooks, QR/PDF and optional YooKassa payments.
     ru_RU: >
-      Добавлено редактируемое описание базовой стоимости тарифа: администратор может указать, что входит в сумму аренды.
-      Описание меняется из Telegram Admin и Web Admin и сохраняется в снимке расчёта заявки.
+      Операционный релиз для двух залов: отдельные занятость, тарифы и правила, временные hold, лист ожидания, ресурсы, менеджеры/задачи, залог, пакеты, публичная бронь, API/webhooks, QR/PDF и опциональная ЮKassa.

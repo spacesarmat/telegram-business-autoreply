@@ -18,6 +18,9 @@ from zoneinfo import ZoneInfo
 from aiohttp import web
 
 from .advanced import AdvancedService, WEEKDAY_NAMES
+from .operations import OperationsService
+from .payments import PaymentService
+from .operations_web import register_operations_routes
 from .backup import BackupManager
 from .db import Database
 from .reminders import ReminderService
@@ -39,6 +42,7 @@ QUESTION_TYPES = {
     "contact": "📱 Контакт",
     "guest_count": "👥 Гости",
     "choice": "🎛 Варианты",
+    "venue": "🏭 Зал / площадка",
     "file": "📎 Файл / фото",
 }
 
@@ -135,6 +139,8 @@ class WebAdmin:
         backup_manager: BackupManager,
         reminder_service: ReminderService,
         advanced: AdvancedService,
+        operations: OperationsService,
+        payments: PaymentService,
         users_config: str = "",
         on_payment_link: PaymentLinkCallback | None = None,
     ) -> None:
@@ -148,6 +154,8 @@ class WebAdmin:
         self.backup_manager = backup_manager
         self.reminder_service = reminder_service
         self.advanced = advanced
+        self.operations = operations
+        self.payments = payments
         self.on_payment_link = on_payment_link
         self.users: dict[str, dict[str, str]] = {}
         if password and not password.startswith("PASTE_") and len(password) >= 10:
@@ -200,7 +208,9 @@ class WebAdmin:
 
     async def auth_middleware(self, app: web.Application, handler):
         async def middleware_handler(request: web.Request):
-            if request.path == "/health" or request.path == "/calendar.ics" or request.path.startswith("/admin/login"):
+            if (request.path == "/health" or request.path == "/calendar.ics" or request.path.startswith("/admin/login")
+                or request.path == "/book" or request.path.startswith("/booking/") or request.path.startswith("/api/v1/")
+                or request.path == "/payments/yookassa/webhook"):
                 return await handler(request)
             if not self.enabled:
                 return await self.disabled_page(request)
@@ -237,6 +247,7 @@ class WebAdmin:
         nav = [
             ("dashboard", "/admin", "🏠 Обзор"),
             ("requests", "/admin/requests", "📋 Заявки"),
+            ("operations", "/admin/operations", "🏭 Операции"),
             ("clients", "/admin/clients", "👥 Клиенты"),
             ("client_requests", "/admin/client-requests", "📨 Запросы клиентов"),
             ("analytics", "/admin/analytics", "📊 Аналитика"),
@@ -353,6 +364,11 @@ class WebAdmin:
         prepay = int(item.get("prepayment_amount") or 0)
         total = int(item.get("total_amount") or 0)
         balance = max(0, total - prepay)
+        venue = await self.operations.get_venue(int(item.get("venue_id") or 0)) if self.operations and item.get("venue_id") else None
+        tasks = await self.operations.list_tasks(submission_id=sid, limit=100) if self.operations else []
+        allocations = await self.operations.list_resource_allocations(sid) if self.operations else []
+        transactions = await self.payments.list_transactions(sid, limit=20) if self.payments else []
+        public_token = await self.operations.ensure_submission_public_token(sid) if self.operations else str(item.get("public_token") or "")
         status_opts = "".join(f'<option value="{k}" {"selected" if item.get("status") == k else ""}>{_e(v)}</option>' for k, v in STATUS_NAMES.items())
         answers_data = item.get("answers") or {}
         questions = await self.db.list_form_questions(int(item["form_id"])) if item.get("form_id") else []
@@ -367,12 +383,22 @@ class WebAdmin:
         events = await self.db.list_submission_events(sid, limit=30)
         event_rows = "".join(f'<tr><td>{_e(_local_dt(ev.get("created_at"), self.timezone))}</td><td>{_e(ev.get("event_type"))}</td><td>{_e(ev.get("old_value") or "—")}</td><td>{_e(ev.get("new_value") or "—")}</td></tr>' for ev in events) or '<tr><td colspan="4" class="muted">Нет событий</td></tr>'
         client = " ".join(x for x in [item.get("first_name"), item.get("last_name")] if x) or "—"
+        task_rows = "".join(f'<tr><td>{_e(t.get("title"))}</td><td>{_e(t.get("assignee") or "—")}</td><td>{_e(t.get("due_at") or "—")}</td><td>{_e(t.get("status"))}</td></tr>' for t in tasks) or '<tr><td colspan="4" class="muted">Нет задач</td></tr>'
+        allocation_rows = "".join(f'<tr><td>{_e(a.get("resource_name"))}</td><td>{int(a.get("quantity") or 0)}</td><td>{_e(a.get("venue_name") or "общий")}</td></tr>' for a in allocations) or '<tr><td colspan="3" class="muted">Ресурсы не назначены</td></tr>'
+        deposit_status_names = {"none":"нет","required":"требуется","paid":"внесён","returned":"возвращён","withheld":"удержан"}
+        payment_rows = "".join(f'<tr><td>{_e(t.get("provider"))}</td><td>{_e(t.get("provider_payment_id"))}</td><td>{_e(_money(t.get("amount"),currency))}</td><td>{_e(t.get("status"))}</td><td>{_e(_local_dt(t.get("created_at"), self.timezone))}</td></tr>' for t in transactions) or '<tr><td colspan="5" class="muted">Платежей нет</td></tr>'
         content = f"""<div class="grid"><div class="card"><div class="muted">Клиент</div><h3>{_e(client)}</h3><div>@{_e(item.get('username') or '—')}</div><div>User ID: {_e(item.get('user_id') or '—')}</div></div><div class="card"><div class="muted">Форма</div><h3>{_e(item.get('form_name'))}</h3><div>{_e(_local_dt(item.get('created_at'), self.timezone))}</div></div><div class="card"><div class="muted">Стоимость</div><div class="metric">{_e(_money(total,currency))}</div><div>Предоплата: {_e(_money(prepay,currency))}<br>Остаток: {_e(_money(balance,currency))}</div></div></div>
 <div class="section row"><div class="card"><h2>Статус</h2><form method="post" action="/admin/requests/{sid}/status"><div class="field"><select name="status">{status_opts}</select></div><button class="btn primary">Сохранить и уведомить клиента</button></form></div><div class="card"><h2>CRM</h2><form method="post" action="/admin/requests/{sid}/crm"><div class="row"><div class="field"><label>Стоимость</label><input name="total_amount" value="{total}"></div><div class="field"><label>Предоплата</label><input name="prepayment_amount" value="{prepay}"></div></div><div class="field"><label>Внутренняя заметка</label><textarea name="internal_note">{_e(item.get('internal_note') or '')}</textarea></div><button class="btn primary">Сохранить</button></form></div></div>
-<div class="section card"><h2>Ответы формы</h2><div class="kv">{answers}</div></div><div class="section"><h2>История</h2><div class="table-wrap"><table><thead><tr><th>Время</th><th>Событие</th><th>Было</th><th>Стало</th></tr></thead><tbody>{event_rows}</tbody></table></div></div>"""
+<div class="section card"><h2>Операционные данные</h2><div class="kv"><div><b>Зал:</b></div><div>{_e((venue or {}).get('name') or '—')}</div><div><b>Менеджер:</b></div><div>{_e(item.get('manager') or '—')}</div><div><b>Залог:</b></div><div>{_e(_money(item.get('deposit_amount'),currency))} · {_e(deposit_status_names.get(str(item.get('deposit_status') or 'none'), item.get('deposit_status') or 'none'))}</div><div><b>Публичная карточка:</b></div><div><a href="/booking/{_e(public_token)}" target="_blank">Открыть</a> · <a href="/admin/requests/{sid}/confirmation.pdf">PDF</a> · <a href="/admin/requests/{sid}/qr.png" target="_blank">QR</a></div></div></div>
+<div class="section card"><h2>Ответы формы</h2><div class="kv">{answers}</div></div>
+<div class="section row"><div><h2>Задачи</h2><div class="table-wrap"><table><thead><tr><th>Задача</th><th>Ответственный</th><th>Срок</th><th>Статус</th></tr></thead><tbody>{task_rows}</tbody></table></div></div><div><h2>Ресурсы</h2><div class="table-wrap"><table><thead><tr><th>Ресурс</th><th>Кол.</th><th>Зал</th></tr></thead><tbody>{allocation_rows}</tbody></table></div></div></div>
+<div class="section"><h2>Платежи</h2><div class="table-wrap"><table><thead><tr><th>Провайдер</th><th>ID</th><th>Сумма</th><th>Статус</th><th>Создан</th></tr></thead><tbody>{payment_rows}</tbody></table></div></div>
+<div class="section"><h2>История</h2><div class="table-wrap"><table><thead><tr><th>Время</th><th>Событие</th><th>Было</th><th>Стало</th></tr></thead><tbody>{event_rows}</tbody></table></div></div>"""
         payment_template = str(await self.db.get_setting("payment_link_template", "") or "").strip()
-        if payment_template:
-            content += f'<div class="section card"><h2>Предоплата</h2><p class="muted">Отправить клиенту настроенную ссылку на предоплату.</p><form method="post" action="/admin/requests/{sid}/payment"><button class="btn primary">💳 Отправить ссылку на оплату</button></form></div>'
+        payment_provider = str(await self.db.get_setting("payment_provider", "off") or "off").strip().lower()
+        if payment_template or payment_provider == "yookassa":
+            provider_label = "ЮKassa" if payment_provider == "yookassa" else "ссылка по шаблону"
+            content += f'<div class="section card"><h2>Предоплата</h2><p class="muted">Провайдер: {_e(provider_label)}. Отправить клиенту ссылку на предоплату.</p><form method="post" action="/admin/requests/{sid}/payment"><button class="btn primary">💳 Отправить ссылку на оплату</button></form></div>'
         return self.page(request, f"Заявка #{sid}", content, active="requests")
 
     async def request_status_post(self, request: web.Request) -> web.StreamResponse:
@@ -509,14 +535,29 @@ class WebAdmin:
 
     async def availability(self, request: web.Request) -> web.Response:
         today = datetime.now(self.timezone).date()
+        selected_venue = str(request.query.get("venue_id") or "").strip()
+        try:
+            selected_venue_id = int(selected_venue) if selected_venue else None
+        except ValueError:
+            selected_venue_id = None
+        venues = await self.operations.list_venues() if self.operations else []
         blocks = await self.db.list_availability_blocks(start_date=(today - timedelta(days=7)).isoformat(), limit=300)
+        venue_map = {int(v["id"]): str(v["name"]) for v in venues}
+        if selected_venue_id is not None:
+            # Global blocks affect every hall and remain visible together with hall-specific blocks.
+            blocks = [b for b in blocks if b.get("venue_id") is None or int(b.get("venue_id")) == selected_venue_id]
         rows = ""
         for b in blocks:
             period = "весь день" if not b.get("start_time") else f"{b.get('start_time')}–{b.get('end_time')}"
+            vid = b.get("venue_id")
+            venue_label = venue_map.get(int(vid), f"Зал #{vid}") if vid is not None else "Все залы"
             source = f'<a href="/admin/requests/{int(b["source_submission_id"])}">заявка #{int(b["source_submission_id"])}</a>' if b.get("source_submission_id") else "вручную"
             delete = "" if b.get("source_submission_id") else f'<form method="post" action="/admin/availability/{int(b["id"])}/delete"><button class="btn danger">Удалить</button></form>'
-            rows += f'<tr><td>{_e(b.get("date_iso"))}</td><td>{_e(period)}</td><td>{_e(b.get("note") or "—")}</td><td>{source}</td><td>{delete}</td></tr>'
-        content = f"""<div class="card"><form method="post" action="/admin/availability"><div class="row3"><div class="field"><label>Дата</label><input type="date" name="date_iso" value="{today.isoformat()}" required></div><div class="field"><label>Начало (пусто = весь день)</label><input type="time" name="start_time"></div><div class="field"><label>Окончание</label><input type="time" name="end_time"></div></div><div class="field"><label>Комментарий</label><input name="note" placeholder="Монтаж, технические работы..."></div><button class="btn primary">Добавить блокировку</button></form></div><div class="section table-wrap"><table><thead><tr><th>Дата</th><th>Время</th><th>Комментарий</th><th>Источник</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="5" class="muted">Нет блокировок</td></tr>'}</tbody></table></div>"""
+            rows += f'<tr><td>{_e(b.get("date_iso"))}</td><td>{_e(venue_label)}</td><td>{_e(period)}</td><td>{_e(b.get("note") or "—")}</td><td>{source}</td><td>{delete}</td></tr>'
+        venue_options = '<option value="">Все залы / общая блокировка</option>' + ''.join(
+            f'<option value="{int(v["id"])}" {"selected" if selected_venue_id == int(v["id"]) else ""}>{_e(v["name"])}</option>' for v in venues
+        )
+        content = f"""<div class="card"><form method="post" action="/admin/availability"><div class="row3"><div class="field"><label>Дата</label><input type="date" name="date_iso" value="{today.isoformat()}" min="{today.isoformat()}" required></div><div class="field"><label>Зал</label><select name="venue_id">{venue_options}</select></div><div class="field"><label>Начало (пусто = весь день)</label><input type="time" name="start_time"></div></div><div class="row"><div class="field"><label>Окончание</label><input type="time" name="end_time"></div><div class="field"><label>Комментарий</label><input name="note" placeholder="Монтаж, технические работы..."></div></div><button class="btn primary">Добавить блокировку</button></form></div><div class="section table-wrap"><table><thead><tr><th>Дата</th><th>Зал</th><th>Время</th><th>Комментарий</th><th>Источник</th><th></th></tr></thead><tbody>{rows or '<tr><td colspan="6" class="muted">Нет блокировок</td></tr>'}</tbody></table></div>"""
         return self.page(request, "Занятость", content, active="availability")
 
     async def availability_add(self, request: web.Request) -> web.StreamResponse:
@@ -529,18 +570,27 @@ class WebAdmin:
             base_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
         except ValueError:
             raise web.HTTPFound("/admin/availability?err=" + quote("Некорректная дата"))
+        if base_date < datetime.now(self.timezone).date():
+            raise web.HTTPFound("/admin/availability?err=" + quote("Нельзя добавить занятость на прошедшую дату"))
+        venue_raw = str(data.get("venue_id") or "").strip()
+        try:
+            venue_id = int(venue_raw) if venue_raw else None
+        except ValueError:
+            raise web.HTTPFound("/admin/availability?err=" + quote("Некорректный зал"))
+        if venue_id is not None and self.operations and not await self.operations.get_venue(venue_id):
+            raise web.HTTPFound("/admin/availability?err=" + quote("Зал не найден"))
         if bool(start) != bool(end):
             raise web.HTTPFound("/admin/availability?err=" + quote("Укажите и начало, и окончание"))
         if not start:
-            await self.db.add_availability_block(date_iso, note=note)
+            await self.db.add_availability_block(date_iso, note=note, venue_id=venue_id)
         else:
             if not (re.fullmatch(r"\d{2}:\d{2}", start) and re.fullmatch(r"\d{2}:\d{2}", end)):
                 raise web.HTTPFound("/admin/availability?err=" + quote("Некорректное время"))
             if end > start:
-                await self.db.add_availability_block(date_iso, start, end, note=note)
+                await self.db.add_availability_block(date_iso, start, end, note=note, venue_id=venue_id)
             else:
-                await self.db.add_availability_block(date_iso, start, "24:00", note=note)
-                await self.db.add_availability_block((base_date + timedelta(days=1)).isoformat(), "00:00", end, note=note)
+                await self.db.add_availability_block(date_iso, start, "24:00", note=note, venue_id=venue_id)
+                await self.db.add_availability_block((base_date + timedelta(days=1)).isoformat(), "00:00", end, note=note, venue_id=venue_id)
         raise web.HTTPFound("/admin/availability?ok=" + quote("Занятость добавлена"))
 
     async def availability_delete(self, request: web.Request) -> web.StreamResponse:
@@ -647,11 +697,18 @@ class WebAdmin:
         prev_first = prev_last.replace(day=1)
         last = next_first - timedelta(days=1)
 
+        venues = await self.operations.list_venues(include_disabled=True)
+        venue_filter = int(request.query.get("venue")) if str(request.query.get("venue") or "").isdigit() else None
+        venue_map = {int(v["id"]): str(v["name"]) for v in venues}
         events: dict[str, list[dict[str, str]]] = {}
         bookings = await self.db.list_booking_submissions(limit=2000, statuses=("confirmed", "paid", "completed"))
         for item in bookings:
             if not item.get("form_id"):
                 continue
+            item_venue_id = int(item.get("venue_id") or 0) or None
+            if venue_filter and item_venue_id != venue_filter:
+                continue
+            venue_label = venue_map.get(item_venue_id or 0, "без зала")
             questions = await self.db.list_form_questions(int(item["form_id"]))
             window = self._booking_window(item, questions)
             if not window:
@@ -663,9 +720,9 @@ class WebAdmin:
             for date_iso, period in self._event_segments(start, end):
                 if first.isoformat() <= date_iso <= last.isoformat():
                     events.setdefault(date_iso, []).append({
-                        "kind": "rental", "label": f"{period} · #{int(item['id'])} {item.get('form_name') or 'Бронь'}", "url": link,
+                        "kind": "rental", "label": f"{period} · {venue_label} · #{int(item['id'])} {item.get('form_name') or 'Бронь'}", "url": link,
                     })
-            pricing = await self.db.get_form_pricing(int(item["form_id"]))
+            pricing = await self.operations.get_effective_pricing(int(item["form_id"]), item_venue_id)
             before = max(0, int(pricing.get("buffer_before_minutes") or 0))
             after = max(0, int(pricing.get("buffer_after_minutes") or 0))
             if before:
@@ -685,12 +742,16 @@ class WebAdmin:
         for block in manual_blocks:
             if block.get("source_submission_id"):
                 continue
+            block_venue_id = int(block.get("venue_id") or 0) or None
+            if venue_filter and block_venue_id not in {None, venue_filter}:
+                continue
             date_iso = str(block.get("date_iso") or "")
             if not (first.isoformat() <= date_iso <= last.isoformat()):
                 continue
             period = "весь день" if not block.get("start_time") else f"{block.get('start_time')}–{block.get('end_time')}"
             note = str(block.get("note") or "ручная блокировка")
-            events.setdefault(date_iso, []).append({"kind": "manual", "label": f"{period} · {note}", "url": "/admin/availability"})
+            block_venue = venue_map.get(block_venue_id or 0, "все залы" if block_venue_id is None else "зал")
+            events.setdefault(date_iso, []).append({"kind": "manual", "label": f"{period} · {block_venue} · {note}", "url": "/admin/availability"})
 
         recurring = await self.advanced.list_recurring_blocks(None)
         if recurring:
@@ -722,7 +783,9 @@ class WebAdmin:
                 if day == now.date():
                     cls += " today"
                 cells.append(f'<div class="{cls}"><div class="day-num">{day.day}</div>{event_html}</div>')
-        content = f'''<div class="calendar-head"><a class="btn" href="/admin/calendar?month={prev_first:%Y-%m}">← {_e(prev_first.strftime("%m.%Y"))}</a><h2>{_e(first.strftime("%m.%Y"))}</h2><a class="btn" href="/admin/calendar?month={next_first:%Y-%m}">{_e(next_first.strftime("%m.%Y"))} →</a></div>
+        venue_q = f"&venue={venue_filter}" if venue_filter else ""
+        venue_options = '<option value="">Все залы</option>' + ''.join(f'<option value="{v["id"]}" {"selected" if venue_filter==int(v["id"]) else ""}>{_e(v["name"])}</option>' for v in venues)
+        content = f'''<form method="get" class="card" style="margin-bottom:12px"><input type="hidden" name="month" value="{first:%Y-%m}"><div class="row"><div class="field"><label>Зал</label><select name="venue">{venue_options}</select></div><div class="field" style="align-self:end"><button class="btn">Показать</button></div></div></form><div class="calendar-head"><a class="btn" href="/admin/calendar?month={prev_first:%Y-%m}{venue_q}">← {_e(prev_first.strftime("%m.%Y"))}</a><h2>{_e(first.strftime("%m.%Y"))}</h2><a class="btn" href="/admin/calendar?month={next_first:%Y-%m}{venue_q}">{_e(next_first.strftime("%m.%Y"))} →</a></div>
 <div class="legend"><span><i class="dot rental"></i> аренда</span><span><i class="dot tech"></i> монтаж / уборка</span><span><i class="dot manual"></i> ручная занятость</span></div>
 <div class="month-grid">{weekdays}{''.join(cells)}</div>
 <div class="section actions"><a class="btn" href="/admin/availability">Управлять занятостью</a><a class="btn" href="/admin/requests">Открыть заявки</a></div>'''
@@ -1239,16 +1302,18 @@ class WebAdmin:
         if not item:
             raise web.HTTPNotFound()
         template=str(await self.db.get_setting("payment_link_template","") or "").strip()
-        if not template or not self.on_payment_link:
-            raise web.HTTPFound(f"/admin/requests/{sid}?err="+quote("Сначала настройте ссылку на оплату в Интеграциях"))
+        provider=str(await self.db.get_setting("payment_provider","off") or "off").strip().lower()
+        if not self.on_payment_link or (provider in {"off","template",""} and not template):
+            raise web.HTTPFound(f"/admin/requests/{sid}?err="+quote("Сначала настройте оплату в Интеграциях / Операциях"))
         total=max(0,int(item.get("total_amount") or 0)); pre=max(0,int(item.get("prepayment_amount") or 0))
         if not pre:
             percent=int(await self.db.get_setting("payment_default_percent","30") or 30); pre=(total*percent+99)//100 if total else 0
         balance=max(0,total-pre)
         values={"id":str(sid),"amount":str(total),"prepayment":str(pre),"balance":str(balance)}
-        url=template
-        for k,v in values.items():
-            url=url.replace("{"+k+"}",quote(v,safe=""))
+        url="__PAYMENT_URL__" if provider=="yookassa" else template
+        if provider!="yookassa":
+            for k,v in values.items():
+                url=url.replace("{"+k+"}",quote(v,safe=""))
         msg=str(await self.db.get_setting("payment_message_template","") or "{url}")
         currency=str(await self.db.get_setting("crm_currency","₽") or "₽")
         display={"id":str(sid),"amount":_money(total,currency),"prepayment":_money(pre,currency),"balance":_money(balance,currency),"url":url}
@@ -1333,6 +1398,8 @@ async def start_web_admin(
     backup_manager: BackupManager,
     reminder_service: ReminderService,
     advanced: AdvancedService,
+    operations: OperationsService,
+    payments: PaymentService,
     users_config: str = "",
     on_payment_link: PaymentLinkCallback | None = None,
 ) -> WebAdminHandle:
@@ -1347,6 +1414,8 @@ async def start_web_admin(
         backup_manager=backup_manager,
         reminder_service=reminder_service,
         advanced=advanced,
+        operations=operations,
+        payments=payments,
         users_config=users_config,
         on_payment_link=on_payment_link,
     )
