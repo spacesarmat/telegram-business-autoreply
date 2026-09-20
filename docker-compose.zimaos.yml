@@ -70,8 +70,8 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.3.4"
+  version: "1.4.0"
   update_at: "2026-09-20"
   release_notes:
-    en_US: Forms now support calendar date selection and a native Telegram button for sharing the user's own contact.
-    ru_RU: В формах добавлены календарь для выбора даты и нативная кнопка Telegram «Поделиться своим контактом».
+    en_US: Adds booking availability, time-slot selection, automatic conflict checks, and an admin mini-CRM with request statuses.
+    ru_RU: Добавлены занятость дат и времени, выбор свободного времени, проверка конфликтов и мини-CRM заявок со статусами.

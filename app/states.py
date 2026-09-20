@@ -22,3 +22,6 @@ class AdminStates(StatesGroup):
     question_edit_label = State()
     question_edit_prompt = State()
     question_edit_position = State()
+
+    availability_date = State()
+    availability_period = State()

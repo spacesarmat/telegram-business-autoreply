@@ -14,6 +14,9 @@ DEFAULT_SETTINGS = {
     "cooldown_hours": "168",
     "menu_columns": "1",
     "menu_triggers": "/menu\nменю\nзаявка",
+    "booking_day_start": "10:00",
+    "booking_day_end": "23:00",
+    "booking_slot_minutes": "60",
     "greeting": (
         "Здравствуйте! Спасибо за сообщение.\n\n"
         "Я отвечаю автоматически, если вы пишете впервые или после длительного перерыва. "
@@ -74,7 +77,7 @@ DEFAULT_FORMS: list[dict[str, Any]] = [
         "name": "Аренда Фабрики",
         "questions": [
             ("Дата", "На какую дату нужна аренда Фабрики?", True, "date"),
-            ("Время", "Во сколько планируется начало?", True),
+            ("Время", "Во сколько планируется начало?", True, "time"),
             ("Продолжительность", "На сколько часов нужна площадка?", True),
             ("Количество гостей", "Сколько примерно будет гостей?", True),
             ("Формат", "Какой формат мероприятия планируется?", True),
@@ -118,6 +121,8 @@ class Database:
         normalized = " ".join(label.strip().casefold().split())
         if normalized == "дата":
             return "date"
+        if normalized in {"время", "время начала", "начало"}:
+            return "time"
         if normalized in {"телефон", "контакт", "контактный телефон"}:
             return "contact"
         return "text"
@@ -226,13 +231,28 @@ class Database:
                     form_id INTEGER,
                     form_name TEXT NOT NULL,
                     chat_id INTEGER NOT NULL,
+                    business_connection_id TEXT,
                     user_id INTEGER,
                     username TEXT,
                     first_name TEXT,
                     last_name TEXT,
                     answers_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'new',
                     created_at TEXT NOT NULL,
+                    updated_at TEXT,
                     FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE SET NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS availability_blocks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date_iso TEXT NOT NULL,
+                    start_time TEXT,
+                    end_time TEXT,
+                    note TEXT,
+                    source_submission_id INTEGER UNIQUE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(source_submission_id) REFERENCES form_submissions(id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_form_questions_form_position
@@ -276,6 +296,34 @@ class Database:
                     "UPDATE form_questions SET input_type='contact' "
                     "WHERE trim(label) IN ('Телефон', 'телефон', 'ТЕЛЕФОН', 'Контакт', 'контакт', 'КОНТАКТ', 'Контактный телефон', 'контактный телефон')"
                 )
+
+            submission_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(form_submissions)")).fetchall()
+            }
+            if "business_connection_id" not in submission_columns:
+                await db.execute("ALTER TABLE form_submissions ADD COLUMN business_connection_id TEXT")
+            if "status" not in submission_columns:
+                await db.execute("ALTER TABLE form_submissions ADD COLUMN status TEXT NOT NULL DEFAULT 'new'")
+            if "updated_at" not in submission_columns:
+                await db.execute("ALTER TABLE form_submissions ADD COLUMN updated_at TEXT")
+            await db.execute(
+                "UPDATE form_submissions SET updated_at=COALESCE(updated_at, created_at), "
+                "status=COALESCE(NULLIF(status, ''), 'new')"
+            )
+            await db.execute(
+                "UPDATE form_questions SET input_type='time' "
+                "WHERE input_type='text' AND trim(label) IN ('Время', 'время', 'ВРЕМЯ', 'Время начала', 'время начала', 'Начало', 'начало')"
+            )
+
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_form_submissions_status "
+                "ON form_submissions(status, created_at DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_availability_date "
+                "ON availability_blocks(date_iso, start_time, end_time)"
+            )
 
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
@@ -597,7 +645,7 @@ class Database:
     ) -> int:
         now = utc_now_iso()
         input_type = input_type or self.infer_question_input_type(label)
-        if input_type not in {"text", "date", "contact"}:
+        if input_type not in {"text", "date", "time", "contact"}:
             input_type = "text"
         async with self.connection() as db:
             row = await (
@@ -777,24 +825,185 @@ class Database:
             cur = await db.execute(
                 """
                 INSERT INTO form_submissions(
-                    form_id, form_name, chat_id, user_id, username, first_name, last_name,
-                    answers_json, created_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    form_id, form_name, chat_id, business_connection_id, user_id, username, first_name, last_name,
+                    answers_json, status, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
                 """,
                 (
                     session.get("form_id"),
                     form_name,
                     session["chat_id"],
+                    session.get("business_connection_id"),
                     session.get("user_id"),
                     session.get("username"),
                     session.get("first_name"),
                     session.get("last_name"),
                     json.dumps(answers, ensure_ascii=False),
                     now,
+                    now,
                 ),
             )
             await db.commit()
             return int(cur.lastrowid)
+
+    async def list_submissions(self, status: str | None = None, limit: int = 30) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 100))
+        sql = "SELECT * FROM form_submissions"
+        args: list[Any] = []
+        if status and status != "all":
+            sql += " WHERE status=?"
+            args.append(status)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        args.append(limit)
+        async with self.connection() as db:
+            rows = await (await db.execute(sql, tuple(args))).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                item["answers"] = _decode_answers(item.get("answers_json"))
+                result.append(item)
+            return result
+
+    async def get_submission(self, submission_id: int) -> dict[str, Any] | None:
+        async with self.connection() as db:
+            row = await (
+                await db.execute("SELECT * FROM form_submissions WHERE id=?", (submission_id,))
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["answers"] = _decode_answers(result.get("answers_json"))
+            return result
+
+    async def update_submission_status(self, submission_id: int, status: str) -> None:
+        allowed = {"new", "in_progress", "confirmed", "paid", "completed", "cancelled"}
+        if status not in allowed:
+            raise ValueError("Unsupported submission status")
+        async with self.connection() as db:
+            await db.execute(
+                "UPDATE form_submissions SET status=?, updated_at=? WHERE id=?",
+                (status, utc_now_iso(), submission_id),
+            )
+            await db.commit()
+
+    async def submission_status_counts(self) -> dict[str, int]:
+        async with self.connection() as db:
+            rows = await (
+                await db.execute("SELECT status, COUNT(*) AS c FROM form_submissions GROUP BY status")
+            ).fetchall()
+            result = {"new": 0, "in_progress": 0, "confirmed": 0, "paid": 0, "completed": 0, "cancelled": 0}
+            for row in rows:
+                result[str(row["status"] or "new")] = int(row["c"])
+            return result
+
+    async def add_availability_block(
+        self,
+        date_iso: str,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        note: str | None = None,
+        source_submission_id: int | None = None,
+    ) -> int:
+        now = utc_now_iso()
+        async with self.connection() as db:
+            if source_submission_id is not None:
+                await db.execute(
+                    "DELETE FROM availability_blocks WHERE source_submission_id=?",
+                    (source_submission_id,),
+                )
+            cur = await db.execute(
+                """
+                INSERT INTO availability_blocks(
+                    date_iso, start_time, end_time, note, source_submission_id, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (date_iso, start_time, end_time, note, source_submission_id, now, now),
+            )
+            await db.commit()
+            return int(cur.lastrowid)
+
+    async def delete_availability_block(self, block_id: int) -> None:
+        async with self.connection() as db:
+            await db.execute("DELETE FROM availability_blocks WHERE id=?", (block_id,))
+            await db.commit()
+
+    async def delete_submission_availability(self, submission_id: int) -> None:
+        async with self.connection() as db:
+            await db.execute(
+                "DELETE FROM availability_blocks WHERE source_submission_id=?",
+                (submission_id,),
+            )
+            await db.commit()
+
+    async def list_availability_blocks(
+        self,
+        *,
+        date_iso: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        args: list[Any] = []
+        if date_iso:
+            clauses.append("date_iso=?")
+            args.append(date_iso)
+        if start_date:
+            clauses.append("date_iso>=?")
+            args.append(start_date)
+        if end_date:
+            clauses.append("date_iso<=?")
+            args.append(end_date)
+        sql = "SELECT * FROM availability_blocks"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY date_iso ASC, COALESCE(start_time, '') ASC, id ASC LIMIT ?"
+        args.append(max(1, min(int(limit), 500)))
+        async with self.connection() as db:
+            rows = await (await db.execute(sql, tuple(args))).fetchall()
+            return [dict(row) for row in rows]
+
+    async def month_availability(self, year: int, month: int) -> tuple[set[str], set[str]]:
+        prefix = f"{year:04d}-{month:02d}-"
+        async with self.connection() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT date_iso, start_time, end_time FROM availability_blocks WHERE date_iso LIKE ?",
+                    (prefix + "%",),
+                )
+            ).fetchall()
+        full: set[str] = set()
+        partial: set[str] = set()
+        for row in rows:
+            date_iso = str(row["date_iso"])
+            if not row["start_time"] or not row["end_time"]:
+                full.add(date_iso)
+                partial.discard(date_iso)
+            elif date_iso not in full:
+                partial.add(date_iso)
+        return full, partial
+
+    async def booking_conflicts(
+        self,
+        date_iso: str,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        *,
+        exclude_submission_id: int | None = None,
+    ) -> bool:
+        blocks = await self.list_availability_blocks(date_iso=date_iso, limit=500)
+        for block in blocks:
+            if exclude_submission_id is not None and block.get("source_submission_id") == exclude_submission_id:
+                continue
+            b_start = block.get("start_time")
+            b_end = block.get("end_time")
+            if not b_start or not b_end:
+                return True
+            if not start_time or not end_time:
+                return True
+            if str(start_time) < str(b_end) and str(end_time) > str(b_start):
+                return True
+        return False
 
     async def stats(self) -> dict[str, int]:
         async with self.connection() as db:

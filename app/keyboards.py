@@ -36,8 +36,12 @@ def calendar_keyboard(
     required: bool,
     can_go_back: bool,
     today_iso: str,
+    full_busy_dates: set[str] | None = None,
+    partial_busy_dates: set[str] | None = None,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    full_busy_dates = full_busy_dates or set()
+    partial_busy_dates = partial_busy_dates or set()
     builder.row(
         InlineKeyboardButton(
             text=f"{MONTH_NAMES_RU[month - 1]} {year}", callback_data="cal:noop"
@@ -53,12 +57,16 @@ def calendar_keyboard(
                 row.append(InlineKeyboardButton(text="·", callback_data="cal:noop"))
                 continue
             iso = f"{year:04d}-{month:02d}-{day:02d}"
-            label = f"•{day}" if iso == today_iso else str(day)
-            row.append(
-                InlineKeyboardButton(
-                    text=label, callback_data=f"cal:day:{question_id}:{iso}"
-                )
-            )
+            if iso in full_busy_dates:
+                label = f"×{day}"
+                callback_data = f"cal:busy:{question_id}:{iso}"
+            elif iso in partial_busy_dates:
+                label = f"•{day}"
+                callback_data = f"cal:day:{question_id}:{iso}"
+            else:
+                label = f"•{day}" if iso == today_iso else str(day)
+                callback_data = f"cal:day:{question_id}:{iso}"
+            row.append(InlineKeyboardButton(text=label, callback_data=callback_data))
         builder.row(*row)
 
     prev_month = month - 1
@@ -148,6 +156,10 @@ def admin_main(enabled: bool) -> InlineKeyboardMarkup:
             text=("🟢 Автоответ включён" if enabled else "⚪ Автоответ выключен"),
             callback_data="adm:toggle",
         )
+    )
+    builder.row(
+        InlineKeyboardButton(text="📋 Заявки", callback_data="adm:reqs:all"),
+        InlineKeyboardButton(text="📅 Занятость", callback_data="adm:availability"),
     )
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"))
     return builder.as_markup()
@@ -258,7 +270,7 @@ def admin_question_edit(question: dict) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🏷 Поле", callback_data=f"adm:q_label:{question['id']}"),
         InlineKeyboardButton(text="💬 Вопрос", callback_data=f"adm:q_prompt:{question['id']}"),
     )
-    type_labels = {"text": "⌨️ Текст", "date": "📅 Дата", "contact": "📱 Контакт"}
+    type_labels = {"text": "⌨️ Текст", "date": "📅 Дата", "time": "🕐 Время", "contact": "📱 Контакт"}
     builder.row(
         InlineKeyboardButton(
             text=f"Тип: {type_labels.get(question.get('input_type', 'text'), '⌨️ Текст')}",
@@ -311,10 +323,114 @@ def admin_question_type(question_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📅 Дата", callback_data=f"adm:q_type:{question_id}:date"),
     )
     builder.row(
-        InlineKeyboardButton(text="📱 Контакт", callback_data=f"adm:q_type:{question_id}:contact")
+        InlineKeyboardButton(text="🕐 Время", callback_data=f"adm:q_type:{question_id}:time"),
+        InlineKeyboardButton(text="📱 Контакт", callback_data=f"adm:q_type:{question_id}:contact"),
     )
     builder.row(
         InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:q:{question_id}")
     )
     return builder.as_markup()
 
+
+
+SUBMISSION_STATUS_LABELS = {
+    "new": "🆕 Новая",
+    "in_progress": "🟡 В работе",
+    "confirmed": "✅ Подтверждена",
+    "paid": "💰 Оплачена",
+    "completed": "🏁 Завершена",
+    "cancelled": "❌ Отказ",
+}
+
+
+def time_slots_keyboard(
+    question_id: int,
+    slots: list[str],
+    busy_slots: set[str],
+    *,
+    required: bool,
+    can_go_back: bool,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for slot in slots:
+        compact = slot.replace(":", "")
+        if slot in busy_slots:
+            builder.button(text=f"× {slot}", callback_data=f"time:busy:{question_id}:{compact}")
+        else:
+            builder.button(text=slot, callback_data=f"time:pick:{question_id}:{compact}")
+    builder.adjust(3)
+    row: list[InlineKeyboardButton] = []
+    if can_go_back:
+        row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data="form:back"))
+    if not required:
+        row.append(InlineKeyboardButton(text="⏭ Пропустить", callback_data="form:skip"))
+    if row:
+        builder.row(*row)
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:menu"))
+    builder.row(InlineKeyboardButton(text="❌ Отменить заявку", callback_data="form:cancel"))
+    return builder.as_markup()
+
+
+def admin_submissions_list(submissions: list[dict], current_filter: str = "all") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="Все", callback_data="adm:reqs:all"),
+        InlineKeyboardButton(text="🆕 Новые", callback_data="adm:reqs:new"),
+        InlineKeyboardButton(text="🟡 В работе", callback_data="adm:reqs:in_progress"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="✅ Подтв.", callback_data="adm:reqs:confirmed"),
+        InlineKeyboardButton(text="💰 Оплач.", callback_data="adm:reqs:paid"),
+        InlineKeyboardButton(text="❌ Отказ", callback_data="adm:reqs:cancelled"),
+    )
+    for item in submissions:
+        status = str(item.get("status") or "new")
+        icon = SUBMISSION_STATUS_LABELS.get(status, "•").split(" ", 1)[0]
+        created = str(item.get("created_at") or "")[:10]
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{icon} №{item['id']} · {str(item['form_name'])[:24]} · {created}",
+                callback_data=f"adm:req:{item['id']}",
+            )
+        )
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:home"))
+    return builder.as_markup()
+
+
+def admin_submission_card(submission: dict) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    sid = int(submission["id"])
+    builder.row(
+        InlineKeyboardButton(text="🆕 Новая", callback_data=f"adm:req_status:{sid}:new"),
+        InlineKeyboardButton(text="🟡 В работе", callback_data=f"adm:req_status:{sid}:in_progress"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm:req_status:{sid}:confirmed"),
+        InlineKeyboardButton(text="💰 Оплачено", callback_data=f"adm:req_status:{sid}:paid"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🏁 Завершить", callback_data=f"adm:req_status:{sid}:completed"),
+        InlineKeyboardButton(text="❌ Отказ", callback_data=f"adm:req_status:{sid}:cancelled"),
+    )
+    username = (submission.get("username") or "").strip()
+    if username:
+        builder.row(InlineKeyboardButton(text="💬 Открыть чат", url=f"https://t.me/{username}"))
+    builder.row(InlineKeyboardButton(text="⬅️ К заявкам", callback_data="adm:reqs:all"))
+    return builder.as_markup()
+
+
+def admin_availability(blocks: list[dict]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="➕ Заблокировать дату/время", callback_data="adm:availability_add"))
+    for block in blocks:
+        date = str(block["date_iso"])
+        period = "весь день" if not block.get("start_time") else f"{block['start_time']}–{block['end_time']}"
+        source = " · заявка" if block.get("source_submission_id") else ""
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🗑 {date} · {period}{source}",
+                callback_data=f"adm:availability_del:{block['id']}",
+            )
+        )
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:home"))
+    return builder.as_markup()

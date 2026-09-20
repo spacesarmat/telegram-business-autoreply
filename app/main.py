@@ -4,6 +4,7 @@ import asyncio
 import calendar
 import html
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -18,6 +19,7 @@ from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message
 from .config import Settings, load_settings
 from .db import Database, utc_now_iso
 from .keyboards import (
+    admin_availability,
     admin_button_edit,
     admin_buttons_list,
     admin_form_bindings,
@@ -29,12 +31,15 @@ from .keyboards import (
     admin_question_delete_confirm,
     admin_question_edit,
     admin_question_type,
+    admin_submission_card,
+    admin_submissions_list,
     calendar_keyboard,
     contact_request_keyboard,
     delete_confirm,
     form_confirmation,
     form_question_nav,
     public_menu,
+    time_slots_keyboard,
 )
 from .states import AdminStates
 from .status import start_status_server
@@ -164,6 +169,7 @@ async def render_admin_button(button: dict) -> tuple[str, object]:
 QUESTION_TYPE_NAMES = {
     "text": "⌨️ Текст",
     "date": "📅 Дата",
+    "time": "🕐 Время",
     "contact": "📱 Контакт",
 }
 
@@ -191,6 +197,151 @@ def _date_from_answer(value: str | None):
     if not normalized:
         return None
     return datetime.strptime(normalized, "%d.%m.%Y").date()
+
+
+
+def _parse_time_answer(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = value.strip().replace(".", ":")
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _time_to_minutes(value: str) -> int:
+    hour, minute = [int(x) for x in value.split(":", 1)]
+    return hour * 60 + minute
+
+
+def _minutes_to_time(value: int) -> str:
+    value = max(0, min(value, 23 * 60 + 59))
+    return f"{value // 60:02d}:{value % 60:02d}"
+
+
+async def _booking_time_slots() -> list[str]:
+    start = _parse_time_answer(await db.get_setting("booking_day_start", "10:00")) or "10:00"
+    end = _parse_time_answer(await db.get_setting("booking_day_end", "23:00")) or "23:00"
+    try:
+        step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
+    except ValueError:
+        step = 60
+    step = max(15, min(step, 240))
+    start_min = _time_to_minutes(start)
+    end_min = _time_to_minutes(end)
+    if end_min <= start_min:
+        start_min, end_min = 10 * 60, 23 * 60
+    return [_minutes_to_time(value) for value in range(start_min, end_min + 1, step)]
+
+
+def _selected_date_iso(questions: list[dict], answers: dict[str, str]) -> str | None:
+    for question in questions:
+        if _question_input_type(question) != "date":
+            continue
+        parsed = _date_from_answer(answers.get(str(question["id"])))
+        if parsed:
+            return parsed.isoformat()
+    return None
+
+
+async def _date_fully_busy(date_iso: str) -> bool:
+    blocks = await db.list_availability_blocks(date_iso=date_iso, limit=200)
+    return any(not block.get("start_time") or not block.get("end_time") for block in blocks)
+
+
+async def _busy_time_slots(date_iso: str | None, slots: list[str]) -> set[str]:
+    if not date_iso:
+        return set()
+    blocks = await db.list_availability_blocks(date_iso=date_iso, limit=200)
+    busy: set[str] = set()
+    for slot in slots:
+        point = _time_to_minutes(slot)
+        for block in blocks:
+            if not block.get("start_time") or not block.get("end_time"):
+                busy.add(slot)
+                break
+            start = _time_to_minutes(str(block["start_time"]))
+            end = _time_to_minutes(str(block["end_time"]))
+            if start <= point < end:
+                busy.add(slot)
+                break
+    return busy
+
+
+def _extract_booking_slot(questions: list[dict], answers: dict[str, str]) -> tuple[str, str | None, str | None] | None:
+    date_iso = _selected_date_iso(questions, answers)
+    if not date_iso:
+        return None
+    start_time: str | None = None
+    duration_minutes: int | None = None
+    for question in questions:
+        value = answers.get(str(question["id"]))
+        label = str(question.get("label") or "").casefold()
+        if _question_input_type(question) == "time" or "время" in label:
+            parsed = _parse_time_answer(value)
+            if parsed:
+                start_time = parsed
+        if "продолж" in label or "длитель" in label:
+            if value:
+                match = re.search(r"(\d+(?:[.,]\d+)?)", value)
+                if match:
+                    try:
+                        duration_minutes = max(15, int(float(match.group(1).replace(",", ".")) * 60))
+                    except ValueError:
+                        pass
+    if not start_time:
+        return date_iso, None, None
+    if duration_minutes is None:
+        duration_minutes = 60
+    end_minutes = _time_to_minutes(start_time) + duration_minutes
+    end_time = _minutes_to_time(min(end_minutes, 23 * 60 + 59))
+    if end_time <= start_time:
+        end_time = "23:59"
+    return date_iso, start_time, end_time
+
+
+SUBMISSION_STATUS_NAMES = {
+    "new": "🆕 Новая",
+    "in_progress": "🟡 В работе",
+    "confirmed": "✅ Подтверждена",
+    "paid": "💰 Оплачена",
+    "completed": "🏁 Завершена",
+    "cancelled": "❌ Отказ",
+}
+BOOKING_STATUSES = {"confirmed", "paid", "completed"}
+
+
+async def _submission_admin_text(submission: dict) -> str:
+    full_name = " ".join(
+        part for part in [submission.get("first_name"), submission.get("last_name")] if part
+    ).strip() or "Без имени"
+    status = SUBMISSION_STATUS_NAMES.get(str(submission.get("status") or "new"), "•")
+    lines = [
+        f"<b>Заявка №{submission['id']}</b>",
+        f"Статус: {status}",
+        f"Форма: <b>{html.escape(str(submission['form_name']))}</b>",
+        "",
+        f"Клиент: {html.escape(full_name)}",
+        f"Telegram: @{html.escape(str(submission['username']))}" if submission.get("username") else "Telegram: —",
+        f"User ID: {submission.get('user_id') or '—'}",
+        "",
+    ]
+    questions = await db.list_form_questions(int(submission["form_id"])) if submission.get("form_id") else []
+    answers = submission.get("answers") or {}
+    if questions:
+        for question in questions:
+            value = answers.get(str(question["id"])) or "—"
+            lines.append(f"<b>{html.escape(str(question['label']))}:</b> {html.escape(str(value))}")
+    else:
+        for key, value in answers.items():
+            lines.append(f"<b>Поле {html.escape(str(key))}:</b> {html.escape(str(value))}")
+    lines.extend(["", f"Создана: {html.escape(str(submission.get('created_at') or '—'))}"])
+    return "\n".join(lines)
 
 
 def _message_answer_text(message: Message) -> str | None:
@@ -342,8 +493,10 @@ async def send_current_form_question(
             f"📝 {form['name']}\n\n"
             f"Вопрос {index + 1} из {len(questions)}\n"
             f"{question['prompt']}{suffix}\n\n"
-            "Выберите день в календаре или введите дату вручную в формате ДД.ММ.ГГГГ."
+            "Выберите день в календаре или введите дату вручную в формате ДД.ММ.ГГГГ.\n"
+            "× — дата занята полностью, • — есть занятые часы."
         )
+        full_busy_dates, partial_busy_dates = await db.month_availability(year, month)
         markup = calendar_keyboard(
             int(question["id"]),
             year,
@@ -352,8 +505,31 @@ async def send_current_form_question(
             required=bool(question["required"]),
             can_go_back=index > 0,
             today_iso=today.isoformat(),
+            full_busy_dates=full_busy_dates,
+            partial_busy_dates=partial_busy_dates,
         )
         await _upsert_form_message(bot, session, text=text, reply_markup=markup)
+        return
+
+    if input_type == "time":
+        slots = await _booking_time_slots()
+        date_iso = _selected_date_iso(questions, session["answers"])
+        busy_slots = await _busy_time_slots(date_iso, slots)
+        text = (
+            f"📝 {form['name']}\n\n"
+            f"Вопрос {index + 1} из {len(questions)}\n"
+            f"{question['prompt']}{suffix}\n\n"
+            "Выберите свободное время или введите его вручную в формате ЧЧ:ММ."
+        )
+        if date_iso:
+            text += "\n× — время уже занято."
+        await _upsert_form_message(
+            bot, session, text=text,
+            reply_markup=time_slots_keyboard(
+                int(question["id"]), slots, busy_slots,
+                required=bool(question["required"]), can_go_back=index > 0,
+            ),
+        )
         return
 
     text = (
@@ -440,6 +616,25 @@ async def handle_form_message(
         if not answer:
             await send_current_form_question(bot, message.chat.id)
             return True
+        parsed_date = _date_from_answer(answer)
+        if parsed_date and await _date_fully_busy(parsed_date.isoformat()):
+            await send_current_form_question(bot, message.chat.id)
+            return True
+    elif input_type == "time":
+        answer = _parse_time_answer(message.text)
+        if not answer:
+            await send_current_form_question(bot, message.chat.id)
+            return True
+        date_iso = _selected_date_iso(questions, session["answers"])
+        if date_iso:
+            try:
+                step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
+            except ValueError:
+                step = 60
+            end_time = _minutes_to_time(min(_time_to_minutes(answer) + max(15, step), 23 * 60 + 59))
+            if await db.booking_conflicts(date_iso, answer, end_time):
+                await send_current_form_question(bot, message.chat.id)
+                return True
     else:
         answer = _message_answer_text(message)
 
@@ -763,6 +958,11 @@ async def calendar_noop(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("cal:busy:"))
+async def calendar_busy(callback: CallbackQuery) -> None:
+    await callback.answer("Эта дата полностью занята. Выберите другой день.", show_alert=True)
+
+
 async def _calendar_session_question(callback: CallbackQuery, question_id: int) -> tuple[dict, dict] | None:
     session = await _form_callback_session(callback)
     if not session or not isinstance(callback.message, Message):
@@ -812,7 +1012,11 @@ async def calendar_today(callback: CallbackQuery, bot: Bot) -> None:
     if not data or not isinstance(callback.message, Message):
         return
     session, question = data
-    selected = datetime.now().date().strftime("%d.%m.%Y")
+    today_date = datetime.now().date()
+    if await _date_fully_busy(today_date.isoformat()):
+        await callback.answer("Сегодня дата полностью занята", show_alert=True)
+        return
+    selected = today_date.strftime("%d.%m.%Y")
     answers = dict(session["answers"])
     answers[str(question["id"])] = selected
     questions = await db.list_form_questions(int(session["form_id"]))
@@ -841,6 +1045,9 @@ async def calendar_select_day(callback: CallbackQuery, bot: Bot) -> None:
     if not data or not isinstance(callback.message, Message):
         return
     session, question = data
+    if await _date_fully_busy(selected_date.isoformat()):
+        await callback.answer("Эта дата полностью занята", show_alert=True)
+        return
     selected = selected_date.strftime("%d.%m.%Y")
     answers = dict(session["answers"])
     answers[str(question["id"])] = selected
@@ -855,6 +1062,71 @@ async def calendar_select_day(callback: CallbackQuery, bot: Bot) -> None:
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer(f"Дата: {selected}")
+
+
+async def _time_session_question(callback: CallbackQuery, question_id: int) -> tuple[dict, dict, list[dict]] | None:
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return None
+    if session["status"] != "active":
+        await callback.answer("Нет активного вопроса", show_alert=True)
+        return None
+    questions = await db.list_form_questions(int(session["form_id"]))
+    index = int(session["current_index"])
+    if index < 0 or index >= len(questions):
+        await callback.answer("Нет активного вопроса", show_alert=True)
+        return None
+    question = questions[index]
+    if int(question["id"]) != question_id or _question_input_type(question) != "time":
+        await callback.answer("Эта кнопка времени уже неактивна", show_alert=True)
+        return None
+    return session, question, questions
+
+
+@router.callback_query(F.data.startswith("time:busy:"))
+async def time_busy(callback: CallbackQuery) -> None:
+    await callback.answer("Это время уже занято. Выберите другой вариант.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("time:pick:"))
+async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, _, question_raw, compact = (callback.data or "").split(":", 3)
+        question_id = int(question_raw)
+        if len(compact) != 4 or not compact.isdigit():
+            raise ValueError
+        selected = _parse_time_answer(f"{compact[:2]}:{compact[2:]}")
+        if not selected:
+            raise ValueError
+    except (ValueError, TypeError):
+        await callback.answer("Некорректное время", show_alert=True)
+        return
+    data = await _time_session_question(callback, question_id)
+    if not data or not isinstance(callback.message, Message):
+        return
+    session, question, questions = data
+    date_iso = _selected_date_iso(questions, session["answers"])
+    try:
+        step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
+    except ValueError:
+        step = 60
+    end_time = _minutes_to_time(min(_time_to_minutes(selected) + max(15, step), 23 * 60 + 59))
+    if date_iso and await db.booking_conflicts(date_iso, selected, end_time):
+        await callback.answer("Это время уже занято", show_alert=True)
+        await send_current_form_question(bot, callback.message.chat.id)
+        return
+    answers = dict(session["answers"])
+    answers[str(question["id"])] = selected
+    next_index = int(session["current_index"]) + 1
+    await db.update_form_session(
+        callback.message.chat.id,
+        current_index=next_index,
+        answers=answers,
+        status="confirm" if next_index >= len(questions) else "active",
+        keyboard_question_id=0,
+    )
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer(f"Время: {selected}")
 
 
 @router.callback_query(F.data == "form:menu")
@@ -980,6 +1252,24 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
                 callback.message.chat.id, current_index=index, status="active"
             )
             await callback.answer("Нужно заполнить обязательный вопрос", show_alert=True)
+            await send_current_form_question(bot, callback.message.chat.id)
+            return
+
+    booking_slot = _extract_booking_slot(questions, session["answers"])
+    if booking_slot:
+        date_iso, start_time, end_time = booking_slot
+        if await db.booking_conflicts(date_iso, start_time, end_time):
+            target_index = 0
+            for idx, question in enumerate(questions):
+                if _question_input_type(question) == ("time" if start_time else "date"):
+                    target_index = idx
+                    break
+            await db.update_form_session(
+                callback.message.chat.id, current_index=target_index, status="active"
+            )
+            await callback.answer(
+                "Выбранные дата/время уже заняты. Выберите другой вариант.", show_alert=True
+            )
             await send_current_form_question(bot, callback.message.chat.id)
             return
 
@@ -1703,7 +1993,8 @@ async def admin_question_type_menu(callback: CallbackQuery) -> None:
         await callback.message.edit_text(
             "Выберите тип ответа для этого вопроса:\n\n"
             "⌨️ Текст — обычный ответ\n"
-            "📅 Дата — календарь + ручной ввод\n"
+            "📅 Дата — календарь + проверка занятости\n"
+            "🕐 Время — свободные интервалы кнопками + ручной ввод\n"
             "📱 Контакт — кнопка «Поделиться своим контактом» + ручной ввод",
             reply_markup=admin_question_type(question_id),
         )
@@ -1721,7 +2012,7 @@ async def admin_question_type_set(callback: CallbackQuery) -> None:
     except (ValueError, TypeError):
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    if input_type not in {"text", "date", "contact"}:
+    if input_type not in {"text", "date", "time", "contact"}:
         await callback.answer("Неизвестный тип", show_alert=True)
         return
     question = await db.get_form_question(question_id)
@@ -1884,12 +2175,206 @@ async def admin_form_bind_button(callback: CallbackQuery) -> None:
     await callback.answer(notice)
 
 
+@router.callback_query(F.data.startswith("adm:reqs:"))
+async def admin_requests(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    status_filter = (callback.data or "adm:reqs:all").rsplit(":", 1)[1]
+    allowed = {"all", "new", "in_progress", "confirmed", "paid", "completed", "cancelled"}
+    if status_filter not in allowed:
+        status_filter = "all"
+    items = await db.list_submissions(None if status_filter == "all" else status_filter, limit=30)
+    counts = await db.submission_status_counts()
+    text = (
+        "<b>📋 Заявки</b>\n\n"
+        f"🆕 Новые: {counts['new']} · 🟡 В работе: {counts['in_progress']}\n"
+        f"✅ Подтверждены: {counts['confirmed']} · 💰 Оплачены: {counts['paid']}\n"
+        f"🏁 Завершены: {counts['completed']} · ❌ Отказ: {counts['cancelled']}\n\n"
+        "Нажмите заявку, чтобы открыть карточку и изменить статус."
+    )
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(text, reply_markup=admin_submissions_list(items, status_filter))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:req:"))
+async def admin_request_open(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        submission_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    submission = await db.get_submission(submission_id)
+    if not submission:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            await _submission_admin_text(submission),
+            reply_markup=admin_submission_card(submission),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:req_status:"))
+async def admin_request_status(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, _, submission_raw, new_status = (callback.data or "").split(":", 3)
+        submission_id = int(submission_raw)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    if new_status not in SUBMISSION_STATUS_NAMES:
+        await callback.answer("Неизвестный статус", show_alert=True)
+        return
+    submission = await db.get_submission(submission_id)
+    if not submission:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    questions = await db.list_form_questions(int(submission["form_id"])) if submission.get("form_id") else []
+    slot = _extract_booking_slot(questions, submission.get("answers") or {}) if questions else None
+    if new_status in BOOKING_STATUSES and slot:
+        date_iso, start_time, end_time = slot
+        if await db.booking_conflicts(
+            date_iso, start_time, end_time, exclude_submission_id=submission_id
+        ):
+            await callback.answer(
+                "Нельзя подтвердить: дата/время уже заняты. Проверьте раздел «Занятость».",
+                show_alert=True,
+            )
+            return
+    await db.update_submission_status(submission_id, new_status)
+    if new_status in BOOKING_STATUSES and slot:
+        date_iso, start_time, end_time = slot
+        await db.add_availability_block(
+            date_iso,
+            start_time,
+            end_time,
+            note=f"Заявка №{submission_id}: {submission['form_name']}",
+            source_submission_id=submission_id,
+        )
+    else:
+        await db.delete_submission_availability(submission_id)
+    submission = await db.get_submission(submission_id)
+    if isinstance(callback.message, Message) and submission:
+        await callback.message.edit_text(
+            await _submission_admin_text(submission),
+            reply_markup=admin_submission_card(submission),
+        )
+    await callback.answer(SUBMISSION_STATUS_NAMES[new_status])
+
+
+@router.callback_query(F.data == "adm:availability")
+async def admin_availability_open(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    today_iso = datetime.now().date().isoformat()
+    blocks = await db.list_availability_blocks(start_date=today_iso, limit=30)
+    text = (
+        "<b>📅 Занятость</b>\n\n"
+        "× в клиентском календаре означает полностью занятую дату, "
+        "• — на дате есть занятые интервалы.\n\n"
+        "Подтверждённые/оплаченные заявки блокируют дату автоматически. "
+        "Также можно добавить блокировку вручную."
+    )
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(text, reply_markup=admin_availability(blocks))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:availability_add")
+async def admin_availability_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.availability_date)
+    if isinstance(callback.message, Message):
+        await callback.message.answer("Введите дату блокировки в формате ДД.ММ.ГГГГ:")
+    await callback.answer()
+
+
+@router.message(AdminStates.availability_date)
+async def admin_availability_date_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    normalized = _parse_date_answer(message.text)
+    parsed = _date_from_answer(normalized)
+    if not normalized or not parsed:
+        await message.answer("Не удалось распознать дату. Пример: 21.10.2026")
+        return
+    await state.update_data(availability_date=parsed.isoformat())
+    await state.set_state(AdminStates.availability_period)
+    await message.answer(
+        "Теперь укажите период:\n\n"
+        "• <code>весь день</code>\n"
+        "• <code>18:00-23:00</code>\n"
+        "• можно добавить заметку: <code>18:00-23:00 | монтаж</code>"
+    )
+
+
+@router.message(AdminStates.availability_period)
+async def admin_availability_period_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    raw = (message.text or "").strip()
+    period_raw, _, note_raw = raw.partition("|")
+    period = period_raw.strip().casefold()
+    note = note_raw.strip() or None
+    start_time = end_time = None
+    if period not in {"весь день", "весьдень", "all", "day"}:
+        match = re.fullmatch(r"\s*(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})\s*", period_raw)
+        if not match:
+            await message.answer("Введите «весь день» или интервал, например 18:00-23:00.")
+            return
+        start_time = _parse_time_answer(match.group(1))
+        end_time = _parse_time_answer(match.group(2))
+        if not start_time or not end_time or _time_to_minutes(end_time) <= _time_to_minutes(start_time):
+            await message.answer("Конец интервала должен быть позже начала.")
+            return
+    data = await state.get_data()
+    await db.add_availability_block(
+        str(data["availability_date"]), start_time, end_time, note=note
+    )
+    await state.clear()
+    await message.answer("✅ Блокировка добавлена.")
+    blocks = await db.list_availability_blocks(start_date=datetime.now().date().isoformat(), limit=30)
+    await message.answer("📅 Занятость:", reply_markup=admin_availability(blocks))
+
+
+@router.callback_query(F.data.startswith("adm:availability_del:"))
+async def admin_availability_delete(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        block_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная блокировка", show_alert=True)
+        return
+    await db.delete_availability_block(block_id)
+    blocks = await db.list_availability_blocks(start_date=datetime.now().date().isoformat(), limit=30)
+    if isinstance(callback.message, Message):
+        await callback.message.edit_reply_markup(reply_markup=admin_availability(blocks))
+    await callback.answer("Удалено")
+
+
 @router.callback_query(F.data == "adm:stats")
 async def admin_stats(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     stat = await db.stats()
+    counts = await db.submission_status_counts()
     connection = await db.latest_business_connection()
     conn = "подключён" if connection and connection["enabled"] else "не подключён"
     text = (
@@ -1898,6 +2383,9 @@ async def admin_stats(callback: CallbackQuery) -> None:
         f"Автоответов отправлено: {stat['auto_replies']}\n"
         f"Нажатий на кнопки: {stat['button_clicks']}\n"
         f"Заявок отправлено: {stat['submissions']}\n"
+        f"Новых заявок: {counts['new']}\n"
+        f"В работе: {counts['in_progress']}\n"
+        f"Подтверждено / оплачено: {counts['confirmed'] + counts['paid']}\n"
         f"Business: {conn}"
     )
     if isinstance(callback.message, Message):
