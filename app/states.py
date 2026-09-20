@@ -31,3 +31,7 @@ class AdminStates(StatesGroup):
     submission_prepayment = State()
     submission_note = State()
     status_template = State()
+
+    pricing_base_amount = State()
+    pricing_included_hours = State()
+    pricing_extra_hour_amount = State()

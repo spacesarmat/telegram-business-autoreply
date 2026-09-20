@@ -70,10 +70,12 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.5.2"
+  version: "1.6.0"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      User-visible dates and timestamps now use the configured business timezone from TZ, while UTC remains internal storage.
+      Configurable automatic rental pricing per form: base price, included hours and
+      each started extra hour, with overnight interval support and CRM integration.
     ru_RU: >
-      Все видимые даты и время теперь отображаются в часовом поясе бизнеса из TZ; UTC используется только для внутреннего хранения.
+      Настраиваемый авторасчёт аренды по форме: базовая стоимость, включённые часы
+      и каждый начатый дополнительный час, включая интервалы через полночь и запись суммы в CRM.

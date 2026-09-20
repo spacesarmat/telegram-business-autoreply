@@ -228,6 +228,17 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS form_pricing (
+                    form_id INTEGER PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    base_amount INTEGER NOT NULL DEFAULT 0,
+                    included_hours INTEGER NOT NULL DEFAULT 0,
+                    extra_hour_amount INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS form_questions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     form_id INTEGER NOT NULL,
@@ -279,6 +290,8 @@ class Database:
                     answers_json TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'new',
                     total_amount INTEGER NOT NULL DEFAULT 0,
+                    calculated_amount INTEGER NOT NULL DEFAULT 0,
+                    pricing_details_json TEXT NOT NULL DEFAULT '{}',
                     prepayment_amount INTEGER NOT NULL DEFAULT 0,
                     internal_note TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
@@ -363,6 +376,10 @@ class Database:
                 await db.execute("ALTER TABLE form_submissions ADD COLUMN updated_at TEXT")
             if "total_amount" not in submission_columns:
                 await db.execute("ALTER TABLE form_submissions ADD COLUMN total_amount INTEGER NOT NULL DEFAULT 0")
+            if "calculated_amount" not in submission_columns:
+                await db.execute("ALTER TABLE form_submissions ADD COLUMN calculated_amount INTEGER NOT NULL DEFAULT 0")
+            if "pricing_details_json" not in submission_columns:
+                await db.execute("ALTER TABLE form_submissions ADD COLUMN pricing_details_json TEXT NOT NULL DEFAULT '{}'")
             if "prepayment_amount" not in submission_columns:
                 await db.execute("ALTER TABLE form_submissions ADD COLUMN prepayment_amount INTEGER NOT NULL DEFAULT 0")
             if "internal_note" not in submission_columns:
@@ -697,6 +714,61 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
+    # ---------- Тарифы форм ----------
+
+    async def get_form_pricing(self, form_id: int) -> dict[str, Any]:
+        async with self.connection() as db:
+            row = await (
+                await db.execute("SELECT * FROM form_pricing WHERE form_id=?", (form_id,))
+            ).fetchone()
+            if row:
+                return dict(row)
+            return {
+                "form_id": form_id,
+                "enabled": 0,
+                "base_amount": 0,
+                "included_hours": 0,
+                "extra_hour_amount": 0,
+            }
+
+    async def list_forms_with_pricing(self) -> list[dict[str, Any]]:
+        async with self.connection() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT f.*,
+                           COALESCE(p.enabled, 0) AS pricing_enabled,
+                           COALESCE(p.base_amount, 0) AS base_amount,
+                           COALESCE(p.included_hours, 0) AS included_hours,
+                           COALESCE(p.extra_hour_amount, 0) AS extra_hour_amount
+                    FROM forms f
+                    LEFT JOIN form_pricing p ON p.form_id=f.id
+                    ORDER BY f.id ASC
+                    """
+                )
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    async def update_form_pricing(self, form_id: int, field: str, value: Any) -> None:
+        allowed = {"enabled", "base_amount", "included_hours", "extra_hour_amount"}
+        if field not in allowed:
+            raise ValueError("Unsupported pricing field")
+        now = utc_now_iso()
+        async with self.connection() as db:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO form_pricing(
+                    form_id, enabled, base_amount, included_hours, extra_hour_amount, created_at, updated_at
+                ) VALUES(?, 0, 0, 0, 0, ?, ?)
+                """,
+                (form_id, now, now),
+            )
+            await db.execute(
+                f"UPDATE form_pricing SET {field}=?, updated_at=? WHERE form_id=?",
+                (value, now, form_id),
+            )
+            await db.commit()
+
     # ---------- Формы ----------
 
     async def list_forms(self) -> list[dict[str, Any]]:
@@ -954,16 +1026,25 @@ class Database:
             await db.execute("DELETE FROM form_sessions WHERE chat_id=?", (chat_id,))
             await db.commit()
 
-    async def create_form_submission(self, session: dict[str, Any], form_name: str) -> int:
+    async def create_form_submission(
+        self,
+        session: dict[str, Any],
+        form_name: str,
+        *,
+        calculated_amount: int = 0,
+        pricing_details: dict[str, Any] | None = None,
+    ) -> int:
         now = utc_now_iso()
         answers = session.get("answers") or _decode_answers(session.get("answers_json"))
+        calculated_amount = max(0, int(calculated_amount or 0))
+        pricing_details = pricing_details or {}
         async with self.connection() as db:
             cur = await db.execute(
                 """
                 INSERT INTO form_submissions(
                     form_id, form_name, chat_id, business_connection_id, user_id, username, first_name, last_name,
-                    answers_json, status, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
+                    answers_json, status, total_amount, calculated_amount, pricing_details_json, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
                 """,
                 (
                     session.get("form_id"),
@@ -975,6 +1056,9 @@ class Database:
                     session.get("first_name"),
                     session.get("last_name"),
                     json.dumps(answers, ensure_ascii=False),
+                    calculated_amount,
+                    calculated_amount,
+                    json.dumps(pricing_details, ensure_ascii=False),
                     now,
                     now,
                 ),
@@ -1002,6 +1086,10 @@ class Database:
             for row in rows:
                 item = dict(row)
                 item["answers"] = _decode_answers(item.get("answers_json"))
+                try:
+                    item["pricing_details"] = json.loads(item.get("pricing_details_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    item["pricing_details"] = {}
                 result.append(item)
             return result
 
@@ -1014,6 +1102,10 @@ class Database:
                 return None
             result = dict(row)
             result["answers"] = _decode_answers(result.get("answers_json"))
+            try:
+                result["pricing_details"] = json.loads(result.get("pricing_details_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                result["pricing_details"] = {}
             return result
 
     async def update_submission_status(
@@ -1103,6 +1195,10 @@ class Database:
             for row in rows:
                 item = dict(row)
                 item["answers"] = _decode_answers(item.get("answers_json"))
+                try:
+                    item["pricing_details"] = json.loads(item.get("pricing_details_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    item["pricing_details"] = {}
                 result.append(item)
             return result
 
@@ -1124,6 +1220,10 @@ class Database:
             for row in rows:
                 item = dict(row)
                 item["answers"] = _decode_answers(item.get("answers_json"))
+                try:
+                    item["pricing_details"] = json.loads(item.get("pricing_details_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    item["pricing_details"] = {}
                 result.append(item)
             return result
 

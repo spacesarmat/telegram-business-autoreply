@@ -147,6 +147,9 @@ def admin_main(enabled: bool) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📅 Занятость", callback_data="adm:availability"),
     )
     builder.row(
+        InlineKeyboardButton(text="💰 Тарифы", callback_data="adm:pricing"),
+    )
+    builder.row(
         InlineKeyboardButton(text="💬 Шаблоны статусов", callback_data="adm:status_templates"),
         InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
     )
@@ -485,4 +488,51 @@ def admin_availability(blocks: list[dict]) -> InlineKeyboardMarkup:
             )
         )
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:home"))
+    return builder.as_markup()
+
+
+def admin_pricing_forms(forms: list[dict], currency: str = "₽") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for form in forms:
+        enabled = bool(form.get("pricing_enabled"))
+        icon = "🟢" if enabled else "⚪"
+        base = int(form.get("base_amount") or 0)
+        hours = int(form.get("included_hours") or 0)
+        extra = int(form.get("extra_hour_amount") or 0)
+        if enabled:
+            if hours > 0:
+                summary = f"{base:,}".replace(",", " ") + f" {currency}/{hours}ч"
+            elif extra > 0:
+                summary = f"{extra:,}".replace(",", " ") + f" {currency}/ч"
+            else:
+                summary = "настроить"
+        else:
+            summary = "выкл."
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{icon} {str(form['name'])[:25]} · {summary}",
+                callback_data=f"adm:pricing_form:{form['id']}",
+            )
+        )
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:home"))
+    return builder.as_markup()
+
+
+def admin_pricing_form(form_id: int, pricing: dict, currency: str = "₽") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    enabled = bool(pricing.get("enabled"))
+    builder.row(
+        InlineKeyboardButton(
+            text=("🟢 Расчёт включён" if enabled else "⚪ Расчёт выключен"),
+            callback_data=f"adm:pricing_toggle:{form_id}",
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(text="💵 Базовая стоимость", callback_data=f"adm:pricing_base:{form_id}"),
+        InlineKeyboardButton(text="⏱ Включено часов", callback_data=f"adm:pricing_hours:{form_id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="➕ Доп. час", callback_data=f"adm:pricing_extra:{form_id}"),
+    )
+    builder.row(InlineKeyboardButton(text="⬅️ К тарифам", callback_data="adm:pricing"))
     return builder.as_markup()

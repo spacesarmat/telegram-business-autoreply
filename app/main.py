@@ -29,6 +29,8 @@ from .keyboards import (
     admin_form_questions,
     admin_forms_list,
     admin_main,
+    admin_pricing_form,
+    admin_pricing_forms,
     admin_question_delete_confirm,
     admin_question_edit,
     admin_question_type,
@@ -531,6 +533,163 @@ def _money_text(value: int | str | None, currency: str = "₽") -> str:
     return f"{number:,}".replace(",", " ") + f" {currency}" if number else "—"
 
 
+def _parse_money_input(value: str | None) -> int | None:
+    if not value:
+        return None
+    raw = value.strip().replace(" ", "").replace(" ", "")
+    raw = re.sub(r"[^0-9]", "", raw)
+    if not raw:
+        return None
+    try:
+        number = int(raw)
+    except ValueError:
+        return None
+    if number < 0 or number > 1_000_000_000:
+        return None
+    return number
+
+
+async def _calculate_form_pricing(
+    form_id: int, questions: list[dict], answers: dict[str, str]
+) -> dict | None:
+    """Calculate a preliminary rental price for a time-based form.
+
+    The base amount covers `included_hours`. Every started hour beyond that
+    is billed at `extra_hour_amount`. With included_hours=0 the extra-hour
+    rate acts as a straight hourly tariff; base_amount may still be used as
+    a fixed starting fee.
+    """
+    pricing = await db.get_form_pricing(form_id)
+    if not pricing.get("enabled"):
+        return None
+    interval = _booking_interval(questions, answers)
+    if not interval or not interval.get("start_time") or not interval.get("end_time"):
+        return None
+    duration_minutes = int(interval.get("duration_minutes") or 0)
+    if duration_minutes <= 0:
+        return None
+
+    base_amount = max(0, int(pricing.get("base_amount") or 0))
+    included_hours = max(0, int(pricing.get("included_hours") or 0))
+    extra_hour_amount = max(0, int(pricing.get("extra_hour_amount") or 0))
+    included_minutes = included_hours * 60
+
+    if included_hours > 0:
+        extra_minutes = max(0, duration_minutes - included_minutes)
+        extra_hours = (extra_minutes + 59) // 60 if extra_minutes else 0
+        billed_hours = included_hours + extra_hours
+        amount = base_amount + extra_hours * extra_hour_amount
+    else:
+        billed_hours = (duration_minutes + 59) // 60
+        extra_hours = billed_hours
+        amount = base_amount + billed_hours * extra_hour_amount
+
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    return {
+        "amount": amount,
+        "currency": currency,
+        "duration_minutes": duration_minutes,
+        "base_amount": base_amount,
+        "included_hours": included_hours,
+        "extra_hour_amount": extra_hour_amount,
+        "extra_hours": extra_hours,
+        "billed_hours": billed_hours,
+        "start_time": interval.get("start_time"),
+        "end_time": interval.get("end_time"),
+        "overnight": bool(interval.get("overnight")),
+    }
+
+
+def _pricing_calculation_text(calculation: dict | None) -> str | None:
+    if not calculation:
+        return None
+    currency = str(calculation.get("currency") or "₽")
+    amount = int(calculation.get("amount") or 0)
+    base = int(calculation.get("base_amount") or 0)
+    included = int(calculation.get("included_hours") or 0)
+    extra_rate = int(calculation.get("extra_hour_amount") or 0)
+    extra_hours = int(calculation.get("extra_hours") or 0)
+    duration = int(calculation.get("duration_minutes") or 0)
+    hours, minutes = divmod(duration, 60)
+    duration_text = f"{hours} ч" if not minutes else f"{hours} ч {minutes} мин"
+
+    lines = [f"💰 Предварительная стоимость: {_money_text(amount, currency)}"]
+    if included > 0:
+        tariff = f"{_money_text(base, currency)} за первые {included} ч"
+        if extra_rate:
+            tariff += f" + {_money_text(extra_rate, currency)} за каждый начатый дополнительный час"
+        lines.append(f"Тариф: {tariff}.")
+        if extra_hours:
+            lines.append(f"Дополнительное время к расчёту: {extra_hours} ч.")
+    elif extra_rate:
+        tariff = f"{_money_text(extra_rate, currency)} за каждый начатый час"
+        if base:
+            tariff = f"база {_money_text(base, currency)} + {tariff}"
+        lines.append(f"Тариф: {tariff}.")
+    elif base:
+        lines.append(f"Фиксированная стоимость: {_money_text(base, currency)}.")
+    lines.append(f"Продолжительность: {duration_text}.")
+    lines.append("Итоговая стоимость может быть скорректирована администратором.")
+    return "\n".join(lines)
+
+
+def _form_supports_time_pricing(questions: list[dict]) -> bool:
+    has_date = any(_question_input_type(q) == "date" for q in questions)
+    time_questions = [q for q in questions if _question_input_type(q) == "time"]
+    has_end = any(_is_end_time_question(q) for q in time_questions)
+    has_duration = any(
+        "продолж" in str(q.get("label") or "").casefold()
+        or "длитель" in str(q.get("label") or "").casefold()
+        for q in questions
+    )
+    return has_date and bool(time_questions) and (has_end or has_duration or len(time_questions) >= 2)
+
+
+async def _pricing_admin_text(form: dict, pricing: dict) -> str:
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    enabled = bool(pricing.get("enabled"))
+    base = max(0, int(pricing.get("base_amount") or 0))
+    included = max(0, int(pricing.get("included_hours") or 0))
+    extra = max(0, int(pricing.get("extra_hour_amount") or 0))
+    questions = await db.list_form_questions(int(form["id"]))
+    compatible = _form_supports_time_pricing(questions)
+    lines = [
+        f"<b>💰 Тариф · {html.escape(str(form['name']))}</b>",
+        "",
+        f"Расчёт: {'🟢 включён' if enabled else '⚪ выключен'}",
+        f"Базовая стоимость: <b>{html.escape(_money_text(base, currency))}</b>",
+        f"В базовую стоимость включено: <b>{included} ч</b>",
+        f"Каждый начатый дополнительный час: <b>{html.escape(_money_text(extra, currency))}</b>",
+        "",
+    ]
+    if included > 0:
+        lines.append(
+            f"Формула: {_money_text(base, currency)} за первые {included} ч"
+            + (f" + {_money_text(extra, currency)} за каждый начатый доп. час." if extra else ".")
+        )
+    elif extra > 0:
+        prefix = f"{_money_text(base, currency)} + " if base else ""
+        lines.append(f"Формула: {prefix}{_money_text(extra, currency)} за каждый начатый час.")
+    elif base > 0:
+        lines.append(f"Формула: фиксированно {_money_text(base, currency)}.")
+    else:
+        lines.append("Тариф ещё не настроен. Укажите базовую стоимость и/или цену часа.")
+    lines.extend(
+        [
+            "",
+            (
+                "✅ В форме есть дата, начало и окончание — автоматический расчёт доступен."
+                if compatible
+                else "⚠️ Для расчёта по времени форме нужны дата, время начала и время окончания."
+            ),
+            "",
+            "Цена показывается клиенту как предварительная и автоматически записывается в стоимость новой заявки. "
+            "После этого администратор может изменить стоимость вручную.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 async def _submission_status_notification_text(submission: dict, new_status: str) -> str:
     """Build a client-facing status update from an editable admin template."""
     status_text = SUBMISSION_STATUS_NAMES.get(new_status, new_status)
@@ -614,6 +773,10 @@ async def _submission_admin_text(submission: dict) -> str:
         f"Форма: <b>{html.escape(str(submission['form_name']))}</b>",
         "",
         f"💵 Стоимость: <b>{html.escape(_money_text(total_amount, currency))}</b>",
+        (
+            f"🤖 Расчёт тарифа: <b>{html.escape(_money_text(submission.get('calculated_amount'), currency))}</b>"
+            + (" · изменено вручную" if int(submission.get("calculated_amount") or 0) and int(submission.get("calculated_amount") or 0) != total_amount else "")
+        ),
         f"💳 Предоплата: <b>{html.escape(_money_text(prepayment, currency))}</b>",
         f"🧾 Остаток: <b>{html.escape(_money_text(balance, currency))}</b>",
         f"🗒 Заметка: {html.escape(str(submission.get('internal_note') or '—'))}",
@@ -707,7 +870,9 @@ def _message_answer_text(message: Message) -> str | None:
     return None
 
 
-def _form_preview_text(form: dict, questions: list[dict], answers: dict[str, str]) -> str:
+def _form_preview_text(
+    form: dict, questions: list[dict], answers: dict[str, str], pricing_calculation: dict | None = None
+) -> str:
     lines = ["✅ Проверьте заявку", "", str(form["name"]), ""]
     for question in questions:
         answer = answers.get(str(question["id"])) or "—"
@@ -715,6 +880,9 @@ def _form_preview_text(form: dict, questions: list[dict], answers: dict[str, str
     interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
     if interval_summary:
         lines.extend(["", f"🕐 Интервал: {interval_summary}"])
+    pricing_text = _pricing_calculation_text(pricing_calculation)
+    if pricing_text:
+        lines.extend(["", pricing_text])
     lines.append("")
     lines.append("Если всё верно, нажмите «Отправить заявку».")
     return "\n".join(lines)
@@ -821,10 +989,15 @@ async def send_current_form_question(
         session = await db.get_form_session(chat_id)
         if not session:
             return
+        pricing_calculation = await _calculate_form_pricing(
+            int(form["id"]), questions, session["answers"]
+        )
         await _upsert_form_message(
             bot,
             session,
-            text=_form_preview_text(form, questions, session["answers"]),
+            text=_form_preview_text(
+                form, questions, session["answers"], pricing_calculation
+            ),
             reply_markup=form_confirmation(),
         )
         return
@@ -1125,7 +1298,11 @@ async def handle_form_message(
 
 
 def _submission_chat_text(
-    submission_id: int, form: dict, questions: list[dict], answers: dict[str, str]
+    submission_id: int,
+    form: dict,
+    questions: list[dict],
+    answers: dict[str, str],
+    pricing_calculation: dict | None = None,
 ) -> str:
     lines = [
         f"✅ Заявка №{submission_id} принята",
@@ -1139,6 +1316,9 @@ def _submission_chat_text(
     interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
     if interval_summary:
         lines.extend(["", f"🕐 Интервал: {interval_summary}"])
+    pricing_text = _pricing_calculation_text(pricing_calculation)
+    if pricing_text:
+        lines.extend(["", pricing_text])
     lines.extend(
         [
             "",
@@ -1153,6 +1333,8 @@ async def render_admin_home() -> tuple[str, object]:
     cooldown = int(await db.get_setting("cooldown_hours", "168") or 168)
     columns = int(await db.get_setting("menu_columns", "1") or 1)
     trigger_count = len(await get_menu_triggers())
+    pricing_forms = await db.list_forms_with_pricing()
+    active_pricing_count = sum(1 for item in pricing_forms if item.get("pricing_enabled"))
     connection = await db.latest_business_connection()
 
     if connection and connection["enabled"]:
@@ -1174,6 +1356,7 @@ async def render_admin_home() -> tuple[str, object]:
         f"Повторный автоответ после паузы: {cooldown} ч.\n"
         f"Кнопок в строке: {columns}\n"
         f"Фраз вызова меню: {trigger_count}\n"
+        f"Тарифов с авторасчётом: {active_pricing_count}\n"
         f"Business-соединение: {conn_text}\n"
         f"Чистая форма: {clean_form_text}\n"
         f"Часовой пояс: {html.escape(settings.timezone_name)}\n\n"
@@ -1765,12 +1948,21 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
         await send_current_form_question(bot, callback.message.chat.id)
         return
 
-    submission_id = await db.create_form_submission(session, str(form["name"]))
+    pricing_calculation = await _calculate_form_pricing(
+        int(form["id"]), questions, session["answers"]
+    )
+    calculated_amount = int(pricing_calculation.get("amount") or 0) if pricing_calculation else 0
+    submission_id = await db.create_form_submission(
+        session,
+        str(form["name"]),
+        calculated_amount=calculated_amount,
+        pricing_details=pricing_calculation or {},
+    )
     await _upsert_form_message(
         bot,
         session,
         text=_submission_chat_text(
-            submission_id, form, questions, session["answers"]
+            submission_id, form, questions, session["answers"], pricing_calculation
         ),
         reply_markup=None,
     )
@@ -2665,6 +2857,202 @@ async def admin_form_bind_button(callback: CallbackQuery) -> None:
             reply_markup=admin_form_bindings(form_id, buttons, bound_ids)
         )
     await callback.answer(notice)
+
+
+@router.callback_query(F.data == "adm:pricing")
+async def admin_pricing_open(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    forms = await db.list_forms_with_pricing()
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    text = (
+        "<b>💰 Тарифы и расчёт аренды</b>\n\n"
+        "Выберите форму. Для форм с датой, временем начала и окончания бот может "
+        "автоматически рассчитать предварительную стоимость аренды.\n\n"
+        "Расчёт: базовая стоимость + каждый начатый дополнительный час."
+    )
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            text, reply_markup=admin_pricing_forms(forms, currency)
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:pricing_form:"))
+async def admin_pricing_form_open(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        form_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная форма", show_alert=True)
+        return
+    form = await db.get_form(form_id)
+    if not form:
+        await callback.answer("Форма не найдена", show_alert=True)
+        return
+    pricing = await db.get_form_pricing(form_id)
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            await _pricing_admin_text(form, pricing),
+            reply_markup=admin_pricing_form(form_id, pricing, currency),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:pricing_toggle:"))
+async def admin_pricing_toggle(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        form_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная форма", show_alert=True)
+        return
+    form = await db.get_form(form_id)
+    if not form:
+        await callback.answer("Форма не найдена", show_alert=True)
+        return
+    pricing = await db.get_form_pricing(form_id)
+    new_enabled = not bool(pricing.get("enabled"))
+    if new_enabled:
+        questions = await db.list_form_questions(form_id)
+        if not _form_supports_time_pricing(questions):
+            await callback.answer(
+                "Для авторасчёта нужны дата, время начала и окончания.", show_alert=True
+            )
+            return
+        if int(pricing.get("base_amount") or 0) <= 0 and int(pricing.get("extra_hour_amount") or 0) <= 0:
+            await callback.answer(
+                "Сначала задайте базовую стоимость или цену дополнительного часа.",
+                show_alert=True,
+            )
+            return
+    await db.update_form_pricing(form_id, "enabled", int(new_enabled))
+    pricing = await db.get_form_pricing(form_id)
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            await _pricing_admin_text(form, pricing),
+            reply_markup=admin_pricing_form(form_id, pricing, currency),
+        )
+    await callback.answer("Расчёт включён" if new_enabled else "Расчёт выключен")
+
+
+async def _pricing_edit_start(
+    callback: CallbackQuery, state: FSMContext, *, field: str
+) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        form_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная форма", show_alert=True)
+        return
+    form = await db.get_form(form_id)
+    if not form:
+        await callback.answer("Форма не найдена", show_alert=True)
+        return
+    pricing = await db.get_form_pricing(form_id)
+    await state.clear()
+    await state.update_data(pricing_form_id=form_id)
+    if field == "base_amount":
+        await state.set_state(AdminStates.pricing_base_amount)
+        prompt = (
+            "Введите базовую стоимость аренды целым числом.\n"
+            "Например: <code>60000</code> или <code>60 000</code>.\n\n"
+            f"Сейчас: {_money_text(pricing.get('base_amount'), str(await db.get_setting('crm_currency', '₽') or '₽'))}"
+        )
+    elif field == "included_hours":
+        await state.set_state(AdminStates.pricing_included_hours)
+        prompt = (
+            "Сколько полных часов включает базовая стоимость?\n"
+            "Например: <code>6</code>. Если нужен чисто почасовой тариф — отправьте <code>0</code>.\n\n"
+            f"Сейчас: {int(pricing.get('included_hours') or 0)} ч"
+        )
+    else:
+        await state.set_state(AdminStates.pricing_extra_hour_amount)
+        prompt = (
+            "Введите стоимость каждого <b>начатого</b> дополнительного часа.\n"
+            "Например: <code>10000</code>. Можно указать <code>0</code>, чтобы отключить доплату.\n\n"
+            f"Сейчас: {_money_text(pricing.get('extra_hour_amount'), str(await db.get_setting('crm_currency', '₽') or '₽'))}"
+        )
+    if isinstance(callback.message, Message):
+        await callback.message.answer(prompt)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:pricing_base:"))
+async def admin_pricing_base_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _pricing_edit_start(callback, state, field="base_amount")
+
+
+@router.callback_query(F.data.startswith("adm:pricing_hours:"))
+async def admin_pricing_hours_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _pricing_edit_start(callback, state, field="included_hours")
+
+
+@router.callback_query(F.data.startswith("adm:pricing_extra:"))
+async def admin_pricing_extra_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _pricing_edit_start(callback, state, field="extra_hour_amount")
+
+
+async def _pricing_save_value(
+    message: Message, state: FSMContext, *, field: str
+) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    data = await state.get_data()
+    form_id = int(data.get("pricing_form_id") or 0)
+    form = await db.get_form(form_id)
+    if not form:
+        await state.clear()
+        await message.answer("Форма не найдена.")
+        return
+    if field == "included_hours":
+        raw = (message.text or "").strip()
+        if not re.fullmatch(r"\d{1,2}", raw):
+            await message.answer("Введите количество часов целым числом, например 6 или 0.")
+            return
+        value = int(raw)
+        if value < 0 or value > 24:
+            await message.answer("Допустимое значение: от 0 до 24 часов.")
+            return
+    else:
+        parsed = _parse_money_input(message.text)
+        if parsed is None:
+            await message.answer("Введите сумму целым числом, например 60000.")
+            return
+        value = parsed
+    await db.update_form_pricing(form_id, field, value)
+    await state.clear()
+    pricing = await db.get_form_pricing(form_id)
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    await message.answer(
+        await _pricing_admin_text(form, pricing),
+        reply_markup=admin_pricing_form(form_id, pricing, currency),
+    )
+
+
+@router.message(AdminStates.pricing_base_amount)
+async def admin_pricing_base_save(message: Message, state: FSMContext) -> None:
+    await _pricing_save_value(message, state, field="base_amount")
+
+
+@router.message(AdminStates.pricing_included_hours)
+async def admin_pricing_hours_save(message: Message, state: FSMContext) -> None:
+    await _pricing_save_value(message, state, field="included_hours")
+
+
+@router.message(AdminStates.pricing_extra_hour_amount)
+async def admin_pricing_extra_save(message: Message, state: FSMContext) -> None:
+    await _pricing_save_value(message, state, field="extra_hour_amount")
 
 
 @router.callback_query(F.data.startswith("adm:reqs:"))
