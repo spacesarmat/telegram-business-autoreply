@@ -91,6 +91,81 @@ def _form_preview_text(form: dict, questions: list[dict], answers: dict[str, str
     return "\n".join(lines)
 
 
+async def _upsert_form_message(
+    bot: Bot, session: dict, *, text: str, reply_markup=None
+) -> int | None:
+    """Keep the whole questionnaire in one editable Business message."""
+    message_id = session.get("form_message_id")
+    if message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=session["chat_id"],
+                message_id=int(message_id),
+                business_connection_id=session["business_connection_id"],
+                text=text,
+                parse_mode=None,
+                reply_markup=reply_markup,
+            )
+            return int(message_id)
+        except TelegramAPIError:
+            logger.warning(
+                "Не удалось обновить сообщение формы %s, отправляю новое", message_id
+            )
+
+    try:
+        sent = await bot.send_message(
+            chat_id=session["chat_id"],
+            business_connection_id=session["business_connection_id"],
+            text=text,
+            parse_mode=None,
+            reply_markup=reply_markup,
+        )
+    except TelegramAPIError:
+        logger.exception("Не удалось отправить сообщение формы в chat_id=%s", session["chat_id"])
+        return None
+
+    await db.update_form_session(
+        int(session["chat_id"]), form_message_id=int(sent.message_id)
+    )
+    session["form_message_id"] = int(sent.message_id)
+    return int(sent.message_id)
+
+
+async def _delete_form_answer_message(
+    bot: Bot, message: Message, session: dict, can_delete_all_messages: bool
+) -> None:
+    if not can_delete_all_messages:
+        return
+    try:
+        await bot.delete_business_messages(
+            business_connection_id=session["business_connection_id"],
+            message_ids=[message.message_id],
+        )
+    except TelegramAPIError:
+        logger.warning(
+            "Не удалось удалить ответ формы message_id=%s. Проверьте право «Удаление входящих».",
+            message.message_id,
+        )
+
+
+async def _form_callback_session(callback: CallbackQuery) -> dict | None:
+    if not isinstance(callback.message, Message):
+        await callback.answer()
+        return None
+    session = await db.get_form_session(callback.message.chat.id)
+    if not session:
+        await callback.answer("Заявка уже закрыта", show_alert=True)
+        return None
+    active_message_id = session.get("form_message_id")
+    if active_message_id and int(active_message_id) != int(callback.message.message_id):
+        await callback.answer(
+            "Эта кнопка относится к старому шагу формы и больше не активна.",
+            show_alert=True,
+        )
+        return None
+    return session
+
+
 async def send_current_form_question(bot: Bot, chat_id: int) -> None:
     session = await db.get_form_session(chat_id)
     if not session:
@@ -98,24 +173,25 @@ async def send_current_form_question(bot: Bot, chat_id: int) -> None:
     form = await db.get_form(int(session["form_id"]))
     questions = await db.list_form_questions(int(session["form_id"]))
     if not form or not questions:
-        await db.delete_form_session(chat_id)
-        await bot.send_message(
-            chat_id=chat_id,
-            business_connection_id=session["business_connection_id"],
+        await _upsert_form_message(
+            bot,
+            session,
             text="Эта форма пока не настроена. Напишите сообщение обычным текстом.",
-            parse_mode=None,
+            reply_markup=None,
         )
+        await db.delete_form_session(chat_id)
         return
 
     index = max(0, int(session["current_index"]))
     if index >= len(questions):
         await db.update_form_session(chat_id, current_index=len(questions), status="confirm")
         session = await db.get_form_session(chat_id)
-        await bot.send_message(
-            chat_id=chat_id,
-            business_connection_id=session["business_connection_id"],
+        if not session:
+            return
+        await _upsert_form_message(
+            bot,
+            session,
             text=_form_preview_text(form, questions, session["answers"]),
-            parse_mode=None,
             reply_markup=form_confirmation(),
         )
         return
@@ -130,34 +206,31 @@ async def send_current_form_question(bot: Bot, chat_id: int) -> None:
         f"Вопрос {index + 1} из {len(questions)}\n"
         f"{question['prompt']}{suffix}"
     )
-    await bot.send_message(
-        chat_id=chat_id,
-        business_connection_id=session["business_connection_id"],
+    await _upsert_form_message(
+        bot,
+        session,
         text=text,
-        parse_mode=None,
         reply_markup=form_question_nav(bool(question["required"]), index > 0),
     )
 
 
-async def handle_form_message(message: Message, bot: Bot, session: dict) -> bool:
+async def handle_form_message(
+    message: Message, bot: Bot, session: dict, *, can_delete_all_messages: bool
+) -> bool:
     if session["status"] == "confirm":
-        await bot.send_message(
-            chat_id=message.chat.id,
-            business_connection_id=session["business_connection_id"],
+        await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+        await _upsert_form_message(
+            bot,
+            session,
             text="Заявка уже заполнена. Используйте кнопки «Отправить заявку», «Изменить ответы» или «Отмена».",
-            parse_mode=None,
             reply_markup=form_confirmation(),
         )
         return True
 
     if (message.text or "").strip().lower() in {"/cancel", "отмена", "отменить"}:
+        await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+        await _upsert_form_message(bot, session, text="Заявка отменена.", reply_markup=None)
         await db.delete_form_session(message.chat.id)
-        await bot.send_message(
-            chat_id=message.chat.id,
-            business_connection_id=session["business_connection_id"],
-            text="Заявка отменена.",
-            parse_mode=None,
-        )
         return True
 
     questions = await db.list_form_questions(int(session["form_id"]))
@@ -168,20 +241,20 @@ async def handle_form_message(message: Message, bot: Bot, session: dict) -> bool
 
     answer = _message_answer_text(message)
     if not answer:
-        await bot.send_message(
-            chat_id=message.chat.id,
-            business_connection_id=session["business_connection_id"],
+        await _upsert_form_message(
+            bot,
+            session,
             text="Пожалуйста, отправьте ответ текстом. Также можно отправить контакт или геолокацию.",
-            parse_mode=None,
+            reply_markup=form_question_nav(bool(questions[index]["required"]), index > 0),
         )
         return True
 
     if len(answer) > 1500:
-        await bot.send_message(
-            chat_id=message.chat.id,
-            business_connection_id=session["business_connection_id"],
+        await _upsert_form_message(
+            bot,
+            session,
             text="Ответ слишком длинный. Пожалуйста, сократите его до 1500 символов.",
-            parse_mode=None,
+            reply_markup=form_question_nav(bool(questions[index]["required"]), index > 0),
         )
         return True
 
@@ -194,6 +267,7 @@ async def handle_form_message(message: Message, bot: Bot, session: dict) -> bool
         answers=answers,
         status="confirm" if next_index >= len(questions) else "active",
     )
+    await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
     await send_current_form_question(bot, message.chat.id)
     return True
 
@@ -243,15 +317,22 @@ async def render_admin_home() -> tuple[str, object]:
         conn_text = "🟢 подключён"
         if not connection["can_reply"]:
             conn_text += " (нет права отвечать)"
+        clean_form_text = (
+            "🟢 ответы скрываются"
+            if connection.get("can_delete_all_messages")
+            else "⚪ ответы видны — включите «Удаление входящих»"
+        )
     else:
         conn_text = "⚪ не подключён"
+        clean_form_text = "⚪ недоступно"
 
     text = (
         "<b>Автоответчик Telegram Business</b>\n\n"
         f"Автоответ: {'включён' if enabled else 'выключен'}\n"
         f"Повторный автоответ после паузы: {cooldown} ч.\n"
         f"Кнопок в строке: {columns}\n"
-        f"Business-соединение: {conn_text}\n\n"
+        f"Business-соединение: {conn_text}\n"
+        f"Чистая форма: {clean_form_text}\n\n"
         "Настройки меняются прямо здесь и сохраняются в SQLite."
     )
     return text, admin_main(enabled)
@@ -277,12 +358,16 @@ async def load_connection_from_telegram(bot: Bot, connection_id: str) -> dict | 
         return None
 
     can_reply = bool(connection.rights and connection.rights.can_reply)
+    can_delete_all_messages = bool(
+        connection.rights and connection.rights.can_delete_all_messages
+    )
     await db.save_business_connection(
         connection_id=connection.id,
         owner_user_id=connection.user.id,
         user_chat_id=connection.user_chat_id,
         enabled=connection.is_enabled,
         can_reply=can_reply,
+        can_delete_all_messages=can_delete_all_messages,
     )
     return await db.get_business_connection(connection_id)
 
@@ -290,21 +375,30 @@ async def load_connection_from_telegram(bot: Bot, connection_id: str) -> dict | 
 @router.business_connection()
 async def on_business_connection(event: BusinessConnection, bot: Bot) -> None:
     can_reply = bool(event.rights and event.rights.can_reply)
+    can_delete_all_messages = bool(
+        event.rights and event.rights.can_delete_all_messages
+    )
     await db.save_business_connection(
         connection_id=event.id,
         owner_user_id=event.user.id,
         user_chat_id=event.user_chat_id,
         enabled=event.is_enabled,
         can_reply=can_reply,
+        can_delete_all_messages=can_delete_all_messages,
     )
 
     status = "подключён" if event.is_enabled else "отключён"
     rights = "есть право отвечать" if can_reply else "НЕТ права отвечать"
+    delete_rights = (
+        "удаление входящих разрешено"
+        if can_delete_all_messages
+        else "удаление входящих НЕ разрешено"
+    )
     for admin_id in settings.admin_ids:
         try:
             await bot.send_message(
                 admin_id,
-                f"Business-бот {status}. Статус: {rights}.",
+                f"Business-бот {status}. Статус: {rights}; {delete_rights}.",
             )
         except TelegramAPIError:
             logger.warning("Не удалось уведомить администратора %s", admin_id)
@@ -355,7 +449,12 @@ async def on_business_message(message: Message, bot: Bot) -> None:
                 message.chat.id, business_connection_id=connection_id
             )
             session["business_connection_id"] = connection_id
-        await handle_form_message(message, bot, session)
+        await handle_form_message(
+            message,
+            bot,
+            session,
+            can_delete_all_messages=bool(connection.get("can_delete_all_messages")),
+        )
         return
 
     if not await get_autoresponder_enabled():
@@ -424,6 +523,7 @@ async def on_public_button(callback: CallbackQuery, bot: Bot) -> None:
                 username=callback.from_user.username,
                 first_name=callback.from_user.first_name,
                 last_name=callback.from_user.last_name,
+                form_message_id=callback.message.message_id,
             )
             await db.mark_button_click(callback.message.chat.id, utc_now_iso())
             await send_current_form_question(bot, callback.message.chat.id)
@@ -451,33 +551,20 @@ async def on_public_button(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "form:cancel")
 async def form_cancel(callback: CallbackQuery, bot: Bot) -> None:
-    if not isinstance(callback.message, Message):
-        await callback.answer()
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
         return
-    session = await db.get_form_session(callback.message.chat.id)
-    if not session:
-        await callback.answer("Заявка уже закрыта", show_alert=True)
-        return
+    await _upsert_form_message(bot, session, text="Заявка отменена.", reply_markup=None)
     await db.delete_form_session(callback.message.chat.id)
-    try:
-        await bot.send_message(
-            chat_id=callback.message.chat.id,
-            business_connection_id=session["business_connection_id"],
-            text="Заявка отменена.",
-            parse_mode=None,
-        )
-    except TelegramAPIError:
-        logger.exception("Не удалось отправить подтверждение отмены формы")
     await callback.answer("Отменено")
 
 
 @router.callback_query(F.data == "form:skip")
 async def form_skip(callback: CallbackQuery, bot: Bot) -> None:
-    if not isinstance(callback.message, Message):
-        await callback.answer()
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
         return
-    session = await db.get_form_session(callback.message.chat.id)
-    if not session or session["status"] != "active":
+    if session["status"] != "active":
         await callback.answer("Нет активного вопроса", show_alert=True)
         return
     questions = await db.list_form_questions(int(session["form_id"]))
@@ -504,12 +591,8 @@ async def form_skip(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "form:back")
 async def form_back(callback: CallbackQuery, bot: Bot) -> None:
-    if not isinstance(callback.message, Message):
-        await callback.answer()
-        return
-    session = await db.get_form_session(callback.message.chat.id)
-    if not session:
-        await callback.answer("Заявка уже закрыта", show_alert=True)
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
         return
     questions = await db.list_form_questions(int(session["form_id"]))
     if not questions:
@@ -531,12 +614,8 @@ async def form_back(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "form:edit")
 async def form_edit_answers(callback: CallbackQuery, bot: Bot) -> None:
-    if not isinstance(callback.message, Message):
-        await callback.answer()
-        return
-    session = await db.get_form_session(callback.message.chat.id)
-    if not session:
-        await callback.answer("Заявка уже закрыта", show_alert=True)
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
         return
     await db.update_form_session(
         callback.message.chat.id, current_index=0, status="active"
@@ -547,16 +626,16 @@ async def form_edit_answers(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "form:submit")
 async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
-    if not isinstance(callback.message, Message):
-        await callback.answer()
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
         return
-    session = await db.get_form_session(callback.message.chat.id)
-    if not session or session["status"] != "confirm":
-        await callback.answer("Заявка уже отправлена или не завершена", show_alert=True)
+    if session["status"] != "confirm":
+        await callback.answer("Заявка ещё не завершена", show_alert=True)
         return
     form = await db.get_form(int(session["form_id"]))
     questions = await db.list_form_questions(int(session["form_id"]))
     if not form:
+        await _upsert_form_message(bot, session, text="Форма больше недоступна.", reply_markup=None)
         await db.delete_form_session(callback.message.chat.id)
         await callback.answer("Форма больше недоступна", show_alert=True)
         return
@@ -571,19 +650,16 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             return
 
     submission_id = await db.create_form_submission(session, str(form["name"]))
+    await _upsert_form_message(
+        bot,
+        session,
+        text=(
+            f"✅ Спасибо! Заявка №{submission_id} отправлена. "
+            "Я получил её и свяжусь с вами."
+        ),
+        reply_markup=None,
+    )
     await db.delete_form_session(callback.message.chat.id)
-    try:
-        await bot.send_message(
-            chat_id=callback.message.chat.id,
-            business_connection_id=session["business_connection_id"],
-            text=(
-                f"✅ Спасибо! Заявка №{submission_id} отправлена. "
-                "Я получил её и свяжусь с вами."
-            ),
-            parse_mode=None,
-        )
-    except TelegramAPIError:
-        logger.exception("Не удалось отправить клиенту подтверждение заявки %s", submission_id)
 
     await notify_admins_about_submission(bot, submission_id, session, form, questions)
     await callback.answer("Заявка отправлена")

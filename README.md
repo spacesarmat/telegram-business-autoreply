@@ -161,7 +161,7 @@ ghcr.io/spacesarmat/tgautoreply:latest
    - `PASTE_YOUR_TELEGRAM_USER_ID_HERE` — на Telegram user ID администратора.
 6. Импортируйте YAML в ZimaOS/CasaOS и запустите приложение.
 
-Локальная сборка на ZimaOS больше не требуется. При каждом push в `main` GitHub Actions пересобирает тег `latest`; теги вида `v1.3.0` также публикуются как отдельные версии образа.
+Локальная сборка на ZimaOS больше не требуется. При каждом push в `main` GitHub Actions пересобирает тег `latest`; теги вида `v1.3.1` также публикуются как отдельные версии образа.
 
 Данные SQLite сохраняются в:
 

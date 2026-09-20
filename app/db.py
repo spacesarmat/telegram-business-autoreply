@@ -161,6 +161,7 @@ class Database:
                     user_chat_id INTEGER,
                     enabled INTEGER NOT NULL DEFAULT 0,
                     can_reply INTEGER NOT NULL DEFAULT 0,
+                    can_delete_all_messages INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
 
@@ -195,6 +196,7 @@ class Database:
                     chat_id INTEGER PRIMARY KEY,
                     business_connection_id TEXT NOT NULL,
                     form_id INTEGER NOT NULL,
+                    form_message_id INTEGER,
                     current_index INTEGER NOT NULL DEFAULT 0,
                     answers_json TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL DEFAULT 'active',
@@ -227,6 +229,21 @@ class Database:
                     ON form_submissions(created_at DESC);
                 """
             )
+
+            # Миграции для существующей базы без потери данных.
+            bc_columns = {
+                row["name"] for row in await (await db.execute("PRAGMA table_info(business_connections)")).fetchall()
+            }
+            if "can_delete_all_messages" not in bc_columns:
+                await db.execute(
+                    "ALTER TABLE business_connections ADD COLUMN can_delete_all_messages INTEGER NOT NULL DEFAULT 0"
+                )
+
+            session_columns = {
+                row["name"] for row in await (await db.execute("PRAGMA table_info(form_sessions)")).fetchall()
+            }
+            if "form_message_id" not in session_columns:
+                await db.execute("ALTER TABLE form_sessions ADD COLUMN form_message_id INTEGER")
 
             for key, value in DEFAULT_SETTINGS.items():
                 await db.execute(
@@ -409,17 +426,22 @@ class Database:
         user_chat_id: int | None,
         enabled: bool,
         can_reply: bool,
+        can_delete_all_messages: bool = False,
     ) -> None:
         async with self.connection() as db:
             await db.execute(
                 """
-                INSERT INTO business_connections(id, owner_user_id, user_chat_id, enabled, can_reply, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO business_connections(
+                    id, owner_user_id, user_chat_id, enabled, can_reply,
+                    can_delete_all_messages, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     owner_user_id=excluded.owner_user_id,
                     user_chat_id=excluded.user_chat_id,
                     enabled=excluded.enabled,
                     can_reply=excluded.can_reply,
+                    can_delete_all_messages=excluded.can_delete_all_messages,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -428,6 +450,7 @@ class Database:
                     user_chat_id,
                     int(enabled),
                     int(can_reply),
+                    int(can_delete_all_messages),
                     utc_now_iso(),
                 ),
             )
@@ -595,18 +618,20 @@ class Database:
         username: str | None,
         first_name: str | None,
         last_name: str | None,
+        form_message_id: int | None = None,
     ) -> None:
         now = utc_now_iso()
         async with self.connection() as db:
             await db.execute(
                 """
                 INSERT INTO form_sessions(
-                    chat_id, business_connection_id, form_id, current_index, answers_json, status,
+                    chat_id, business_connection_id, form_id, form_message_id, current_index, answers_json, status,
                     user_id, username, first_name, last_name, created_at, updated_at
-                ) VALUES(?, ?, ?, 0, '{}', 'active', ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, 0, '{}', 'active', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     business_connection_id=excluded.business_connection_id,
                     form_id=excluded.form_id,
+                    form_message_id=excluded.form_message_id,
                     current_index=0,
                     answers_json='{}',
                     status='active',
@@ -621,6 +646,7 @@ class Database:
                     chat_id,
                     business_connection_id,
                     form_id,
+                    form_message_id,
                     user_id,
                     username,
                     first_name,
@@ -650,6 +676,7 @@ class Database:
         answers: dict[str, str] | None = None,
         status: str | None = None,
         business_connection_id: str | None = None,
+        form_message_id: int | None = None,
     ) -> None:
         fields: list[str] = []
         values: list[Any] = []
@@ -665,6 +692,9 @@ class Database:
         if business_connection_id is not None:
             fields.append("business_connection_id=?")
             values.append(business_connection_id)
+        if form_message_id is not None:
+            fields.append("form_message_id=?")
+            values.append(form_message_id)
         fields.append("updated_at=?")
         values.append(utc_now_iso())
         values.append(chat_id)
