@@ -5,6 +5,8 @@ import calendar
 import html
 import logging
 import re
+import uuid
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -15,8 +17,9 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message
+from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 
+from .advanced import AdvancedService
 from .backup import BackupManager
 from .config import Settings, load_settings
 from .concurrency import ConcurrencyMiddleware, UpdateConcurrencyGuard
@@ -64,6 +67,7 @@ logger = logging.getLogger(__name__)
 settings: Settings = load_settings()
 APP_TIMEZONE = ZoneInfo(settings.timezone_name)
 db = Database(settings.database_path)
+advanced = AdvancedService(db, APP_TIMEZONE)
 router = Router(name="main")
 concurrency_guard = UpdateConcurrencyGuard(settings.max_concurrent_updates)
 
@@ -239,6 +243,7 @@ QUESTION_TYPE_NAMES = {
     "contact": "📱 Контакт",
     "guest_count": "👥 Количество гостей",
     "choice": "🎛 Выбор из вариантов",
+    "file": "📎 Файл / фото",
 }
 
 
@@ -365,6 +370,29 @@ def _selected_date_iso(questions: list[dict], answers: dict[str, str]) -> str | 
         if parsed:
             return parsed.isoformat()
     return None
+
+
+async def _rule_month_availability(form_id: int, year: int, month: int) -> tuple[set[str], set[str]]:
+    full: set[str] = set()
+    partial: set[str] = set()
+    rule = await advanced.get_rule(form_id)
+    closed = set(int(x) for x in rule.get("closed_weekdays") or []) if rule.get("enabled") else set()
+    recurring = await advanced.list_recurring_blocks(form_id)
+    for day_num in range(1, calendar.monthrange(year, month)[1] + 1):
+        day = datetime(year, month, day_num).date()
+        iso = day.isoformat()
+        if day.weekday() in closed:
+            full.add(iso)
+            continue
+        for block in recurring:
+            if not block.get("enabled") or int(block.get("weekday") or -1) != day.weekday():
+                continue
+            if not block.get("start_time") or not block.get("end_time"):
+                full.add(iso)
+                break
+            partial.add(iso)
+    partial -= full
+    return full, partial
 
 
 async def _date_fully_busy(date_iso: str) -> bool:
@@ -652,12 +680,21 @@ async def _booking_interval_conflicts(
 async def _booking_interval_conflicts_for_form(
     form_id: int, interval: dict | None, *, exclude_submission_id: int | None = None
 ) -> bool:
+    if interval and await advanced.booking_rule_violation(form_id, interval):
+        return True
     pricing = await db.get_form_pricing(form_id)
+    before = int(pricing.get("buffer_before_minutes") or 0)
+    after = int(pricing.get("buffer_after_minutes") or 0)
+    if interval:
+        buffered = _booking_interval_with_buffers(interval, before, after)
+        recurring_segments = (buffered or {}).get("technical_segments") or interval.get("segments") or []
+        if await advanced.recurring_violation(form_id, recurring_segments):
+            return True
     return await _booking_interval_conflicts(
         interval,
         exclude_submission_id=exclude_submission_id,
-        buffer_before_minutes=int(pricing.get("buffer_before_minutes") or 0),
-        buffer_after_minutes=int(pricing.get("buffer_after_minutes") or 0),
+        buffer_before_minutes=before,
+        buffer_after_minutes=after,
     )
 
 
@@ -693,9 +730,8 @@ async def _booking_end_time_options(
         if end_question:
             temp_answers = dict(answers)
             temp_answers[str(end_question["id"])] = value
-            if await _booking_interval_conflicts(
-                _booking_interval(questions, temp_answers),
-                buffer_before_minutes=before, buffer_after_minutes=after,
+            if await _booking_interval_conflicts_for_form(
+                form_id, _booking_interval(questions, temp_answers)
             ):
                 busy.add(value)
     return options, busy
@@ -844,10 +880,17 @@ async def _calculate_form_pricing(
     ]
     addons_total = sum(int(item["amount"]) for item in addon_items)
     rental_amount = amount
-    amount = rental_amount + addons_total
+    surcharge_data = await advanced.pricing_surcharges(
+        form_id, questions, answers, interval, rental_amount
+    )
+    surcharge_total = max(0, int(surcharge_data.get("total") or 0))
+    surcharges = list(surcharge_data.get("items") or [])
+    amount = rental_amount + surcharge_total + addons_total
     return {
         "amount": amount,
         "rental_amount": rental_amount,
+        "surcharge_total": surcharge_total,
+        "surcharges": surcharges,
         "addons_total": addons_total,
         "addons": addon_items,
         "currency": currency,
@@ -882,11 +925,16 @@ def _pricing_calculation_text(calculation: dict | None) -> str | None:
     duration_text = f"{hours} ч" if not minutes else f"{hours} ч {minutes} мин"
 
     lines = [f"💰 Предварительная стоимость: {_money_text(amount, currency)}"]
-    if addons:
+    if addons or surcharges:
         lines.append(f"Аренда: {_money_text(rental_amount, currency)}")
+        for surcharge in surcharges:
+            lines.append(f"+ {surcharge.get('label')}: {_money_text(surcharge.get('amount'), currency)}")
+        if surcharge_total:
+            lines.append(f"Динамические надбавки: {_money_text(surcharge_total, currency)}")
         for addon in addons:
             lines.append(f"+ {addon.get('name')}: {_money_text(addon.get('amount'), currency)}")
-        lines.append(f"Доп. услуги: {_money_text(addons_total, currency)}")
+        if addons_total:
+            lines.append(f"Доп. услуги: {_money_text(addons_total, currency)}")
     if included > 0:
         tariff = f"{_money_text(base, currency)} за первые {included} ч"
         if extra_rate:
@@ -1131,7 +1179,7 @@ async def _submission_admin_text(submission: dict) -> str:
     if questions:
         for question in questions:
             value = answers.get(str(question["id"])) or "—"
-            lines.append(f"<b>{html.escape(str(question['label']))}:</b> {html.escape(str(value))}")
+            lines.append(f"<b>{html.escape(str(question['label']))}:</b> {html.escape(_display_answer(str(value)))}")
         interval = _booking_interval(questions, answers)
         interval_summary = _booking_interval_summary(interval)
         if interval_summary:
@@ -1213,6 +1261,15 @@ def _contact_question_text(
     return "\n".join(lines)
 
 
+def _display_answer(value: str | None) -> str:
+    raw = str(value or "—")
+    if raw.startswith("attachment:"):
+        payload = raw[len("attachment:"):]
+        _stored, _sep, original = payload.partition("|")
+        return f"📎 {original or 'файл'}"
+    return raw
+
+
 def _message_answer_text(message: Message) -> str | None:
     if message.text and message.text.strip():
         return message.text.strip()
@@ -1230,7 +1287,7 @@ def _form_preview_text(
 ) -> str:
     lines = ["✅ Проверьте заявку", "", str(form["name"]), ""]
     for question in questions:
-        answer = answers.get(str(question["id"])) or "—"
+        answer = _display_answer(answers.get(str(question["id"])))
         lines.append(f"{question['label']}: {answer}")
     interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
     if interval_summary:
@@ -1427,6 +1484,10 @@ async def send_current_form_question(
             "× — дата занята полностью, • — есть занятые часы."
         )
         full_busy_dates, partial_busy_dates = await db.month_availability(year, month)
+        rule_full, rule_partial = await _rule_month_availability(int(form["id"]), year, month)
+        full_busy_dates |= rule_full
+        partial_busy_dates |= rule_partial
+        partial_busy_dates -= full_busy_dates
         markup = calendar_keyboard(
             int(question["id"]),
             year,
@@ -1547,6 +1608,19 @@ async def send_current_form_question(
         await _upsert_form_message(bot, session, text=text, reply_markup=markup)
         return
 
+    if input_type == "file":
+        text = (
+            f"📝 {form['name']}\n\n"
+            f"Вопрос {index + 1} из {len(questions)}\n"
+            f"{question['prompt']}{suffix}\n\n"
+            "Отправьте фотографию или файл одним сообщением. Максимальный рекомендуемый размер — 20 МБ."
+        )
+        await _upsert_form_message(
+            bot, session, text=text,
+            reply_markup=form_question_nav(bool(question["required"]), index > 0),
+        )
+        return
+
     if input_type == "contact":
         text = _contact_question_text(
             form,
@@ -1652,6 +1726,36 @@ async def handle_form_message(
                     reply_markup=form_question_nav(bool(question["required"]), index > 0),
                 )
             return True
+    elif input_type == "file":
+        file_obj = None
+        original_name = ""
+        if message.document:
+            file_obj = message.document
+            original_name = message.document.file_name or "document.bin"
+            if message.document.file_size and int(message.document.file_size) > 20 * 1024 * 1024:
+                await _upsert_form_message(bot, session, text="Файл слишком большой. Отправьте файл до 20 МБ.", reply_markup=form_question_nav(bool(question["required"]), index > 0))
+                return True
+        elif message.photo:
+            file_obj = message.photo[-1]
+            original_name = "photo.jpg"
+            if file_obj.file_size and int(file_obj.file_size) > 20 * 1024 * 1024:
+                await _upsert_form_message(bot, session, text="Фото слишком большое. Отправьте файл до 20 МБ.", reply_markup=form_question_nav(bool(question["required"]), index > 0))
+                return True
+        if not file_obj:
+            await _upsert_form_message(bot, session, text="Пожалуйста, отправьте фотографию или документ.", reply_markup=form_question_nav(bool(question["required"]), index > 0))
+            return True
+        safe_suffix = Path(original_name).suffix.lower()[:10] or ".bin"
+        stored_name = f"{uuid.uuid4().hex}{safe_suffix}"
+        upload_dir = Path(settings.database_path).parent / "uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        destination = upload_dir / stored_name
+        try:
+            await bot.download(file_obj, destination=destination)
+        except Exception:
+            logger.exception("Не удалось скачать вложение формы")
+            await _upsert_form_message(bot, session, text="Не удалось сохранить файл. Попробуйте отправить его ещё раз.", reply_markup=form_question_nav(bool(question["required"]), index > 0))
+            return True
+        answer = f"attachment:{stored_name}|{original_name[:180]}"
     elif input_type == "choice":
         options = [str(x) for x in (question.get("choice_options") or []) if str(x).strip()]
         if int(session.get("custom_choice_question_id") or 0) == int(question["id"]):
@@ -1800,7 +1904,7 @@ def _submission_chat_text(
         "",
     ]
     for question in questions:
-        value = answers.get(str(question["id"])) or "—"
+        value = _display_answer(answers.get(str(question["id"])))
         lines.append(f"{question['label']}: {value}")
     interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
     if interval_summary:
@@ -1924,6 +2028,99 @@ async def on_business_connection(event: BusinessConnection, bot: Bot) -> None:
             logger.warning("Не удалось уведомить администратора %s", admin_id)
 
 
+
+
+CLIENT_REQUEST_TYPES = {
+    "change": "изменение брони",
+    "addons": "добавление / изменение услуг",
+    "cancel": "отмена брони",
+}
+
+
+def _my_request_keyboard(submission_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Запросить изменение", callback_data=f"selfreq:change:{submission_id}")],
+        [InlineKeyboardButton(text="🧰 Изменить услуги", callback_data=f"selfreq:addons:{submission_id}")],
+        [InlineKeyboardButton(text="❌ Запросить отмену", callback_data=f"selfreq:cancel:{submission_id}")],
+    ])
+
+
+async def _show_my_submission(message: Message, bot: Bot, connection_id: str) -> bool:
+    items = await db.list_client_submissions(
+        user_id=message.from_user.id if message.from_user else None,
+        chat_id=message.chat.id,
+        limit=1,
+    )
+    if not items:
+        await bot.send_message(
+            chat_id=message.chat.id,
+            business_connection_id=connection_id,
+            text="У вас пока нет сохранённых заявок.",
+            parse_mode=None,
+        )
+        return True
+    item = items[0]
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    amount = max(0, int(item.get("total_amount") or 0))
+    prepayment = max(0, int(item.get("prepayment_amount") or 0))
+    balance = max(0, amount - prepayment)
+    status = SUBMISSION_STATUS_NAMES.get(str(item.get("status") or "new"), str(item.get("status") or "new"))
+    text = (
+        f"📋 Моя заявка №{item.get('id')}\n\n"
+        f"{item.get('form_name') or 'Заявка'}\n"
+        f"Статус: {status}\n"
+        f"Стоимость: {_money_text(amount, currency)}\n"
+        f"Предоплата: {_money_text(prepayment, currency)}\n"
+        f"Остаток: {_money_text(balance, currency)}\n\n"
+        "Через кнопки ниже можно отправить администратору запрос на изменение. "
+        "Текущая бронь не изменится автоматически до подтверждения менеджером."
+    )
+    await bot.send_message(
+        chat_id=message.chat.id,
+        business_connection_id=connection_id,
+        text=text,
+        parse_mode=None,
+        reply_markup=_my_request_keyboard(int(item["id"])),
+    )
+    return True
+
+
+@router.callback_query(F.data.startswith("selfreq:"))
+async def client_request_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.data or not callback.message:
+        return
+    try:
+        _, request_type, raw_sid = callback.data.split(":", 2)
+        submission_id = int(raw_sid)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректный запрос", show_alert=True)
+        return
+    if request_type not in CLIENT_REQUEST_TYPES:
+        await callback.answer("Некорректный запрос", show_alert=True)
+        return
+    submission = await db.get_submission(submission_id)
+    if not submission or int(submission.get("chat_id") or 0) != int(callback.message.chat.id):
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    request_id = await advanced.create_client_request(
+        submission_id, int(callback.message.chat.id), request_type,
+        f"Клиент запросил: {CLIENT_REQUEST_TYPES[request_type]}",
+    )
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🔔 Новый запрос клиента №{request_id}\n"
+                f"Заявка №{submission_id} · {submission.get('form_name') or 'Заявка'}\n"
+                f"Запрос: {CLIENT_REQUEST_TYPES[request_type]}\n\n"
+                "Откройте Web Admin → Запросы клиентов.",
+                parse_mode=None,
+            )
+        except TelegramAPIError:
+            logger.warning("Не удалось уведомить администратора %s о запросе клиента", admin_id)
+    await callback.answer("Запрос отправлен администратору", show_alert=True)
+
+
 @router.business_message()
 async def on_business_message(message: Message, bot: Bot) -> None:
     connection_id = message.business_connection_id
@@ -1981,6 +2178,12 @@ async def on_business_message(message: Message, bot: Bot) -> None:
         )
         if menu_message_id is not None and session:
             await db.delete_form_session(message.chat.id)
+        return
+
+    normalized_text = " ".join((message.text or "").strip().casefold().split())
+    if normalized_text in {"моя заявка", "/my", "/request", "моя бронь"}:
+        if connection["can_reply"]:
+            await _show_my_submission(message, bot, connection_id)
         return
 
     if session:
@@ -2602,6 +2805,10 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             return
 
     booking_interval = _booking_interval(questions, session["answers"])
+    rule_violation = await advanced.booking_rule_violation(int(form["id"]), booking_interval) if booking_interval else None
+    if rule_violation:
+        await callback.answer(rule_violation[:190], show_alert=True)
+        return
     if booking_interval and await _booking_interval_conflicts_for_form(int(form["id"]), booking_interval):
         target_index = 0
         if booking_interval.get("start_time"):
@@ -3392,7 +3599,7 @@ async def admin_question_type_set(callback: CallbackQuery) -> None:
     except (ValueError, TypeError):
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    if input_type not in {"text", "date", "time", "contact", "guest_count", "choice"}:
+    if input_type not in {"text", "date", "time", "contact", "guest_count", "choice", "file"}:
         await callback.answer("Неизвестный тип", show_alert=True)
         return
     question = await db.get_form_question(question_id)
@@ -4777,6 +4984,7 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     await db.init()
+    await advanced.init()
 
     bot = Bot(
         token=settings.bot_token,
@@ -4799,6 +5007,29 @@ async def main() -> None:
     async def web_amount_change(submission_id: int, new_amount: int) -> tuple[bool, str]:
         return await _apply_submission_amount_change(bot, submission_id, new_amount, None)
 
+    async def web_payment_link(submission_id: int, text: str) -> tuple[bool, str]:
+        submission = await db.get_submission(submission_id)
+        if not submission or not submission.get("chat_id"):
+            return False, "У заявки нет чата клиента"
+        connection_id = submission.get("business_connection_id")
+        if not connection_id:
+            connection = await db.latest_business_connection()
+            if connection and connection.get("enabled") and connection.get("can_reply"):
+                connection_id = connection.get("id")
+        if not connection_id:
+            return False, "Не найдено активное Business-соединение"
+        try:
+            await bot.send_message(
+                chat_id=int(submission["chat_id"]),
+                business_connection_id=str(connection_id),
+                text=text,
+                parse_mode=None,
+            )
+            return True, "Ссылка на предоплату отправлена клиенту"
+        except TelegramAPIError as exc:
+            logger.exception("Не удалось отправить ссылку оплаты по заявке %s", submission_id)
+            return False, f"Telegram не разрешил отправку: {exc}"
+
     web_server = await start_web_admin(
         port=settings.status_port,
         db=db,
@@ -4810,6 +5041,9 @@ async def main() -> None:
         concurrency_snapshot=concurrency_guard.snapshot,
         backup_manager=backup_manager,
         reminder_service=reminder_service,
+        advanced=advanced,
+        users_config=settings.web_admin_users,
+        on_payment_link=web_payment_link,
     )
     dp = Dispatcher(storage=MemoryStorage())
     concurrency_middleware = ConcurrencyMiddleware(concurrency_guard)

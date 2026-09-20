@@ -3,3 +3,4 @@ aiosqlite==0.22.1
 tzdata>=2025.2,<2027
 
 aiohttp>=3.11,<4.0
+openpyxl>=3.1,<4.0

@@ -358,7 +358,7 @@ def admin_question_edit(question: dict) -> InlineKeyboardMarkup:
     )
     type_labels = {
         "text": "⌨️ Текст", "date": "📅 Дата", "time": "🕐 Время",
-        "contact": "📱 Контакт", "guest_count": "👥 Гости", "choice": "🎛 Варианты"
+        "contact": "📱 Контакт", "guest_count": "👥 Гости", "choice": "🎛 Варианты", "file": "📎 Файл"
     }
     builder.row(
         InlineKeyboardButton(
@@ -422,6 +422,9 @@ def admin_question_type(question_id: int) -> InlineKeyboardMarkup:
     builder.row(
         InlineKeyboardButton(text="👥 Гости", callback_data=f"adm:q_type:{question_id}:guest_count"),
         InlineKeyboardButton(text="🎛 Варианты", callback_data=f"adm:q_type:{question_id}:choice"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📎 Файл / фото", callback_data=f"adm:q_type:{question_id}:file"),
     )
     builder.row(
         InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:q:{question_id}")

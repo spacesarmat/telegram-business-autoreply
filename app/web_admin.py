@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
+from .advanced import AdvancedService, WEEKDAY_NAMES
 from .backup import BackupManager
 from .db import Database
 from .reminders import ReminderService
@@ -38,11 +39,13 @@ QUESTION_TYPES = {
     "contact": "📱 Контакт",
     "guest_count": "👥 Гости",
     "choice": "🎛 Варианты",
+    "file": "📎 Файл / фото",
 }
 
 StatusChangeCallback = Callable[[int, str], Awaitable[tuple[bool, str]]]
 AmountChangeCallback = Callable[[int, int], Awaitable[tuple[bool, str]]]
 ConcurrencySnapshotCallback = Callable[[], dict[str, int]]
+PaymentLinkCallback = Callable[[int, str], Awaitable[tuple[bool, str]]]
 
 
 @dataclass
@@ -66,6 +69,17 @@ def _money(value: Any, currency: str = "₽") -> str:
     except (TypeError, ValueError):
         amount = 0
     return f"{amount:,}".replace(",", " ") + f" {currency}"
+
+
+def _answer_html(value: Any) -> str:
+    raw = str(value or "")
+    if raw.startswith("attachment:"):
+        payload = raw[len("attachment:"):]
+        stored, _, original = payload.partition("|")
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", stored):
+            label = original or stored
+            return f'<a href="/admin/files/{quote(stored, safe="")}">📎 {_e(label)}</a>'
+    return f'<span class="answer">{_e(raw or "—")}</span>'
 
 
 def _parse_int(value: str | None, *, minimum: int = 0, maximum: int = 10**12) -> int | None:
@@ -120,6 +134,9 @@ class WebAdmin:
         concurrency_snapshot: ConcurrencySnapshotCallback,
         backup_manager: BackupManager,
         reminder_service: ReminderService,
+        advanced: AdvancedService,
+        users_config: str = "",
+        on_payment_link: PaymentLinkCallback | None = None,
     ) -> None:
         self.db = db
         self.timezone = timezone
@@ -130,30 +147,52 @@ class WebAdmin:
         self.concurrency_snapshot = concurrency_snapshot
         self.backup_manager = backup_manager
         self.reminder_service = reminder_service
-        self.enabled = bool(password and not password.startswith("PASTE_") and len(password) >= 10)
-        self._key = hashlib.sha256((password or secrets.token_hex(16)).encode("utf-8")).digest()
+        self.advanced = advanced
+        self.on_payment_link = on_payment_link
+        self.users: dict[str, dict[str, str]] = {}
+        if password and not password.startswith("PASTE_") and len(password) >= 10:
+            self.users[self.username] = {"password": password, "role": "owner"}
+        for raw in (users_config or "").replace("\n", ",").split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            parts = raw.split(":", 2)
+            if len(parts) != 3:
+                continue
+            login, secret, role = [x.strip() for x in parts]
+            if login and len(secret) >= 10 and role in {"owner", "manager", "viewer"}:
+                self.users[login] = {"password": secret, "role": role}
+        self.enabled = bool(self.users)
+        key_material = "|".join(f"{u}:{v['password']}:{v['role']}" for u,v in sorted(self.users.items())) or secrets.token_hex(16)
+        self._key = hashlib.sha256(key_material.encode("utf-8")).digest()
 
-    def _session_cookie(self) -> str:
+    def _session_cookie(self, username: str, role: str) -> str:
         exp = int(time.time()) + 12 * 3600
-        payload = f"{exp}:{self.username}"
+        payload = f"{exp}:{username}:{role}"
         sig = hmac.new(self._key, payload.encode(), hashlib.sha256).hexdigest()
         return f"{payload}:{sig}"
 
-    def _valid_session(self, request: web.Request) -> bool:
+    def _session_data(self, request: web.Request) -> tuple[str, str] | None:
         raw = request.cookies.get("tgadmin", "")
         parts = raw.split(":")
-        if len(parts) != 3:
-            return False
-        exp_s, username, sig = parts
+        if len(parts) != 4:
+            return None
+        exp_s, username, role, sig = parts
         try:
             exp = int(exp_s)
         except ValueError:
-            return False
-        if exp < int(time.time()) or username != self.username:
-            return False
-        payload = f"{exp}:{username}"
+            return None
+        user = self.users.get(username)
+        if exp < int(time.time()) or not user or user.get("role") != role:
+            return None
+        payload = f"{exp}:{username}:{role}"
         expected = hmac.new(self._key, payload.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(sig, expected)
+        if not hmac.compare_digest(sig, expected):
+            return None
+        return username, role
+
+    def _valid_session(self, request: web.Request) -> bool:
+        return self._session_data(request) is not None
 
     def _csrf(self, request: web.Request) -> str:
         cookie = request.cookies.get("tgadmin", "")
@@ -161,18 +200,35 @@ class WebAdmin:
 
     async def auth_middleware(self, app: web.Application, handler):
         async def middleware_handler(request: web.Request):
-            if request.path == "/health" or request.path.startswith("/admin/login"):
+            if request.path == "/health" or request.path == "/calendar.ics" or request.path.startswith("/admin/login"):
                 return await handler(request)
             if not self.enabled:
                 return await self.disabled_page(request)
-            if not self._valid_session(request):
+            session = self._session_data(request)
+            if not session:
                 raise web.HTTPFound("/admin/login?next=" + quote(request.path_qs, safe=""))
+            username, role = session
+            request["admin_user"] = username
+            request["admin_role"] = role
             if request.method == "POST":
+                if role == "viewer":
+                    raise web.HTTPForbidden(text="Роль viewer доступна только для просмотра")
+                if role != "owner" and (request.path.startswith("/admin/settings") or request.path.startswith("/admin/integrations") or "/restore" in request.path):
+                    raise web.HTTPForbidden(text="Это действие доступно только владельцу")
                 data = await request.post()
                 token = str(data.get("csrf") or "")
                 if not hmac.compare_digest(token, self._csrf(request)):
                     raise web.HTTPForbidden(text="CSRF token invalid")
                 request["post"] = data
+                safe_details = ", ".join(k for k in data.keys() if k not in {"csrf", "password"})
+                try:
+                    response = await handler(request)
+                except web.HTTPException as exc:
+                    if 300 <= exc.status < 400:
+                        await self.advanced.add_audit(username, role, request.method + " " + request.path, request.path, safe_details)
+                    raise
+                await self.advanced.add_audit(username, role, request.method + " " + request.path, request.path, safe_details)
+                return response
             return await handler(request)
 
         return middleware_handler
@@ -181,11 +237,17 @@ class WebAdmin:
         nav = [
             ("dashboard", "/admin", "🏠 Обзор"),
             ("requests", "/admin/requests", "📋 Заявки"),
+            ("clients", "/admin/clients", "👥 Клиенты"),
+            ("client_requests", "/admin/client-requests", "📨 Запросы клиентов"),
+            ("analytics", "/admin/analytics", "📊 Аналитика"),
             ("calendar", "/admin/calendar", "🗓 Календарь"),
             ("availability", "/admin/availability", "📅 Занятость"),
             ("reminders", "/admin/reminders", "🔔 Напоминания"),
             ("backups", "/admin/backups", "💾 Бэкапы"),
             ("pricing", "/admin/pricing", "💰 Тарифы"),
+            ("rules", "/admin/rules", "🧭 Правила брони"),
+            ("audit", "/admin/audit", "🧾 Журнал"),
+            ("integrations", "/admin/integrations", "🔌 Интеграции"),
             ("forms", "/admin/forms", "📝 Формы"),
             ("buttons", "/admin/buttons", "🔘 Кнопки"),
             ("settings", "/admin/settings", "⚙️ Настройки"),
@@ -203,7 +265,7 @@ class WebAdmin:
             flash_html += f'<div class="flash err">{_e(err)}</div>'
         csrf = self._csrf(request) if self._valid_session(request) else ""
         body = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{_e(title)} — TG AutoReply</title><style>{_BASE_CSS}</style></head>
-<body><div class="shell"><aside class="side"><div class="brand">TG Business AutoReply</div><nav class="nav">{nav_html}<a href="/admin/logout">🚪 Выйти</a></nav></aside><main class="main"><div class="top"><h1>{_e(title)}</h1><span class="muted">TZ: {_e(self.timezone.key)}</span></div>{flash_html}{content}</main></div>
+<body><div class="shell"><aside class="side"><div class="brand">TG Business AutoReply</div><nav class="nav">{nav_html}<a href="/admin/logout">🚪 Выйти</a></nav></aside><main class="main"><div class="top"><h1>{_e(title)}</h1><span class="muted">{_e((request.get("admin_user") or ""))} · {_e((request.get("admin_role") or ""))} · TZ: {_e(self.timezone.key)}</span></div>{flash_html}{content}</main></div>
 <script>document.querySelectorAll('form[method="post"]').forEach(f=>{{if(!f.querySelector('input[name="csrf"]')){{let i=document.createElement('input');i.type='hidden';i.name='csrf';i.value={csrf!r};f.appendChild(i)}}}});</script></body></html>"""
         return web.Response(text=body, content_type="text/html", charset="utf-8", headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY", "Referrer-Policy": "same-origin"})
 
@@ -226,14 +288,15 @@ class WebAdmin:
         data = await request.post()
         username = str(data.get("username") or "")
         password = str(data.get("password") or "")
-        if not (hmac.compare_digest(username, self.username) and hmac.compare_digest(password, self.password)):
+        user = self.users.get(username)
+        if not user or not hmac.compare_digest(password, user.get("password", "")):
             await asyncio.sleep(0.8)
             raise web.HTTPFound("/admin/login?error=1")
         target = str(data.get("next") or "/admin")
         if not target.startswith("/") or target.startswith("//"):
             target = "/admin"
         response = web.HTTPFound(target)
-        response.set_cookie("tgadmin", self._session_cookie(), httponly=True, samesite="Lax", max_age=12 * 3600, path="/")
+        response.set_cookie("tgadmin", self._session_cookie(username, user["role"]), httponly=True, samesite="Lax", max_age=12 * 3600, path="/")
         raise response
 
     async def logout(self, request: web.Request) -> web.StreamResponse:
@@ -295,11 +358,11 @@ class WebAdmin:
         questions = await self.db.list_form_questions(int(item["form_id"])) if item.get("form_id") else []
         if questions:
             answers = "".join(
-                f'<div><b>{_e(q.get("label"))}:</b> <span class="answer">{_e(answers_data.get(str(q.get("id"))) or "—")}</span></div>'
+                f'<div><b>{_e(q.get("label"))}:</b> {_answer_html(answers_data.get(str(q.get("id"))) or "—")}</div>'
                 for q in questions
             )
         else:
-            answers = "".join(f'<div><b>{_e(k)}:</b> <span class="answer">{_e(v)}</span></div>' for k, v in answers_data.items())
+            answers = "".join(f'<div><b>{_e(k)}:</b> {_answer_html(v)}</div>' for k, v in answers_data.items())
         answers = answers or '<span class="muted">Нет ответов</span>'
         events = await self.db.list_submission_events(sid, limit=30)
         event_rows = "".join(f'<tr><td>{_e(_local_dt(ev.get("created_at"), self.timezone))}</td><td>{_e(ev.get("event_type"))}</td><td>{_e(ev.get("old_value") or "—")}</td><td>{_e(ev.get("new_value") or "—")}</td></tr>' for ev in events) or '<tr><td colspan="4" class="muted">Нет событий</td></tr>'
@@ -307,6 +370,9 @@ class WebAdmin:
         content = f"""<div class="grid"><div class="card"><div class="muted">Клиент</div><h3>{_e(client)}</h3><div>@{_e(item.get('username') or '—')}</div><div>User ID: {_e(item.get('user_id') or '—')}</div></div><div class="card"><div class="muted">Форма</div><h3>{_e(item.get('form_name'))}</h3><div>{_e(_local_dt(item.get('created_at'), self.timezone))}</div></div><div class="card"><div class="muted">Стоимость</div><div class="metric">{_e(_money(total,currency))}</div><div>Предоплата: {_e(_money(prepay,currency))}<br>Остаток: {_e(_money(balance,currency))}</div></div></div>
 <div class="section row"><div class="card"><h2>Статус</h2><form method="post" action="/admin/requests/{sid}/status"><div class="field"><select name="status">{status_opts}</select></div><button class="btn primary">Сохранить и уведомить клиента</button></form></div><div class="card"><h2>CRM</h2><form method="post" action="/admin/requests/{sid}/crm"><div class="row"><div class="field"><label>Стоимость</label><input name="total_amount" value="{total}"></div><div class="field"><label>Предоплата</label><input name="prepayment_amount" value="{prepay}"></div></div><div class="field"><label>Внутренняя заметка</label><textarea name="internal_note">{_e(item.get('internal_note') or '')}</textarea></div><button class="btn primary">Сохранить</button></form></div></div>
 <div class="section card"><h2>Ответы формы</h2><div class="kv">{answers}</div></div><div class="section"><h2>История</h2><div class="table-wrap"><table><thead><tr><th>Время</th><th>Событие</th><th>Было</th><th>Стало</th></tr></thead><tbody>{event_rows}</tbody></table></div></div>"""
+        payment_template = str(await self.db.get_setting("payment_link_template", "") or "").strip()
+        if payment_template:
+            content += f'<div class="section card"><h2>Предоплата</h2><p class="muted">Отправить клиенту настроенную ссылку на предоплату.</p><form method="post" action="/admin/requests/{sid}/payment"><button class="btn primary">💳 Отправить ссылку на оплату</button></form></div>'
         return self.page(request, f"Заявка #{sid}", content, active="requests")
 
     async def request_status_post(self, request: web.Request) -> web.StreamResponse:
@@ -624,6 +690,18 @@ class WebAdmin:
             note = str(block.get("note") or "ручная блокировка")
             events.setdefault(date_iso, []).append({"kind": "manual", "label": f"{period} · {note}", "url": "/admin/availability"})
 
+        recurring = await self.advanced.list_recurring_blocks(None)
+        if recurring:
+            day = first
+            while day <= last:
+                for block in recurring:
+                    if not block.get("enabled") or int(block.get("weekday") or -1) != day.weekday():
+                        continue
+                    period = "весь день" if not block.get("start_time") else f"{block.get('start_time')}–{block.get('end_time')}"
+                    note = str(block.get("note") or "регулярная занятость")
+                    events.setdefault(day.isoformat(), []).append({"kind": "manual", "label": f"{period} · ↻ {note}", "url": "/admin/rules"})
+                day += timedelta(days=1)
+
         cells = []
         weekdays = "".join(f'<div class="weekday">{name}</div>' for name in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"))
         for week in pycalendar.Calendar(firstweekday=0).monthdatescalendar(first.year, first.month):
@@ -892,21 +970,325 @@ class WebAdmin:
         await self.db.set_button_form(bid, int(form_raw) if form_raw.isdigit() else None)
         raise web.HTTPFound("/admin/buttons?ok=" + quote("Кнопка сохранена"))
 
+    async def file_download(self, request: web.Request) -> web.StreamResponse:
+        from pathlib import Path
+        name = request.match_info["name"]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise web.HTTPNotFound()
+        path = Path(self.db.path).parent / "uploads" / name
+        if not path.is_file():
+            raise web.HTTPNotFound(text="Файл не найден")
+        return web.FileResponse(path, headers={"Content-Disposition": f'inline; filename="{name}"'})
+
+    async def clients(self, request: web.Request) -> web.Response:
+        query = (request.query.get("q") or "").strip()
+        items = await self.advanced.list_clients(query=query, limit=300)
+        currency = str(await self.db.get_setting("crm_currency", "₽") or "₽")
+        rows = ""
+        for item in items:
+            key = f"u:{int(item['user_id'])}" if item.get("user_id") else f"c:{int(item.get('chat_id') or 0)}"
+            name = " ".join(x for x in [item.get("first_name"), item.get("last_name")] if x) or ("@" + str(item.get("username")) if item.get("username") else key)
+            rows += f'<tr><td><a href="/admin/clients/{quote(key, safe=":")}">{_e(name)}</a></td><td>@{_e(item.get("username") or "—")}</td><td>{int(item.get("submissions_count") or 0)}</td><td>{int(item.get("successful_count") or 0)}</td><td>{_e(_money(item.get("total_amount"), currency))}</td><td>{_e(_local_dt(item.get("last_submission_at"), self.timezone))}</td></tr>'
+        rows = rows or '<tr><td colspan="6" class="muted">Клиентов пока нет</td></tr>'
+        content = f"""<form method="get" class="card"><div class="row"><div class="field"><label>Поиск клиента</label><input name="q" value="{_e(query)}" placeholder="Имя, @username, телефон"></div><div class="field"><label>&nbsp;</label><button class="btn primary">Найти</button></div></div></form>
+<div class="section actions"><a class="btn" href="/admin/export.csv">⬇️ CSV</a><a class="btn" href="/admin/export.xlsx">⬇️ Excel</a></div>
+<div class="section table-wrap"><table><thead><tr><th>Клиент</th><th>Username</th><th>Заявок</th><th>Успешных</th><th>Сумма</th><th>Последняя</th></tr></thead><tbody>{rows}</tbody></table></div>"""
+        return self.page(request, "Клиенты", content, active="clients")
+
+    async def client_detail(self, request: web.Request) -> web.Response:
+        key = request.match_info["client_key"]
+        client = await self.advanced.get_client(key)
+        if not client:
+            raise web.HTTPNotFound(text="Клиент не найден")
+        items = await self.db.list_client_submissions(user_id=client.get("user_id"), chat_id=client.get("chat_id"), limit=50)
+        notes = await self.advanced.list_client_notes(key)
+        currency = str(await self.db.get_setting("crm_currency", "₽") or "₽")
+        name = " ".join(x for x in [client.get("first_name"), client.get("last_name")] if x) or ("@" + str(client.get("username")) if client.get("username") else key)
+        request_rows = "".join(self._request_row(x, currency) for x in items) or '<tr><td colspan="6" class="muted">Заявок нет</td></tr>'
+        note_rows = "".join(f'<div class="card section"><div class="muted">{_e(_local_dt(n.get("created_at"), self.timezone))} · {_e(n.get("admin_name") or "admin")}</div><div class="answer">{_e(n.get("note"))}</div></div>' for n in notes) or '<div class="muted">Заметок нет</div>'
+        content = f"""<div class="grid"><div class="card"><div class="muted">Клиент</div><div class="metric">{_e(name)}</div><div>@{_e(client.get("username") or "—")}</div></div><div class="card"><div class="muted">Заявок</div><div class="metric">{int(client.get("submissions_count") or 0)}</div></div><div class="card"><div class="muted">Сумма</div><div class="metric">{_e(_money(client.get("total_amount"), currency))}</div></div></div>
+<div class="section"><h2>Заявки</h2><div class="table-wrap"><table><thead><tr><th>№</th><th>Клиент</th><th>Форма</th><th>Статус</th><th>Сумма</th><th>Создана</th></tr></thead><tbody>{request_rows}</tbody></table></div></div>
+<div class="section"><h2>CRM-заметки</h2><form method="post" action="/admin/clients/{quote(key, safe=':')}" class="card"><input type="hidden" name="action" value="note"><div class="field"><textarea name="note" required placeholder="Внутренняя заметка о клиенте"></textarea></div><button class="btn primary">Добавить заметку</button></form>{note_rows}</div>"""
+        return self.page(request, f"Клиент: {name}", content, active="clients")
+
+    async def client_note_post(self, request: web.Request) -> web.StreamResponse:
+        key = request.match_info["client_key"]
+        note = str(request["post"].get("note") or "").strip()
+        if not note:
+            raise web.HTTPFound(f"/admin/clients/{quote(key, safe=':')}?err=" + quote("Введите заметку"))
+        await self.advanced.add_client_note(key, note, str(request.get("admin_user") or "admin"))
+        raise web.HTTPFound(f"/admin/clients/{quote(key, safe=':')}?ok=" + quote("Заметка добавлена"))
+
+    async def analytics_view(self, request: web.Request) -> web.Response:
+        a = await self.advanced.analytics()
+        currency = str(await self.db.get_setting("crm_currency", "₽") or "₽")
+        cards = f"""<div class="grid"><div class="card"><div class="muted">Всего заявок</div><div class="metric">{int(a.get('total') or 0)}</div></div><div class="card"><div class="muted">Конверсия в подтверждение</div><div class="metric">{_e(a.get('conversion_percent'))}%</div></div><div class="card"><div class="muted">Выручка по подтверждённым</div><div class="metric">{_e(_money(a.get('revenue'), currency))}</div></div><div class="card"><div class="muted">Средний чек</div><div class="metric">{_e(_money(round(float(a.get('avg_check') or 0)), currency))}</div></div></div>"""
+        form_rows = "".join(f'<tr><td>{_e(x.get("form_name"))}</td><td>{int(x.get("c") or 0)}</td><td>{_e(_money(x.get("revenue"), currency))}</td></tr>' for x in a.get("forms", [])) or '<tr><td colspan="3" class="muted">Нет данных</td></tr>'
+        month_rows = "".join(f'<tr><td>{_e(x.get("month"))}</td><td>{int(x.get("c") or 0)}</td><td>{_e(_money(x.get("revenue"), currency))}</td></tr>' for x in a.get("months", [])) or '<tr><td colspan="3" class="muted">Нет данных</td></tr>'
+        content = cards + f"""<div class="row section"><div><h2>По формам</h2><div class="table-wrap"><table><thead><tr><th>Форма</th><th>Заявок</th><th>Выручка</th></tr></thead><tbody>{form_rows}</tbody></table></div></div><div><h2>По месяцам</h2><div class="table-wrap"><table><thead><tr><th>Месяц</th><th>Заявок</th><th>Выручка</th></tr></thead><tbody>{month_rows}</tbody></table></div></div></div>"""
+        return self.page(request, "Аналитика", content, active="analytics")
+
+    async def audit_view(self, request: web.Request) -> web.Response:
+        items = await self.advanced.list_audit(300)
+        rows = "".join(f'<tr><td>{_e(_local_dt(x.get("created_at"), self.timezone))}</td><td>{_e(x.get("actor"))}</td><td>{_e(x.get("role"))}</td><td>{_e(x.get("action"))}</td><td>{_e(x.get("details") or "")}</td></tr>' for x in items) or '<tr><td colspan="5" class="muted">Журнал пуст</td></tr>'
+        content = f'<div class="table-wrap"><table><thead><tr><th>Время</th><th>Кто</th><th>Роль</th><th>Действие</th><th>Детали</th></tr></thead><tbody>{rows}</tbody></table></div>'
+        return self.page(request, "Журнал действий", content, active="audit")
+
+    async def rules(self, request: web.Request) -> web.Response:
+        forms = await self.db.list_forms()
+        rows = ""
+        for form in forms:
+            rule = await self.advanced.get_rule(int(form["id"]))
+            rows += f'<tr><td><a href="/admin/rules/{int(form["id"])}">{_e(form["name"])}</a></td><td>{"✅" if rule.get("enabled") else "⚪"}</td><td>{int(rule.get("min_duration_minutes") or 0)} мин</td><td>{int(rule.get("min_lead_hours") or 0)} ч</td><td>{int(rule.get("max_advance_days") or 0)} дн.</td></tr>'
+        content = f'<div class="table-wrap"><table><thead><tr><th>Форма</th><th>Правила</th><th>Минимум</th><th>До события</th><th>Горизонт</th></tr></thead><tbody>{rows}</tbody></table></div>'
+        return self.page(request, "Правила бронирования", content, active="rules")
+
+    async def rule_detail(self, request: web.Request) -> web.Response:
+        fid = int(request.match_info["fid"])
+        form = await self.db.get_form(fid)
+        if not form:
+            raise web.HTTPNotFound()
+        rule = await self.advanced.get_rule(fid)
+        blocks = await self.advanced.list_recurring_blocks(fid)
+        closed = set(int(x) for x in rule.get("closed_weekdays") or [])
+        closed_html = " ".join(f'<label><input style="width:auto" type="checkbox" name="closed_{i}" value="1" {"checked" if i in closed else ""}> {name}</label>' for i,name in enumerate(WEEKDAY_NAMES))
+        day_hours = rule.get("day_hours") or {}
+        day_lines = "\n".join(f'{i}={v[0]}-{v[1]}' for i,v in sorted(((int(k),v) for k,v in day_hours.items() if isinstance(v,list) and len(v)==2), key=lambda x:x[0]))
+        guest_map = rule.get("guest_surcharges") or {}
+        guest_options = ["до 50","от 50 до 100","от 100 до 150","от 150 до 250","от 250 до 400","более 400"]
+        guest_fields = "".join(f'<div class="field"><label>{_e(opt)}</label><input name="guest_{i}" value="{int(guest_map.get(opt,0) or 0)}"></div>' for i,opt in enumerate(guest_options))
+        weekday_map = rule.get("weekday_surcharges") or {}
+        weekday_fields = "".join(f'<div class="field"><label>{name}, %</label><input name="weekday_{i}" value="{int(weekday_map.get(str(i),0) or 0)}"></div>' for i,name in enumerate(WEEKDAY_NAMES))
+        block_rows = "".join(f'<tr><td>{WEEKDAY_NAMES[int(b.get("weekday") or 0)]}</td><td>{_e((b.get("start_time") or "весь день") + ("–" + str(b.get("end_time")) if b.get("end_time") else ""))}</td><td>{_e(b.get("note") or "")}</td><td><form method="post" action="/admin/rules/{fid}/recurring/{int(b["id"])}/delete"><button class="btn danger">Удалить</button></form></td></tr>' for b in blocks) or '<tr><td colspan="4" class="muted">Нет регулярных блокировок</td></tr>'
+        options = ''.join(f'<option value="{i}">{n}</option>' for i,n in enumerate(WEEKDAY_NAMES))
+        content = f"""<div class="card"><form method="post" action="/admin/rules/{fid}"><div class="field"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {"checked" if rule.get("enabled") else ""}> Включить правила и динамические надбавки</label></div><div class="row3"><div class="field"><label>Минимум аренды, мин</label><input name="min_duration_minutes" value="{int(rule.get('min_duration_minutes') or 0)}"></div><div class="field"><label>Минимум до события, ч</label><input name="min_lead_hours" value="{int(rule.get('min_lead_hours') or 0)}"></div><div class="field"><label>Бронировать вперёд, дней</label><input name="max_advance_days" value="{int(rule.get('max_advance_days') or 365)}"></div></div><div class="field"><label>Закрытые дни</label><div class="actions">{closed_html}</div></div><div class="field"><label>Рабочее время по дням (0=Пн … 6=Вс)</label><textarea name="day_hours" placeholder="0=10:00-23:59\n5=12:00-24:00">{_e(day_lines)}</textarea></div><h3>Надбавка по количеству гостей</h3><div class="grid">{guest_fields}</div><h3>Надбавка по дню недели, %</h3><div class="grid">{weekday_fields}</div><div class="row3"><div class="field"><label>Ночная зона с</label><input name="night_start" value="{_e(rule.get('night_start') or '23:00')}"></div><div class="field"><label>Ночная доплата, фикс.</label><input name="night_surcharge_amount" value="{int(rule.get('night_surcharge_amount') or 0)}"></div><div class="field"><label>Ночная доплата, %</label><input name="night_surcharge_percent" value="{int(rule.get('night_surcharge_percent') or 0)}"></div></div><button class="btn primary">Сохранить правила</button></form></div>
+<div class="section"><h2>Повторяющаяся занятость</h2><div class="table-wrap"><table><thead><tr><th>День</th><th>Время</th><th>Причина</th><th></th></tr></thead><tbody>{block_rows}</tbody></table></div><form method="post" action="/admin/rules/{fid}/recurring" class="card section"><div class="row3"><div class="field"><label>День недели</label><select name="weekday">{options}</select></div><div class="field"><label>Начало (пусто = весь день)</label><input name="start_time" placeholder="18:00"></div><div class="field"><label>Окончание</label><input name="end_time" placeholder="22:00"></div></div><div class="field"><label>Причина</label><input name="note" value="Регулярная занятость"></div><button class="btn">Добавить</button></form></div>"""
+        return self.page(request, f"Правила: {form['name']}", content, active="rules")
+
+    async def rule_post(self, request: web.Request) -> web.StreamResponse:
+        import json as _jsonlib
+        fid = int(request.match_info["fid"])
+        data = request["post"]
+        def iv(name: str, maximum: int = 1000000) -> int:
+            v = _parse_int(str(data.get(name) or "0"), minimum=0, maximum=maximum)
+            if v is None:
+                raise ValueError(name)
+            return v
+        try:
+            closed = [i for i in range(7) if data.get(f"closed_{i}")]
+            day_hours = {}
+            for line in str(data.get("day_hours") or "").splitlines():
+                line=line.strip()
+                if not line:
+                    continue
+                k, rng = line.split("=",1); start,end = rng.split("-",1)
+                idx=int(k.strip())
+                if idx not in range(7) or not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d|24:00", start.strip()) or not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d|24:00", end.strip()):
+                    raise ValueError("day_hours")
+                day_hours[str(idx)] = [start.strip(), end.strip()]
+            guest_options = ["до 50","от 50 до 100","от 100 до 150","от 150 до 250","от 250 до 400","более 400"]
+            guest_map = {}
+            for i,opt in enumerate(guest_options):
+                value=iv(f"guest_{i}",10**9)
+                if value:
+                    guest_map[opt]=value
+            weekday_map = {}
+            for i in range(7):
+                value=iv(f"weekday_{i}",500)
+                if value:
+                    weekday_map[str(i)]=value
+            night_start = str(data.get("night_start") or "23:00").strip()
+            if not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", night_start):
+                raise ValueError("night_start")
+            values = {
+                "enabled": 1 if data.get("enabled") else 0,
+                "min_duration_minutes": iv("min_duration_minutes", 7*24*60),
+                "min_lead_hours": iv("min_lead_hours", 24*365),
+                "max_advance_days": iv("max_advance_days", 3650),
+                "closed_weekdays_json": _jsonlib.dumps(closed, ensure_ascii=False),
+                "day_hours_json": _jsonlib.dumps(day_hours, ensure_ascii=False),
+                "guest_surcharges_json": _jsonlib.dumps(guest_map, ensure_ascii=False),
+                "weekday_surcharges_json": _jsonlib.dumps(weekday_map, ensure_ascii=False),
+                "night_start": night_start,
+                "night_surcharge_amount": iv("night_surcharge_amount", 10**9),
+                "night_surcharge_percent": iv("night_surcharge_percent", 500),
+            }
+        except Exception:
+            raise web.HTTPFound(f"/admin/rules/{fid}?err=" + quote("Проверьте числовые значения и формат рабочего времени"))
+        await self.advanced.update_rule(fid, values)
+        raise web.HTTPFound(f"/admin/rules/{fid}?ok=" + quote("Правила сохранены"))
+
+    async def recurring_add(self, request: web.Request) -> web.StreamResponse:
+        fid = int(request.match_info["fid"]); data=request["post"]
+        weekday = _parse_int(str(data.get("weekday") or ""), minimum=0, maximum=6)
+        start = str(data.get("start_time") or "").strip() or None
+        end = str(data.get("end_time") or "").strip() or None
+        if weekday is None or bool(start) != bool(end):
+            raise web.HTTPFound(f"/admin/rules/{fid}?err=" + quote("Укажите оба времени или оставьте оба пустыми"))
+        if start and (not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", start) or not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d|24:00", end or "")):
+            raise web.HTTPFound(f"/admin/rules/{fid}?err=" + quote("Время должно быть ЧЧ:ММ"))
+        await self.advanced.add_recurring_block(form_id=fid, weekday=weekday, start_time=start, end_time=end, note=str(data.get("note") or "Регулярная занятость"))
+        raise web.HTTPFound(f"/admin/rules/{fid}?ok=" + quote("Регулярная занятость добавлена"))
+
+    async def recurring_delete(self, request: web.Request) -> web.StreamResponse:
+        fid=int(request.match_info["fid"]); bid=int(request.match_info["bid"])
+        await self.advanced.delete_recurring_block(bid)
+        raise web.HTTPFound(f"/admin/rules/{fid}?ok=" + quote("Блокировка удалена"))
+
+    async def export_csv(self, request: web.Request) -> web.Response:
+        import csv, io
+        async with self.db.connection() as conn:
+            rows = await (await conn.execute("SELECT * FROM form_submissions ORDER BY created_at DESC,id DESC")).fetchall()
+        out=io.StringIO(); w=csv.writer(out, delimiter=';')
+        w.writerow(["id","created_at","form","status","client","username","chat_id","amount","prepayment","balance","answers","note"])
+        for r in rows:
+            d=dict(r); total=int(d.get("total_amount") or 0); pre=int(d.get("prepayment_amount") or 0)
+            client=" ".join(x for x in [d.get("first_name"),d.get("last_name")] if x)
+            w.writerow([d.get("id"),d.get("created_at"),d.get("form_name"),d.get("status"),client,d.get("username"),d.get("chat_id"),total,pre,max(0,total-pre),d.get("answers_json"),d.get("internal_note")])
+        body='\ufeff'+out.getvalue()
+        return web.Response(text=body, content_type="text/csv", charset="utf-8", headers={"Content-Disposition":"attachment; filename=tgautoreply-export.csv"})
+
+    async def export_xlsx(self, request: web.Request) -> web.Response:
+        from io import BytesIO
+        from openpyxl import Workbook
+        async with self.db.connection() as conn:
+            rows = await (await conn.execute("SELECT * FROM form_submissions ORDER BY created_at DESC,id DESC")).fetchall()
+        wb=Workbook(); ws=wb.active; ws.title="Заявки"
+        headers=["ID","Создана UTC","Форма","Статус","Клиент","Username","Chat ID","Стоимость","Предоплата","Остаток","Ответы JSON","Заметка"]
+        ws.append(headers)
+        for r in rows:
+            d=dict(r); total=int(d.get("total_amount") or 0); pre=int(d.get("prepayment_amount") or 0)
+            client=" ".join(x for x in [d.get("first_name"),d.get("last_name")] if x)
+            ws.append([d.get("id"),d.get("created_at"),d.get("form_name"),d.get("status"),client,d.get("username"),d.get("chat_id"),total,pre,max(0,total-pre),d.get("answers_json"),d.get("internal_note")])
+        ws.freeze_panes="A2"
+        for col in ws.columns:
+            ws.column_dimensions[col[0].column_letter].width=min(50,max(12,max(len(str(c.value or "")) for c in col)+2))
+        stream=BytesIO(); wb.save(stream)
+        return web.Response(body=stream.getvalue(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition":"attachment; filename=tgautoreply-export.xlsx"})
+
+    async def client_requests_view(self, request: web.Request) -> web.Response:
+        items=await self.advanced.list_client_requests(limit=200)
+        labels={"change":"✏️ Изменение брони","addons":"🧰 Изменение услуг","cancel":"❌ Отмена"}
+        rows=""
+        for x in items:
+            rid=int(x["id"]); current=str(x.get("status") or "new")
+            opts="".join(f'<option value="{v}" {"selected" if current==v else ""}>{label}</option>' for v,label in [("new","Новый"),("in_progress","В работе"),("done","Готово"),("rejected","Отклонён")])
+            rows += f'<tr><td>#{rid}</td><td><a href="/admin/requests/{int(x["submission_id"])}">заявка #{int(x["submission_id"])}</a></td><td>{_e(labels.get(str(x.get("request_type")),x.get("request_type")))}</td><td>{_e(x.get("message") or "")}</td><td><form method="post" action="/admin/client-requests/{rid}"><select name="status">{opts}</select><button class="btn">OK</button></form></td><td>{_e(_local_dt(x.get("created_at"),self.timezone))}</td></tr>'
+        rows=rows or '<tr><td colspan="6" class="muted">Запросов нет</td></tr>'
+        return self.page(request,"Запросы клиентов",f'<div class="table-wrap"><table><thead><tr><th>№</th><th>Заявка</th><th>Тип</th><th>Сообщение</th><th>Статус</th><th>Создан</th></tr></thead><tbody>{rows}</tbody></table></div>',active="client_requests")
+
+    async def client_request_status_post(self, request: web.Request) -> web.StreamResponse:
+        rid=int(request.match_info["rid"]); status=str(request["post"].get("status") or "")
+        try:
+            await self.advanced.update_client_request_status(rid,status)
+        except ValueError:
+            raise web.HTTPFound("/admin/client-requests?err="+quote("Некорректный статус"))
+        raise web.HTTPFound("/admin/client-requests?ok="+quote("Статус запроса обновлён"))
+
+    async def integrations_get(self, request: web.Request) -> web.Response:
+        enabled=(await self.db.get_setting("calendar_feed_enabled","0"))=="1"
+        token=str(await self.db.get_setting("calendar_feed_token","") or "")
+        payment=str(await self.db.get_setting("payment_link_template","") or "")
+        message=str(await self.db.get_setting("payment_message_template","") or "")
+        percent=str(await self.db.get_setting("payment_default_percent","30") or "30")
+        feed_url=f"{request.scheme}://{request.host}/calendar.ics?token={quote(token)}"
+        content=f"""<div class="card"><h2>Google Calendar / iCalendar</h2><p class="muted">Односторонняя синхронизация: Google Calendar может подписаться на приватный ICS URL. Для внешнего Google Calendar адрес Web Admin должен быть доступен из интернета по HTTPS.</p><form method="post" action="/admin/integrations"><input type="hidden" name="section" value="calendar"><label><input style="width:auto" type="checkbox" name="calendar_feed_enabled" value="1" {"checked" if enabled else ""}> Включить приватный календарный feed</label><div class="field"><label>URL подписки</label><input readonly value="{_e(feed_url)}"></div><button class="btn primary">Сохранить</button></form></div>
+<div class="card section"><h2>Ссылка на предоплату</h2><p class="muted">Шаблон URL может использовать <code>{{id}}</code>, <code>{{amount}}</code>, <code>{{prepayment}}</code>, <code>{{balance}}</code>.</p><form method="post" action="/admin/integrations"><input type="hidden" name="section" value="payment"><div class="field"><label>Шаблон URL</label><input name="payment_link_template" value="{_e(payment)}" placeholder="https://pay.example/order/{{id}}?amount={{prepayment}}"></div><div class="field"><label>Предоплата по умолчанию, %</label><input name="payment_default_percent" value="{_e(percent)}"></div><div class="field"><label>Текст сообщения клиенту</label><textarea name="payment_message_template">{_e(message)}</textarea></div><button class="btn primary">Сохранить</button></form></div>"""
+        return self.page(request,"Интеграции",content,active="integrations")
+
+    async def integrations_post(self, request: web.Request) -> web.StreamResponse:
+        data=request["post"]; section=str(data.get("section") or "")
+        if section=="calendar":
+            await self.db.set_setting("calendar_feed_enabled","1" if data.get("calendar_feed_enabled") else "0")
+        elif section=="payment":
+            percent=_parse_int(str(data.get("payment_default_percent") or ""),minimum=1,maximum=100)
+            if percent is None:
+                raise web.HTTPFound("/admin/integrations?err="+quote("Процент должен быть 1–100"))
+            await self.db.set_setting("payment_link_template",str(data.get("payment_link_template") or "").strip()[:2000])
+            await self.db.set_setting("payment_default_percent",str(percent))
+            await self.db.set_setting("payment_message_template",str(data.get("payment_message_template") or "")[:4000])
+        raise web.HTTPFound("/admin/integrations?ok="+quote("Настройки сохранены"))
+
+    async def calendar_ics(self, request: web.Request) -> web.Response:
+        if (await self.db.get_setting("calendar_feed_enabled","0"))!="1":
+            raise web.HTTPNotFound()
+        token=str(await self.db.get_setting("calendar_feed_token","") or "")
+        if not token or not hmac.compare_digest(str(request.query.get("token") or ""),token):
+            raise web.HTTPForbidden(text="Invalid calendar token")
+        items=await self.db.list_booking_submissions(limit=5000,statuses=("confirmed","paid","completed"))
+        def esc(v: str)->str:
+            return str(v).replace('\\','\\\\').replace(';','\\;').replace(',','\\,').replace('\n','\\n')
+        lines=["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//TG AutoReply//Business Calendar//RU","CALSCALE:GREGORIAN","METHOD:PUBLISH"]
+        for item in items:
+            if not item.get("form_id"):
+                continue
+            qs=await self.db.list_form_questions(int(item["form_id"])); window=self._booking_window(item,qs)
+            if not window:
+                continue
+            start,end=window
+            uid=f"tgautoreply-{int(item['id'])}@local"
+            client=" ".join(x for x in [item.get("first_name"),item.get("last_name")] if x) or ("@"+str(item.get("username")) if item.get("username") else "клиент")
+            lines += ["BEGIN:VEVENT",f"UID:{uid}",f"DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}",f"DTSTART;TZID={self.timezone.key}:{start.strftime('%Y%m%dT%H%M%S')}",f"DTEND;TZID={self.timezone.key}:{end.strftime('%Y%m%dT%H%M%S')}",f"SUMMARY:{esc('#'+str(item['id'])+' '+str(item.get('form_name') or 'Бронь'))}",f"DESCRIPTION:{esc('Клиент: '+client+' | статус: '+str(item.get('status') or ''))}","END:VEVENT"]
+        lines.append("END:VCALENDAR")
+        return web.Response(text="\r\n".join(lines)+"\r\n",content_type="text/calendar",charset="utf-8",headers={"Content-Disposition":"inline; filename=bookings.ics"})
+
+    async def payment_send(self, request: web.Request) -> web.StreamResponse:
+        sid=int(request.match_info["sid"]); item=await self.db.get_submission(sid)
+        if not item:
+            raise web.HTTPNotFound()
+        template=str(await self.db.get_setting("payment_link_template","") or "").strip()
+        if not template or not self.on_payment_link:
+            raise web.HTTPFound(f"/admin/requests/{sid}?err="+quote("Сначала настройте ссылку на оплату в Интеграциях"))
+        total=max(0,int(item.get("total_amount") or 0)); pre=max(0,int(item.get("prepayment_amount") or 0))
+        if not pre:
+            percent=int(await self.db.get_setting("payment_default_percent","30") or 30); pre=(total*percent+99)//100 if total else 0
+        balance=max(0,total-pre)
+        values={"id":str(sid),"amount":str(total),"prepayment":str(pre),"balance":str(balance)}
+        url=template
+        for k,v in values.items():
+            url=url.replace("{"+k+"}",quote(v,safe=""))
+        msg=str(await self.db.get_setting("payment_message_template","") or "{url}")
+        currency=str(await self.db.get_setting("crm_currency","₽") or "₽")
+        display={"id":str(sid),"amount":_money(total,currency),"prepayment":_money(pre,currency),"balance":_money(balance,currency),"url":url}
+        for k,v in display.items():
+            msg=msg.replace("{"+k+"}",str(v))
+        ok,info=await self.on_payment_link(sid,msg[:4000]); key="ok" if ok else "err"
+        raise web.HTTPFound(f"/admin/requests/{sid}?{key}="+quote(info))
+
+
     def application(self) -> web.Application:
         app = web.Application(middlewares=[self.auth_middleware])
         app.router.add_get("/health", self.health)
+        app.router.add_get("/calendar.ics", self.calendar_ics)
         app.router.add_get("/", lambda r: (_ for _ in ()).throw(web.HTTPFound("/admin")))
         app.router.add_get("/admin/login", self.login_get)
         app.router.add_post("/admin/login", self.login_post)
         app.router.add_get("/admin/logout", self.logout)
         app.router.add_get("/admin", self.dashboard)
         app.router.add_get("/admin/requests", self.requests)
+        app.router.add_get("/admin/files/{name}", self.file_download)
+        app.router.add_get("/admin/clients", self.clients)
+        app.router.add_get("/admin/clients/{client_key}", self.client_detail)
+        app.router.add_post("/admin/clients/{client_key}", self.client_note_post)
+        app.router.add_get("/admin/client-requests", self.client_requests_view)
+        app.router.add_post(r"/admin/client-requests/{rid:\d+}", self.client_request_status_post)
+        app.router.add_get("/admin/analytics", self.analytics_view)
+        app.router.add_get("/admin/audit", self.audit_view)
+        app.router.add_get("/admin/export.csv", self.export_csv)
+        app.router.add_get("/admin/export.xlsx", self.export_xlsx)
         app.router.add_get("/admin/requests/{sid:\\d+}", self.request_detail)
         app.router.add_post("/admin/requests/{sid:\\d+}/status", self.request_status_post)
         app.router.add_post("/admin/requests/{sid:\\d+}/crm", self.request_crm_post)
         app.router.add_get("/admin/settings", self.settings_get)
         app.router.add_post("/admin/settings", self.settings_post)
         app.router.add_get("/admin/pricing", self.pricing)
+        app.router.add_get("/admin/rules", self.rules)
+        app.router.add_get(r"/admin/rules/{fid:\d+}", self.rule_detail)
+        app.router.add_post(r"/admin/rules/{fid:\d+}", self.rule_post)
+        app.router.add_post(r"/admin/rules/{fid:\d+}/recurring", self.recurring_add)
+        app.router.add_post(r"/admin/rules/{fid:\d+}/recurring/{bid:\d+}/delete", self.recurring_delete)
+        app.router.add_get("/admin/integrations", self.integrations_get)
+        app.router.add_post("/admin/integrations", self.integrations_post)
         app.router.add_get("/admin/pricing/{fid:\\d+}", self.pricing_detail)
         app.router.add_post("/admin/pricing/{fid:\\d+}", self.pricing_post)
         app.router.add_post("/admin/pricing/{fid:\\d+}/addon", self.addon_create)
@@ -948,6 +1330,9 @@ async def start_web_admin(
     concurrency_snapshot: ConcurrencySnapshotCallback,
     backup_manager: BackupManager,
     reminder_service: ReminderService,
+    advanced: AdvancedService,
+    users_config: str = "",
+    on_payment_link: PaymentLinkCallback | None = None,
 ) -> WebAdminHandle:
     admin = WebAdmin(
         db=db,
@@ -959,6 +1344,9 @@ async def start_web_admin(
         concurrency_snapshot=concurrency_snapshot,
         backup_manager=backup_manager,
         reminder_service=reminder_service,
+        advanced=advanced,
+        users_config=users_config,
+        on_payment_link=on_payment_link,
     )
     runner = web.AppRunner(admin.application(), access_log=logger)
     await runner.setup()

@@ -22,6 +22,7 @@ services:
       TZ: Europe/Moscow
       WEB_ADMIN_USERNAME: "admin"
       WEB_ADMIN_PASSWORD: "PASTE_STRONG_WEB_ADMIN_PASSWORD_HERE"
+      WEB_ADMIN_USERS: ""
       MAX_CONCURRENT_UPDATES: "32"
       BACKUP_DIR: /data/backups
     labels:
@@ -74,12 +75,12 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.9.0"
+  version: "2.0.0"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      Web calendar, automatic SQLite backups with restore, and configurable customer/admin
-      booking reminders with delivery history.
+      Advanced booking rules, recurring availability, dynamic pricing, CRM clients, roles, audit,
+      analytics, CSV/Excel export, private calendar feed, payment links and file uploads.
     ru_RU: >
-      Календарь в Web Admin, автоматические резервные копии SQLite с восстановлением и
-      настраиваемые напоминания клиентам/администраторам с историей доставки.
+      Правила бронирования, повторяющаяся занятость, динамические тарифы, CRM клиентов, роли,
+      аудит, аналитика, CSV/Excel, приватный календарь, ссылки оплаты и файлы в заявках.
