@@ -75,12 +75,12 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "2.0.0"
+  version: "2.0.1"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      Advanced booking rules, recurring availability, dynamic pricing, CRM clients, roles, audit,
-      analytics, CSV/Excel export, private calendar feed, payment links and file uploads.
+      Adds a direct-chat Menu Button, inline Menu shortcuts for Business replies, blocks past booking dates,
+      and adds an admin-only test mode that runs client forms without creating real CRM submissions.
     ru_RU: >
-      Правила бронирования, повторяющаяся занятость, динамические тарифы, CRM клиентов, роли,
-      аудит, аналитика, CSV/Excel, приватный календарь, ссылки оплаты и файлы в заявках.
+      Добавлена кнопка меню в ЛС с ботом, inline-меню в Business-ответах, запрет бронирования прошедших дат
+      и тестовый режим администратора без создания реальных CRM-заявок.

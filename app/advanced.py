@@ -229,6 +229,9 @@ class AdvancedService:
         except ValueError:
             return None
 
+        if start_date < datetime.now(self.timezone).date():
+            return "Нельзя бронировать дату раньше сегодняшней."
+
         if rule.get("enabled"):
             min_duration = max(0, int(rule.get("min_duration_minutes") or 0))
             if min_duration and duration < min_duration:

@@ -15,6 +15,12 @@ def public_menu(buttons: list[dict], columns: int = 1) -> InlineKeyboardMarkup |
     return builder.as_markup()
 
 
+def public_menu_button() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="☰ Меню", callback_data="public:menu"))
+    return builder.as_markup()
+
+
 MONTH_NAMES_RU = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
@@ -52,7 +58,10 @@ def calendar_keyboard(
                 row.append(InlineKeyboardButton(text="·", callback_data="cal:noop"))
                 continue
             iso = f"{year:04d}-{month:02d}-{day:02d}"
-            if iso in full_busy_dates:
+            if iso < today_iso:
+                label = f"·{day}"
+                callback_data = "cal:past"
+            elif iso in full_busy_dates:
                 label = f"×{day}"
                 callback_data = f"cal:busy:{question_id}:{iso}"
             elif iso in partial_busy_dates:
@@ -74,9 +83,12 @@ def calendar_keyboard(
     if next_month == 13:
         next_month = 1
         next_year += 1
+    current_ym = today_iso[:7]
+    prev_ym = f"{prev_year:04d}-{prev_month:02d}"
+    prev_callback = "cal:noop" if prev_ym < current_ym else f"cal:nav:{question_id}:{prev_ym}"
     builder.row(
         InlineKeyboardButton(
-            text="◀️", callback_data=f"cal:nav:{question_id}:{prev_year:04d}-{prev_month:02d}"
+            text="◀️", callback_data=prev_callback
         ),
         InlineKeyboardButton(
             text="Сегодня", callback_data=f"cal:today:{question_id}"
@@ -247,6 +259,9 @@ def admin_main(enabled: bool) -> InlineKeyboardMarkup:
     builder.row(
         InlineKeyboardButton(text="💬 Шаблоны статусов", callback_data="adm:status_templates"),
         InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🧪 Тест бота", callback_data="adm:test"),
     )
     return builder.as_markup()
 

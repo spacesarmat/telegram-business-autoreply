@@ -17,7 +17,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands
 
 from .advanced import AdvancedService
 from .backup import BackupManager
@@ -56,6 +56,7 @@ from .keyboards import (
     form_question_nav,
     guest_count_keyboard,
     public_menu,
+    public_menu_button,
     time_slots_keyboard,
 )
 from .reminders import ReminderService
@@ -74,6 +75,25 @@ concurrency_guard = UpdateConcurrencyGuard(settings.max_concurrent_updates)
 
 def is_admin(user_id: int | None) -> bool:
     return user_id is not None and user_id in settings.admin_ids
+
+
+TEST_CONNECTION_PREFIX = "admin-test:"
+
+
+def _test_connection_id(user_id: int) -> str:
+    return f"{TEST_CONNECTION_PREFIX}{user_id}"
+
+
+def _is_test_connection(value: str | None) -> bool:
+    return bool(value and str(value).startswith(TEST_CONNECTION_PREFIX))
+
+
+def _is_test_session(session: dict | None) -> bool:
+    return bool(session and _is_test_connection(session.get("business_connection_id")))
+
+
+def _telegram_business_id(value: str | None) -> str | None:
+    return None if _is_test_connection(value) else value
 
 
 def local_now() -> datetime:
@@ -163,23 +183,25 @@ async def _show_public_menu(
     bot: Bot,
     *,
     chat_id: int,
-    business_connection_id: str,
+    business_connection_id: str | None,
     text: str = "Выберите, что вас интересует:",
     edit_message_id: int | None = None,
 ) -> int | None:
     columns = int(await db.get_setting("menu_columns", "1") or 1)
     buttons = await db.list_buttons(enabled_only=True)
     markup = public_menu(buttons, columns)
+    business_id = _telegram_business_id(business_connection_id)
+    business_kwargs = {"business_connection_id": business_id} if business_id else {}
 
     if edit_message_id is not None:
         try:
             edited = await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=edit_message_id,
-                business_connection_id=business_connection_id,
                 text=text,
                 parse_mode=None,
                 reply_markup=markup,
+                **business_kwargs,
             )
             if isinstance(edited, Message):
                 return int(edited.message_id)
@@ -190,10 +212,10 @@ async def _show_public_menu(
     try:
         sent = await bot.send_message(
             chat_id=chat_id,
-            business_connection_id=business_connection_id,
             text=text,
             parse_mode=None,
             reply_markup=markup,
+            **business_kwargs,
         )
         return int(sent.message_id)
     except TelegramAPIError:
@@ -1307,17 +1329,21 @@ def _form_preview_text(
 async def _upsert_form_message(
     bot: Bot, session: dict, *, text: str, reply_markup=None
 ) -> int | None:
-    """Keep the whole questionnaire in one editable Business message."""
+    """Keep the questionnaire in one editable message (Business or admin test chat)."""
+    if _is_test_session(session) and not text.startswith("🧪"):
+        text = "🧪 ТЕСТОВЫЙ РЕЖИМ\n\n" + text
     message_id = session.get("form_message_id")
+    business_id = _telegram_business_id(session.get("business_connection_id"))
+    business_kwargs = {"business_connection_id": business_id} if business_id else {}
     if message_id:
         try:
             await bot.edit_message_text(
                 chat_id=session["chat_id"],
                 message_id=int(message_id),
-                business_connection_id=session["business_connection_id"],
                 text=text,
                 parse_mode=None,
                 reply_markup=reply_markup,
+                **business_kwargs,
             )
             return int(message_id)
         except TelegramAPIError:
@@ -1328,10 +1354,10 @@ async def _upsert_form_message(
     try:
         sent = await bot.send_message(
             chat_id=session["chat_id"],
-            business_connection_id=session["business_connection_id"],
             text=text,
             parse_mode=None,
             reply_markup=reply_markup,
+            **business_kwargs,
         )
     except TelegramAPIError:
         logger.exception("Не удалось отправить сообщение формы в chat_id=%s", session["chat_id"])
@@ -1347,7 +1373,7 @@ async def _upsert_form_message(
 async def _delete_form_answer_message(
     bot: Bot, message: Message, session: dict, can_delete_all_messages: bool
 ) -> None:
-    if not can_delete_all_messages:
+    if _is_test_session(session) or not can_delete_all_messages:
         return
     try:
         await bot.delete_business_messages(
@@ -1472,7 +1498,7 @@ async def send_current_form_question(
         selected = _date_from_answer(existing)
         year = calendar_year or (selected.year if selected else today.year)
         month = calendar_month or (selected.month if selected else today.month)
-        if year < today.year - 1:
+        if (year, month) < (today.year, today.month):
             year, month = today.year, today.month
         if year > today.year + 6:
             year, month = today.year + 6, 12
@@ -1481,7 +1507,7 @@ async def send_current_form_question(
             f"Вопрос {index + 1} из {len(questions)}\n"
             f"{question['prompt']}{suffix}\n\n"
             "Выберите день в календаре или введите дату вручную в формате ДД.ММ.ГГГГ.\n"
-            "× — дата занята полностью, • — есть занятые часы."
+            "Прошедшие даты недоступны. × — дата занята полностью, • — есть занятые часы."
         )
         full_busy_dates, partial_busy_dates = await db.month_availability(year, month)
         rule_full, rule_partial = await _rule_month_availability(int(form["id"]), year, month)
@@ -1793,7 +1819,12 @@ async def handle_form_message(
             await send_current_form_question(bot, message.chat.id)
             return True
         parsed_date = _date_from_answer(answer)
+        if parsed_date and parsed_date < local_today():
+            await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+            await send_current_form_question(bot, message.chat.id)
+            return True
         if parsed_date and await _date_fully_busy(parsed_date.isoformat()):
+            await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
             await send_current_form_question(bot, message.chat.id)
             return True
     elif input_type == "time":
@@ -2233,6 +2264,23 @@ async def on_business_message(message: Message, bot: Bot) -> None:
         await db.mark_auto_reply(message.chat.id, now_iso)
 
 
+@router.callback_query(F.data == "public:menu")
+async def public_menu_open(callback: CallbackQuery, bot: Bot) -> None:
+    if not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+    connection_id = callback.message.business_connection_id
+    if not connection_id and is_admin(callback.from_user.id) and callback.message.chat.type == ChatType.PRIVATE:
+        connection_id = _test_connection_id(callback.from_user.id)
+    if not connection_id:
+        await callback.answer("Меню недоступно в этом чате", show_alert=True)
+        return
+    result = await _show_public_menu(
+        bot, chat_id=callback.message.chat.id, business_connection_id=str(connection_id)
+    )
+    await callback.answer("Меню открыто" if result else "Не удалось открыть меню", show_alert=result is None)
+
+
 @router.callback_query(F.data.startswith("pub:"))
 async def on_public_button(callback: CallbackQuery, bot: Bot) -> None:
     if not callback.data:
@@ -2248,8 +2296,14 @@ async def on_public_button(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Эта кнопка больше недоступна", show_alert=True)
         return
 
-    if not isinstance(callback.message, Message) or not callback.message.business_connection_id:
-        await callback.answer("Не удалось определить бизнес-чат", show_alert=True)
+    if not isinstance(callback.message, Message):
+        await callback.answer("Не удалось определить чат", show_alert=True)
+        return
+    connection_id = callback.message.business_connection_id
+    if not connection_id and is_admin(callback.from_user.id) and callback.message.chat.type == ChatType.PRIVATE:
+        connection_id = _test_connection_id(callback.from_user.id)
+    if not connection_id:
+        await callback.answer("Клиентское меню доступно в Business-чате или администратору в /test.", show_alert=True)
         return
 
     try:
@@ -2257,7 +2311,7 @@ async def on_public_button(callback: CallbackQuery, bot: Bot) -> None:
         if form:
             await db.start_form_session(
                 chat_id=callback.message.chat.id,
-                business_connection_id=callback.message.business_connection_id,
+                business_connection_id=str(connection_id),
                 form_id=int(form["id"]),
                 user_id=callback.from_user.id,
                 username=callback.from_user.username,
@@ -2265,18 +2319,23 @@ async def on_public_button(callback: CallbackQuery, bot: Bot) -> None:
                 last_name=callback.from_user.last_name,
                 form_message_id=callback.message.message_id,
             )
-            await db.mark_button_click(callback.message.chat.id, utc_now_iso())
+            if not _is_test_connection(str(connection_id)):
+                await db.mark_button_click(callback.message.chat.id, utc_now_iso())
             await send_current_form_question(bot, callback.message.chat.id)
             await callback.answer("Открываю заявку")
             return
 
+        business_id = _telegram_business_id(str(connection_id))
+        business_kwargs = {"business_connection_id": business_id} if business_id else {}
         await bot.send_message(
             chat_id=callback.message.chat.id,
-            business_connection_id=callback.message.business_connection_id,
             text=button["response"],
             parse_mode=None,
+            reply_markup=public_menu_button(),
+            **business_kwargs,
         )
-        await db.mark_button_click(callback.message.chat.id, utc_now_iso())
+        if not _is_test_connection(str(connection_id)):
+            await db.mark_button_click(callback.message.chat.id, utc_now_iso())
         await callback.answer("Принято")
     except TelegramAPIError:
         logger.exception("Ошибка ответа на business callback")
@@ -2292,6 +2351,11 @@ async def on_public_button(callback: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(F.data == "cal:noop")
 async def calendar_noop(callback: CallbackQuery) -> None:
     await callback.answer()
+
+
+@router.callback_query(F.data == "cal:past")
+async def calendar_past(callback: CallbackQuery) -> None:
+    await callback.answer("Нельзя выбрать дату раньше сегодняшней.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("cal:busy:"))
@@ -2381,6 +2445,9 @@ async def calendar_select_day(callback: CallbackQuery, bot: Bot) -> None:
     if not data or not isinstance(callback.message, Message):
         return
     session, question = data
+    if selected_date < local_today():
+        await callback.answer("Нельзя выбрать дату раньше сегодняшней.", show_alert=True)
+        return
     if await _date_fully_busy(selected_date.isoformat()):
         await callback.answer("Эта дата полностью занята", show_alert=True)
         return
@@ -2613,7 +2680,7 @@ async def guest_count_pick(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "form:menu")
 async def form_main_menu(callback: CallbackQuery, bot: Bot) -> None:
-    if not isinstance(callback.message, Message) or not callback.message.business_connection_id:
+    if not isinstance(callback.message, Message):
         await callback.answer("Не удалось открыть меню", show_alert=True)
         return
 
@@ -2622,11 +2689,17 @@ async def form_main_menu(callback: CallbackQuery, bot: Bot) -> None:
         if int(session["form_message_id"]) != int(callback.message.message_id):
             await callback.answer("Это старая кнопка формы", show_alert=True)
             return
+    connection_id = (session or {}).get("business_connection_id") or callback.message.business_connection_id
+    if not connection_id and is_admin(callback.from_user.id):
+        connection_id = _test_connection_id(callback.from_user.id)
+    if not connection_id:
+        await callback.answer("Не удалось открыть меню", show_alert=True)
+        return
 
     menu_message_id = await _show_public_menu(
         bot,
         chat_id=callback.message.chat.id,
-        business_connection_id=callback.message.business_connection_id,
+        business_connection_id=str(connection_id),
         edit_message_id=callback.message.message_id,
     )
     if menu_message_id is None:
@@ -2804,6 +2877,20 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             await send_current_form_question(bot, callback.message.chat.id)
             return
 
+    for index, question in enumerate(questions):
+        if _question_input_type(question) != "date":
+            continue
+        selected_date = _date_from_answer(session["answers"].get(str(question["id"])))
+        if selected_date and selected_date < local_today():
+            await db.update_form_session(
+                callback.message.chat.id, current_index=index, status="active"
+            )
+            await callback.answer(
+                "Дата уже прошла. Выберите сегодняшнюю или будущую дату.", show_alert=True
+            )
+            await send_current_form_question(bot, callback.message.chat.id)
+            return
+
     booking_interval = _booking_interval(questions, session["answers"])
     rule_violation = await advanced.booking_rule_violation(int(form["id"]), booking_interval) if booking_interval else None
     if rule_violation:
@@ -2846,6 +2933,26 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             for item in selected_addons
         ],
     }
+    if _is_test_session(session):
+        preview = _form_preview_text(
+            form, questions, session["answers"], pricing_calculation, selected_addons, currency
+        ).replace(
+            "Если всё верно, нажмите «Отправить заявку».",
+            "✅ Тест завершён. Реальная заявка не создана и в CRM ничего не добавлено.",
+        )
+        test_markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🧪 Ещё тест", callback_data="adm:test")],
+                [InlineKeyboardButton(text="↩️ В админку", callback_data="adm:home")],
+            ]
+        )
+        await _upsert_form_message(
+            bot, session, text="🧪 ТЕСТОВЫЙ РЕЖИМ\n\n" + preview, reply_markup=test_markup
+        )
+        await db.delete_form_session(callback.message.chat.id)
+        await callback.answer("Тест завершён — заявка не создана")
+        return
+
     submission_id = await db.create_form_submission(
         session,
         str(form["name"]),
@@ -2859,7 +2966,7 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             submission_id, form, questions, session["answers"], pricing_calculation,
             selected_addons, currency
         ),
-        reply_markup=None,
+        reply_markup=public_menu_button(),
     )
     await db.delete_form_session(callback.message.chat.id)
     await callback.answer("Заявка сохранена в этом чате")
@@ -2870,7 +2977,43 @@ async def admin_start(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id if message.from_user else None):
         return
     await state.clear()
+    await db.delete_form_session(message.chat.id)
     await show_admin_home_message(message)
+
+
+async def _open_admin_test_menu(bot: Bot, chat_id: int, *, edit_message_id: int | None = None) -> int | None:
+    await db.delete_form_session(chat_id)
+    return await _show_public_menu(
+        bot,
+        chat_id=chat_id,
+        business_connection_id=_test_connection_id(chat_id),
+        text=(
+            "🧪 ТЕСТОВЫЙ РЕЖИМ\n\n"
+            "Вы видите клиентское меню. Можно пройти формы, календарь, тарифы и услуги. "
+            "При финальной отправке реальная заявка не создаётся."
+        ),
+        edit_message_id=edit_message_id,
+    )
+
+
+@router.message(Command("test", "menu"))
+async def admin_test_command(message: Message, state: FSMContext, bot: Bot) -> None:
+    if message.chat.type != ChatType.PRIVATE or not is_admin(message.from_user.id if message.from_user else None):
+        return
+    await state.clear()
+    await _open_admin_test_menu(bot, message.chat.id)
+
+
+@router.callback_query(F.data == "adm:test")
+async def admin_test_callback(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not is_admin(callback.from_user.id) or not isinstance(callback.message, Message):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    result = await _open_admin_test_menu(
+        bot, callback.message.chat.id, edit_message_id=callback.message.message_id
+    )
+    await callback.answer("Тестовый режим" if result else "Не удалось открыть тест", show_alert=result is None)
 
 
 @router.callback_query(F.data == "adm:home")
@@ -4978,6 +5121,21 @@ async def admin_stats(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@router.message()
+async def admin_test_message(message: Message, bot: Bot) -> None:
+    if message.chat.type != ChatType.PRIVATE or not is_admin(message.from_user.id if message.from_user else None):
+        return
+    session = await db.get_form_session(message.chat.id)
+    if not _is_test_session(session):
+        return
+    if await is_menu_trigger(message.text):
+        await _open_admin_test_menu(bot, message.chat.id)
+        return
+    await handle_form_message(
+        message, bot, session, can_delete_all_messages=False
+    )
+
+
 async def main() -> None:
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
@@ -5055,9 +5213,15 @@ async def main() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="admin", description="Открыть админ-панель"),
-            BotCommand(command="start", description="Открыть меню"),
+            BotCommand(command="test", description="Тестировать клиентский сценарий"),
+            BotCommand(command="menu", description="Открыть клиентское меню"),
+            BotCommand(command="start", description="Открыть админ-панель"),
         ]
     )
+    # Telegram system Menu Button is available in a direct chat with the bot.
+    # Business chats with the Premium account do not expose the bot's system menu button,
+    # therefore those chats also receive an inline «☰ Меню» button on final responses.
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
     me = await bot.get_me()
     logger.info(
