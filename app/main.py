@@ -316,6 +316,69 @@ SUBMISSION_STATUS_NAMES = {
 BOOKING_STATUSES = {"confirmed", "paid", "completed"}
 
 
+def _submission_status_notification_text(submission: dict, new_status: str) -> str:
+    """Build a concise client-facing status update for the same Business chat."""
+    submission_id = int(submission["id"])
+    form_name = str(submission.get("form_name") or "Заявка")
+    status_text = SUBMISSION_STATUS_NAMES.get(new_status, new_status)
+
+    specific = {
+        "new": "Заявка снова отмечена как новая.",
+        "in_progress": "Заявка взята в работу.",
+        "confirmed": "Заявка подтверждена.",
+        "paid": "Оплата по заявке отмечена как полученная.",
+        "completed": "Заявка завершена. Спасибо!",
+        "cancelled": "По заявке установлен статус «Отказ».",
+    }.get(new_status, f"Статус заявки изменён: {status_text}.")
+
+    return (
+        f"🔔 Статус заявки №{submission_id}\n\n"
+        f"{form_name}\n"
+        f"{status_text}\n\n"
+        f"{specific}\n"
+        "Если есть вопросы, просто ответьте в этом чате."
+    )
+
+
+async def _notify_submission_status_change(
+    bot: Bot, submission: dict, new_status: str
+) -> tuple[bool, str | None]:
+    """Notify the customer in the original Telegram Business dialog.
+
+    Returns (sent, error_reason). Old submissions created before v1.4 may not
+    contain business_connection_id, so for a single-account installation we
+    fall back to the latest active Business connection.
+    """
+    chat_id = submission.get("chat_id")
+    if not chat_id:
+        return False, "у заявки нет chat_id"
+
+    business_connection_id = submission.get("business_connection_id")
+    if not business_connection_id:
+        connection = await db.latest_business_connection()
+        if connection and connection.get("enabled") and connection.get("can_reply"):
+            business_connection_id = connection.get("id")
+
+    if not business_connection_id:
+        return False, "не найдено Business-соединение"
+
+    try:
+        await bot.send_message(
+            chat_id=int(chat_id),
+            business_connection_id=str(business_connection_id),
+            text=_submission_status_notification_text(submission, new_status),
+            parse_mode=None,
+        )
+        return True, None
+    except TelegramAPIError as exc:
+        logger.exception(
+            "Не удалось уведомить клиента о статусе заявки %s -> %s",
+            submission.get("id"),
+            new_status,
+        )
+        return False, str(exc)
+
+
 async def _submission_admin_text(submission: dict) -> str:
     full_name = " ".join(
         part for part in [submission.get("first_name"), submission.get("last_name")] if part
@@ -2222,7 +2285,7 @@ async def admin_request_open(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("adm:req_status:"))
-async def admin_request_status(callback: CallbackQuery) -> None:
+async def admin_request_status(callback: CallbackQuery, bot: Bot) -> None:
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
@@ -2238,6 +2301,10 @@ async def admin_request_status(callback: CallbackQuery) -> None:
     submission = await db.get_submission(submission_id)
     if not submission:
         await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    old_status = str(submission.get("status") or "new")
+    if old_status == new_status:
+        await callback.answer(f"Статус уже: {SUBMISSION_STATUS_NAMES[new_status]}")
         return
     questions = await db.list_form_questions(int(submission["form_id"])) if submission.get("form_id") else []
     slot = _extract_booking_slot(questions, submission.get("answers") or {}) if questions else None
@@ -2263,13 +2330,32 @@ async def admin_request_status(callback: CallbackQuery) -> None:
         )
     else:
         await db.delete_submission_availability(submission_id)
-    submission = await db.get_submission(submission_id)
-    if isinstance(callback.message, Message) and submission:
+    updated_submission = await db.get_submission(submission_id)
+    if isinstance(callback.message, Message) and updated_submission:
         await callback.message.edit_text(
-            await _submission_admin_text(submission),
-            reply_markup=admin_submission_card(submission),
+            await _submission_admin_text(updated_submission),
+            reply_markup=admin_submission_card(updated_submission),
         )
-    await callback.answer(SUBMISSION_STATUS_NAMES[new_status])
+
+    notified = False
+    notification_error: str | None = None
+    if updated_submission:
+        notified, notification_error = await _notify_submission_status_change(
+            bot, updated_submission, new_status
+        )
+
+    if notified:
+        await callback.answer(
+            f"{SUBMISSION_STATUS_NAMES[new_status]} · клиент уведомлён"
+        )
+    else:
+        reason = notification_error or "неизвестная ошибка"
+        if len(reason) > 120:
+            reason = reason[:117] + "..."
+        await callback.answer(
+            f"Статус сохранён, но клиент не уведомлён: {reason}",
+            show_alert=True,
+        )
 
 
 @router.callback_query(F.data == "adm:availability")

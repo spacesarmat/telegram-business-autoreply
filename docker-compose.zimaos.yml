@@ -70,8 +70,8 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.4.0"
+  version: "1.4.1"
   update_at: "2026-09-20"
   release_notes:
-    en_US: Adds booking availability, time-slot selection, automatic conflict checks, and an admin mini-CRM with request statuses.
-    ru_RU: Добавлены занятость дат и времени, выбор свободного времени, проверка конфликтов и мини-CRM заявок со статусами.
+    en_US: Customers now receive a Telegram Business message in the original chat whenever an admin changes a request status.
+    ru_RU: При изменении статуса заявки клиент получает уведомление в исходном личном Telegram Business-чате.
