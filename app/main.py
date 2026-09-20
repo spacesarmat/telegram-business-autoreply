@@ -17,6 +17,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message
 
+from .backup import BackupManager
 from .config import Settings, load_settings
 from .concurrency import ConcurrencyMiddleware, UpdateConcurrencyGuard
 from .db import DEFAULT_STATUS_TEMPLATES, Database, utc_now_iso
@@ -54,6 +55,7 @@ from .keyboards import (
     public_menu,
     time_slots_keyboard,
 )
+from .reminders import ReminderService
 from .states import AdminStates
 from .web_admin import start_web_admin
 
@@ -556,6 +558,25 @@ def _booking_interval(
         "duration_minutes": duration_minutes,
         "segments": segments,
     }
+
+
+async def _resolve_submission_booking_start(submission: dict) -> datetime | None:
+    """Resolve the customer's booked start time in the configured business timezone."""
+    form_id = submission.get("form_id")
+    if not form_id:
+        return None
+    questions = await db.list_form_questions(int(form_id))
+    interval = _booking_interval(questions, submission.get("answers") or {})
+    if not interval or not interval.get("date_iso") or not interval.get("start_time"):
+        return None
+    try:
+        booked_date = datetime.strptime(str(interval["date_iso"]), "%Y-%m-%d").date()
+        hour, minute = [int(x) for x in str(interval["start_time"]).split(":", 1)]
+    except (ValueError, TypeError):
+        return None
+    return datetime.combine(booked_date, datetime.min.time()).replace(
+        hour=hour, minute=minute, tzinfo=APP_TIMEZONE
+    )
 
 
 def _segments_for_datetime_range(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str, str]]:
@@ -4761,6 +4782,16 @@ async def main() -> None:
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    backup_manager = BackupManager(db, settings.backup_dir, APP_TIMEZONE)
+    reminder_service = ReminderService(
+        db=db,
+        bot=bot,
+        timezone=APP_TIMEZONE,
+        admin_ids=settings.admin_ids,
+        resolve_booking_start=_resolve_submission_booking_start,
+    )
+    backup_manager.start()
+    reminder_service.start()
 
     async def web_status_change(submission_id: int, new_status: str) -> tuple[bool, str]:
         return await _apply_submission_status_change(bot, submission_id, new_status, None)
@@ -4777,6 +4808,8 @@ async def main() -> None:
         on_status_change=web_status_change,
         on_amount_change=web_amount_change,
         concurrency_snapshot=concurrency_guard.snapshot,
+        backup_manager=backup_manager,
+        reminder_service=reminder_service,
     )
     dp = Dispatcher(storage=MemoryStorage())
     concurrency_middleware = ConcurrencyMiddleware(concurrency_guard)
@@ -4808,6 +4841,8 @@ async def main() -> None:
             allowed_updates=dp.resolve_used_update_types(),
         )
     finally:
+        await reminder_service.close()
+        await backup_manager.close()
         await web_server.close()
         await web_server.wait_closed()
         await bot.session.close()

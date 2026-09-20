@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
@@ -20,6 +21,26 @@ DEFAULT_SETTINGS = {
     "booking_slot_minutes": "60",
     "booking_max_duration_hours": "18",
     "crm_currency": "₽",
+    "backups_enabled": "1",
+    "backup_hour_local": "4",
+    "backup_retention": "30",
+    "reminders_enabled": "0",
+    "reminder_client_hours": "168,24,3",
+    "reminder_admin_hours": "168,24,3",
+    "reminder_grace_hours": "6",
+    "reminder_client_template": (
+        "⏰ Напоминание о заявке №{id}\n\n"
+        "{form}\n{date} · {time}\n\n"
+        "До начала осталось около {hours_before} ч.\n"
+        "Стоимость: {amount}\nПредоплата: {prepayment}\nОстаток: {balance}\n\n"
+        "Если планы изменились, ответьте в этом чате."
+    ),
+    "reminder_admin_template": (
+        "⏰ Скоро мероприятие · заявка №{id}\n\n"
+        "{form}\nКлиент: {client}\n{date} · {time}\n"
+        "До начала: ~{hours_before} ч.\n"
+        "Стоимость: {amount} · предоплата: {prepayment} · остаток: {balance}"
+    ),
     "greeting": (
         "Здравствуйте! Спасибо за сообщение.\n\n"
         "Я отвечаю автоматически, если вы пишете впервые или после длительного перерыва. "
@@ -189,6 +210,40 @@ def _decode_int_list(raw: str | None) -> list[int]:
 class Database:
     def __init__(self, path: str):
         self.path = path
+        # Normal DB connections may work concurrently.  A restore operation
+        # raises a maintenance gate, waits for active connections to finish and
+        # temporarily blocks new ones, so an SQLite backup can be restored safely.
+        self._gate = asyncio.Condition()
+        self._maintenance = False
+        self._active_connections = 0
+
+    async def _connection_enter(self) -> None:
+        async with self._gate:
+            while self._maintenance:
+                await self._gate.wait()
+            self._active_connections += 1
+
+    async def _connection_leave(self) -> None:
+        async with self._gate:
+            self._active_connections = max(0, self._active_connections - 1)
+            if self._active_connections == 0:
+                self._gate.notify_all()
+
+    @asynccontextmanager
+    async def exclusive_maintenance(self) -> AsyncIterator[None]:
+        """Block new DB connections and wait for active ones to finish."""
+        async with self._gate:
+            while self._maintenance:
+                await self._gate.wait()
+            self._maintenance = True
+            while self._active_connections:
+                await self._gate.wait()
+        try:
+            yield
+        finally:
+            async with self._gate:
+                self._maintenance = False
+                self._gate.notify_all()
 
     @staticmethod
     def infer_question_input_type(label: str) -> str:
@@ -205,14 +260,20 @@ class Database:
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[aiosqlite.Connection]:
-        db = await aiosqlite.connect(self.path)
-        db.row_factory = aiosqlite.Row
+        await self._connection_enter()
+        db: aiosqlite.Connection | None = None
         try:
+            db = await aiosqlite.connect(self.path)
+            db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA busy_timeout=5000")
             await db.execute("PRAGMA foreign_keys=ON")
             yield db
         finally:
-            await db.close()
+            try:
+                if db is not None:
+                    await db.close()
+            finally:
+                await self._connection_leave()
 
     async def init(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -377,6 +438,23 @@ class Database:
                     admin_user_id INTEGER,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(submission_id) REFERENCES form_submissions(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS reminder_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id INTEGER NOT NULL,
+                    recipient_key TEXT NOT NULL,
+                    hours_before INTEGER NOT NULL,
+                    due_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at TEXT,
+                    sent_at TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(submission_id) REFERENCES form_submissions(id) ON DELETE CASCADE,
+                    UNIQUE(submission_id, recipient_key, hours_before, due_at)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_form_questions_form_position
@@ -604,6 +682,14 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_form_addons_form_position "
                 "ON form_addons(form_id, position, id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reminder_deliveries_submission "
+                "ON reminder_deliveries(submission_id, created_at DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reminder_deliveries_status "
+                "ON reminder_deliveries(status, due_at)"
             )
             await db.execute(
                 """
@@ -1701,6 +1787,89 @@ class Database:
             if str(start_time) < str(b_end) and str(end_time) > str(b_start):
                 return True
         return False
+
+    async def list_booking_submissions(
+        self, limit: int = 1000, statuses: tuple[str, ...] = ("confirmed", "paid")
+    ) -> list[dict[str, Any]]:
+        """Booking submissions for reminders/calendar, decoded from JSON fields."""
+        allowed = {"confirmed", "paid", "completed"}
+        selected = tuple(status for status in statuses if status in allowed) or ("confirmed", "paid")
+        placeholders = ",".join("?" for _ in selected)
+        async with self.connection() as db:
+            rows = await (
+                await db.execute(
+                    f"SELECT * FROM form_submissions WHERE status IN ({placeholders}) "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (*selected, max(1, min(int(limit), 5000))),
+                )
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                item["answers"] = _decode_answers(item.get("answers_json"))
+                try:
+                    item["pricing_details"] = json.loads(item.get("pricing_details_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    item["pricing_details"] = {}
+                item["selected_addon_ids"] = _decode_int_list(item.get("selected_addons_json"))
+                result.append(item)
+            return result
+
+    async def get_reminder_delivery(
+        self, submission_id: int, recipient_key: str, hours_before: int, due_at: str
+    ) -> dict[str, Any] | None:
+        async with self.connection() as db:
+            row = await (
+                await db.execute(
+                    "SELECT * FROM reminder_deliveries "
+                    "WHERE submission_id=? AND recipient_key=? AND hours_before=? AND due_at=?",
+                    (submission_id, recipient_key, hours_before, due_at),
+                )
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def record_reminder_delivery(
+        self, submission_id: int, recipient_key: str, hours_before: int, due_at: str,
+        status: str, error: str | None = None
+    ) -> None:
+        if status not in {"pending", "sent", "failed", "missed"}:
+            raise ValueError("Unsupported reminder status")
+        now = utc_now_iso()
+        sent_at = now if status == "sent" else None
+        async with self.connection() as db:
+            await db.execute(
+                """
+                INSERT INTO reminder_deliveries(
+                    submission_id, recipient_key, hours_before, due_at, status, attempts,
+                    last_attempt_at, sent_at, error, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                ON CONFLICT(submission_id, recipient_key, hours_before, due_at) DO UPDATE SET
+                    status=excluded.status,
+                    attempts=reminder_deliveries.attempts + 1,
+                    last_attempt_at=excluded.last_attempt_at,
+                    sent_at=COALESCE(reminder_deliveries.sent_at, excluded.sent_at),
+                    error=excluded.error,
+                    updated_at=excluded.updated_at
+                """,
+                (submission_id, recipient_key, hours_before, due_at, status, now, sent_at,
+                 (error or "")[:1000] or None, now, now),
+            )
+            await db.commit()
+
+    async def list_reminder_deliveries(self, limit: int = 100) -> list[dict[str, Any]]:
+        async with self.connection() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT r.*, s.form_name, s.first_name, s.last_name, s.username
+                    FROM reminder_deliveries r
+                    JOIN form_submissions s ON s.id=r.submission_id
+                    ORDER BY r.updated_at DESC, r.id DESC LIMIT ?
+                    """,
+                    (max(1, min(int(limit), 1000)),),
+                )
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     async def stats(self) -> dict[str, int]:
         async with self.connection() as db:

@@ -23,6 +23,7 @@ services:
       WEB_ADMIN_USERNAME: "admin"
       WEB_ADMIN_PASSWORD: "PASTE_STRONG_WEB_ADMIN_PASSWORD_HERE"
       MAX_CONCURRENT_UPDATES: "32"
+      BACKUP_DIR: /data/backups
     labels:
       icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/telegram.png
     network_mode: bridge
@@ -54,12 +55,12 @@ x-casaos:
     en_US: >
       Telegram Business auto-reply assistant for a Premium/Business account.
       Replies to first-time or returning contacts, shows configurable inline
-      buttons, stores settings in SQLite, and is administered directly in Telegram.
+      buttons, stores settings in SQLite, and includes Telegram + Web administration.
     ru_RU: >
       Автоответчик Telegram Business для Premium/Business-аккаунта. Отвечает
       пользователям при первом обращении или после длительного перерыва, показывает
-      настраиваемые inline-кнопки, хранит настройки в SQLite и администрируется
-      непосредственно через Telegram.
+      настраиваемые inline-кнопки, хранит настройки в SQLite и поддерживает
+      администрирование через Telegram и Web Admin.
   developer: spacesarmat
   icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/telegram.png
   id: io.github.spacesarmat.telegram-business-autoreply
@@ -73,12 +74,12 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.8.2"
+  version: "1.9.0"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      Concurrency safety: per-chat queues, idempotent form submission, duplicate callback
-      protection, a global update limit and live queue metrics in Telegram/Web Admin.
+      Web calendar, automatic SQLite backups with restore, and configurable customer/admin
+      booking reminders with delivery history.
     ru_RU: >
-      Защита от гонок: очередь на каждый чат, идемпотентная отправка заявки, защита от
-      двойных нажатий, общий лимит параллельных updates и мониторинг очереди в админках.
+      Календарь в Web Admin, автоматические резервные копии SQLite с восстановлением и
+      настраиваемые напоминания клиентам/администраторам с историей доставки.

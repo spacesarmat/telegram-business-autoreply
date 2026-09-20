@@ -29,6 +29,7 @@ class Settings:
     web_admin_username: str
     web_admin_password: str
     max_concurrent_updates: int
+    backup_dir: str
 
 
 def load_settings() -> Settings:
@@ -65,4 +66,5 @@ def load_settings() -> Settings:
         web_admin_username=os.getenv("WEB_ADMIN_USERNAME", "admin").strip() or "admin",
         web_admin_password=os.getenv("WEB_ADMIN_PASSWORD", "").strip(),
         max_concurrent_updates=max_concurrent_updates,
+        backup_dir=os.getenv("BACKUP_DIR", "/data/backups").strip() or "/data/backups",
     )
