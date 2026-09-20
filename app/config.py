@@ -26,6 +26,8 @@ class Settings:
     log_level: str
     status_port: int
     timezone_name: str
+    web_admin_username: str
+    web_admin_password: str
 
 
 def load_settings() -> Settings:
@@ -52,4 +54,6 @@ def load_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         status_port=int(os.getenv("STATUS_PORT", "8080")),
         timezone_name=timezone_name,
+        web_admin_username=os.getenv("WEB_ADMIN_USERNAME", "admin").strip() or "admin",
+        web_admin_password=os.getenv("WEB_ADMIN_PASSWORD", "").strip(),
     )

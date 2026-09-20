@@ -20,6 +20,8 @@ services:
       LOG_LEVEL: INFO
       STATUS_PORT: "8080"
       TZ: Europe/Moscow
+      WEB_ADMIN_USERNAME: "admin"
+      WEB_ADMIN_PASSWORD: "PASTE_STRONG_WEB_ADMIN_PASSWORD_HERE"
     labels:
       icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/telegram.png
     network_mode: bridge
@@ -70,12 +72,10 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.7.1"
+  version: "1.8.0"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      Guest count is now selected from predefined ranges, and customers are notified
-      when an administrator manually changes the final request price.
+      Web administration panel with login, dashboard, requests, CRM fields, pricing, add-ons, availability, forms, menu buttons and core bot settings.
     ru_RU: >
-      Количество гостей выбирается из готовых диапазонов, а при ручном изменении
-      итоговой стоимости администратором заказчик получает уведомление в исходном чате.
+      Веб-админка с авторизацией: заявки, CRM, тарифы, допуслуги, занятость, формы, кнопки меню и основные настройки бота.

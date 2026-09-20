@@ -46,3 +46,16 @@ After that, every push to `main` rebuilds `latest` for `linux/amd64` and `linux/
 
 Новых GitHub Secrets или переменных окружения не требуется. После обновления существующие стандартные вопросы **«Количество гостей»** автоматически мигрируют на тип с диапазонами. При ручном изменении стоимости из карточки заявки бот использует сохранённый `business_connection_id` и уведомляет клиента в исходном Business-чате.
 
+
+## Web Admin (v1.8.0)
+
+Для включения веб-админки задайте в ZimaOS/CasaOS окружение:
+
+```env
+WEB_ADMIN_USERNAME=admin
+WEB_ADMIN_PASSWORD=your-strong-password-here
+```
+
+После запуска откройте `http://IP_ZIMAOS:18080/admin`. Пароль должен быть не короче 10 символов. Заглушка `PASTE_STRONG_WEB_ADMIN_PASSWORD_HERE` намеренно отключает панель, пока вы не замените её. `/health` остаётся публичным для Docker healthcheck.
+
+Не публикуйте порт 18080 напрямую в интернет без HTTPS/reverse proxy.

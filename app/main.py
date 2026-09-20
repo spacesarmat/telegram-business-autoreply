@@ -52,7 +52,7 @@ from .keyboards import (
     time_slots_keyboard,
 )
 from .states import AdminStates
-from .status import start_status_server
+from .web_admin import start_web_admin
 
 logger = logging.getLogger(__name__)
 
@@ -3913,6 +3913,96 @@ async def admin_request_open(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+
+async def _apply_submission_status_change(
+    bot: Bot,
+    submission_id: int,
+    new_status: str,
+    admin_user_id: int | None = None,
+) -> tuple[bool, str]:
+    """Change request status from Telegram or Web Admin with identical booking logic."""
+    if new_status not in SUBMISSION_STATUS_NAMES:
+        return False, "Неизвестный статус"
+    submission = await db.get_submission(submission_id)
+    if not submission:
+        return False, "Заявка не найдена"
+    old_status = str(submission.get("status") or "new")
+    if old_status == new_status:
+        return True, f"Статус уже: {SUBMISSION_STATUS_NAMES[new_status]}"
+
+    questions = (
+        await db.list_form_questions(int(submission["form_id"]))
+        if submission.get("form_id") else []
+    )
+    interval = _booking_interval(questions, submission.get("answers") or {}) if questions else None
+    if new_status in BOOKING_STATUSES and interval:
+        if await _booking_interval_conflicts_for_form(
+            int(submission["form_id"]), interval, exclude_submission_id=submission_id
+        ):
+            return False, "Интервал пересекается с занятой бронью"
+
+    await db.update_submission_status(submission_id, new_status, admin_user_id)
+    if new_status in BOOKING_STATUSES and interval:
+        pricing = await db.get_form_pricing(int(submission["form_id"]))
+        buffered = _booking_interval_with_buffers(
+            interval,
+            int(pricing.get("buffer_before_minutes") or 0),
+            int(pricing.get("buffer_after_minutes") or 0),
+        )
+        segments = (buffered or {}).get("technical_segments") or interval["segments"]
+        before = int(pricing.get("buffer_before_minutes") or 0)
+        after = int(pricing.get("buffer_after_minutes") or 0)
+        buffer_note = ""
+        if before or after:
+            buffer_note = f" · буфер -{_duration_minutes_text(before)} / +{_duration_minutes_text(after)}"
+        await db.replace_submission_availability(
+            submission_id,
+            segments,
+            note=f"Заявка №{submission_id}: {submission['form_name']}{buffer_note}",
+        )
+    else:
+        await db.delete_submission_availability(submission_id)
+
+    updated = await db.get_submission(submission_id)
+    if not updated:
+        return True, f"{SUBMISSION_STATUS_NAMES[new_status]}"
+    notified, error = await _notify_submission_status_change(bot, updated, new_status)
+    if notified:
+        return True, f"{SUBMISSION_STATUS_NAMES[new_status]} · клиент уведомлён"
+    return True, f"Статус сохранён, но клиент не уведомлён: {(error or 'неизвестная ошибка')[:160]}"
+
+
+async def _apply_submission_amount_change(
+    bot: Bot,
+    submission_id: int,
+    new_amount: int,
+    admin_user_id: int | None = None,
+) -> tuple[bool, str]:
+    """Update total amount and notify the customer. The DB update is authoritative."""
+    submission = await db.get_submission(submission_id)
+    if not submission:
+        return False, "Заявка не найдена"
+    new_amount = max(0, int(new_amount))
+    prepayment = max(0, int(submission.get("prepayment_amount") or 0))
+    if new_amount and prepayment > new_amount:
+        return False, "Стоимость не может быть меньше предоплаты"
+    old_amount = max(0, int(submission.get("total_amount") or 0))
+    if old_amount == new_amount:
+        return True, "Стоимость не изменилась"
+    await db.update_submission_crm_field(
+        submission_id, "total_amount", new_amount, admin_user_id
+    )
+    updated = await db.get_submission(submission_id)
+    if not updated:
+        return True, "Стоимость сохранена"
+    notified, error = await _notify_submission_amount_change(
+        bot, updated, old_amount, new_amount
+    )
+    if notified:
+        return True, "Стоимость обновлена · клиент уведомлён"
+    return True, f"Стоимость обновлена, но клиент не уведомлён: {(error or 'неизвестная ошибка')[:160]}"
+
+
 @router.callback_query(F.data.startswith("adm:req_status:"))
 async def admin_request_status(callback: CallbackQuery, bot: Bot) -> None:
     if not is_admin(callback.from_user.id):
@@ -4453,11 +4543,26 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     await db.init()
-    status_server = await start_status_server(settings.status_port)
 
     bot = Bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    async def web_status_change(submission_id: int, new_status: str) -> tuple[bool, str]:
+        return await _apply_submission_status_change(bot, submission_id, new_status, None)
+
+    async def web_amount_change(submission_id: int, new_amount: int) -> tuple[bool, str]:
+        return await _apply_submission_amount_change(bot, submission_id, new_amount, None)
+
+    web_server = await start_web_admin(
+        port=settings.status_port,
+        db=db,
+        timezone=APP_TIMEZONE,
+        username=settings.web_admin_username,
+        password=settings.web_admin_password,
+        on_status_change=web_status_change,
+        on_amount_change=web_amount_change,
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
@@ -4484,8 +4589,8 @@ async def main() -> None:
             allowed_updates=dp.resolve_used_update_types(),
         )
     finally:
-        status_server.close()
-        await status_server.wait_closed()
+        await web_server.close()
+        await web_server.wait_closed()
         await bot.session.close()
 
 
