@@ -1,5 +1,11 @@
 # Telegram Business AutoReply для Premium / ZimaOS
 
+## v1.5.1 — GitHub Actions на Node 24
+
+Workflow публикации GHCR обновлён до актуальных major-версий GitHub/Docker Actions с runtime **Node 24**. Это убирает предупреждение GitHub о deprecated Node 20 и сохраняет прежнюю multi-arch сборку `linux/amd64` + `linux/arm64`.
+
+Обновлены `actions/checkout` до `v5`, `docker/setup-qemu-action` до `v4`, `docker/setup-buildx-action` до `v4`, `docker/login-action` до `v4`, `docker/metadata-action` до `v6` и `docker/build-push-action` до `v7`. Настройки GHCR, теги `latest`/`v*`/`sha-*` и GitHub Actions cache остаются прежними.
+
 ## v1.5.0 — расширенная мини-CRM
 
 В карточке заявки появились **стоимость, предоплата, остаток и внутренняя заметка администратора**. Добавлены **поиск заявок и клиентов** по номеру заявки, имени, username, телефону и содержимому формы, а также **история клиента** с предыдущими заявками и журналом последних изменений текущей заявки.
@@ -219,7 +225,7 @@ ghcr.io/spacesarmat/tgautoreply:latest
    - `PASTE_YOUR_TELEGRAM_USER_ID_HERE` — на Telegram user ID администратора.
 6. Импортируйте YAML в ZimaOS/CasaOS и запустите приложение.
 
-Локальная сборка на ZimaOS больше не требуется. При каждом push в `main` GitHub Actions пересобирает тег `latest`; теги вида `v1.5.0` также публикуются как отдельные версии образа.
+Локальная сборка на ZimaOS больше не требуется. При каждом push в `main` GitHub Actions пересобирает тег `latest`; теги вида `v1.5.1` также публикуются как отдельные версии образа.
 
 Данные SQLite сохраняются в:
 

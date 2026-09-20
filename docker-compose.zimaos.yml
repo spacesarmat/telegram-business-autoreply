@@ -70,12 +70,10 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.5.0"
+  version: "1.5.1"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      Mini-CRM upgrade with request amounts, prepayments, internal notes, client history,
-      search and editable status notification templates.
+      GitHub Actions updated to Node 24-compatible major versions for checkout and Docker build/publish actions.
     ru_RU: >
-      Мини-CRM: стоимость и предоплата, внутренние заметки, история клиента,
-      поиск и редактируемые шаблоны уведомлений о статусах.
+      GitHub Actions обновлены до major-версий с Node 24 для checkout и сборки/публикации Docker-образа.

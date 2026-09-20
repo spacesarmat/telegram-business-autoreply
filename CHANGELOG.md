@@ -2,6 +2,19 @@
 
 Все значимые изменения Telegram Business AutoReply.
 
+## [1.5.1] — 2026-09-20
+
+### Изменено
+
+- GitHub Actions переведены с Node 20-зависимых major-версий на Node 24-compatible версии.
+- `actions/checkout`: `v4` → `v5`.
+- `docker/setup-qemu-action`: `v3` → `v4`.
+- `docker/setup-buildx-action`: `v3` → `v4`.
+- `docker/login-action`: `v3` → `v4`.
+- `docker/metadata-action`: `v5` → `v6`.
+- `docker/build-push-action`: `v6` → `v7`.
+- Multi-arch публикация GHCR, теги и GitHub Actions cache сохранены без изменения логики.
+
 ## [1.5.0] — 2026-09-20
 
 ### Добавлено

@@ -317,6 +317,7 @@ ghcr.io/spacesarmat/tgautoreply:latest
 - обычный Linux Docker host.
 
 Образ автоматически собирается GitHub Actions после push в `main`.
+Workflow использует Node 24-compatible версии официальных GitHub/Docker Actions и публикует multi-arch образ в GHCR.
 
 ## ❤️ Healthcheck
 
