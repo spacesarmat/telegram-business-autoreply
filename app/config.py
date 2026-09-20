@@ -28,6 +28,7 @@ class Settings:
     timezone_name: str
     web_admin_username: str
     web_admin_password: str
+    max_concurrent_updates: int
 
 
 def load_settings() -> Settings:
@@ -47,6 +48,13 @@ def load_settings() -> Settings:
             f"Некорректный TZ: {timezone_name!r}. Используйте IANA-зону, например Europe/Moscow."
         ) from exc
 
+    try:
+        max_concurrent_updates = int(os.getenv("MAX_CONCURRENT_UPDATES", "32"))
+    except ValueError as exc:
+        raise RuntimeError("MAX_CONCURRENT_UPDATES должен быть целым числом") from exc
+    if not 1 <= max_concurrent_updates <= 256:
+        raise RuntimeError("MAX_CONCURRENT_UPDATES должен быть в диапазоне 1..256")
+
     return Settings(
         bot_token=bot_token,
         admin_ids=admin_ids,
@@ -56,4 +64,5 @@ def load_settings() -> Settings:
         timezone_name=timezone_name,
         web_admin_username=os.getenv("WEB_ADMIN_USERNAME", "admin").strip() or "admin",
         web_admin_password=os.getenv("WEB_ADMIN_PASSWORD", "").strip(),
+        max_concurrent_updates=max_concurrent_updates,
     )

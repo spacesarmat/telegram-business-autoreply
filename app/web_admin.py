@@ -39,6 +39,7 @@ QUESTION_TYPES = {
 
 StatusChangeCallback = Callable[[int, str], Awaitable[tuple[bool, str]]]
 AmountChangeCallback = Callable[[int, int], Awaitable[tuple[bool, str]]]
+ConcurrencySnapshotCallback = Callable[[], dict[str, int]]
 
 
 @dataclass
@@ -112,6 +113,7 @@ class WebAdmin:
         password: str,
         on_status_change: StatusChangeCallback,
         on_amount_change: AmountChangeCallback,
+        concurrency_snapshot: ConcurrencySnapshotCallback,
     ) -> None:
         self.db = db
         self.timezone = timezone
@@ -119,6 +121,7 @@ class WebAdmin:
         self.password = password
         self.on_status_change = on_status_change
         self.on_amount_change = on_amount_change
+        self.concurrency_snapshot = concurrency_snapshot
         self.enabled = bool(password and not password.startswith("PASTE_") and len(password) >= 10)
         self._key = hashlib.sha256((password or secrets.token_hex(16)).encode("utf-8")).digest()
 
@@ -232,6 +235,7 @@ class WebAdmin:
         counts = await self.db.submission_status_counts()
         connection = await self.db.latest_business_connection()
         recent = await self.db.list_submissions(limit=8)
+        queue = self.concurrency_snapshot()
         cards = f"""<div class="grid">
 <div class="card"><div class="muted">Заявок</div><div class="metric">{stat['submissions']}</div></div>
 <div class="card"><div class="muted">Новых</div><div class="metric">{counts['new']}</div></div>
@@ -239,6 +243,7 @@ class WebAdmin:
 <div class="card"><div class="muted">Подтверждено / оплачено</div><div class="metric">{counts['confirmed'] + counts['paid']}</div></div>
 <div class="card"><div class="muted">Контактов</div><div class="metric">{stat['contacts']}</div></div>
 <div class="card"><div class="muted">Business</div><div class="metric">{'🟢' if connection and connection.get('enabled') else '⚪'}</div><div class="muted">{'подключён' if connection and connection.get('enabled') else 'не подключён'}</div></div>
+<div class="card"><div class="muted">Telegram updates</div><div class="metric">{queue['active']} / {queue['max_concurrent']}</div><div class="muted">ожидает: {queue['waiting']} · chat-lock: {queue['chat_locks']}</div></div>
 </div>"""
         currency = str(await self.db.get_setting("crm_currency", "₽") or "₽")
         rows = "".join(self._request_row(item, currency) for item in recent) or '<tr><td colspan="6" class="muted">Заявок пока нет</td></tr>'
@@ -620,6 +625,7 @@ async def start_web_admin(
     password: str,
     on_status_change: StatusChangeCallback,
     on_amount_change: AmountChangeCallback,
+    concurrency_snapshot: ConcurrencySnapshotCallback,
 ) -> WebAdminHandle:
     admin = WebAdmin(
         db=db,
@@ -628,6 +634,7 @@ async def start_web_admin(
         password=password,
         on_status_change=on_status_change,
         on_amount_change=on_amount_change,
+        concurrency_snapshot=concurrency_snapshot,
     )
     runner = web.AppRunner(admin.application(), access_log=logger)
     await runner.setup()

@@ -18,6 +18,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message
 
 from .config import Settings, load_settings
+from .concurrency import ConcurrencyMiddleware, UpdateConcurrencyGuard
 from .db import DEFAULT_STATUS_TEMPLATES, Database, utc_now_iso
 from .keyboards import (
     admin_addon_delete_confirm,
@@ -62,6 +63,7 @@ settings: Settings = load_settings()
 APP_TIMEZONE = ZoneInfo(settings.timezone_name)
 db = Database(settings.database_path)
 router = Router(name="main")
+concurrency_guard = UpdateConcurrencyGuard(settings.max_concurrent_updates)
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -4726,6 +4728,7 @@ async def admin_stats(callback: CallbackQuery) -> None:
     counts = await db.submission_status_counts()
     connection = await db.latest_business_connection()
     conn = "подключён" if connection and connection["enabled"] else "не подключён"
+    queue = concurrency_guard.snapshot()
     text = (
         "<b>Статистика</b>\n\n"
         f"Уникальных чатов: {stat['contacts']}\n"
@@ -4735,7 +4738,12 @@ async def admin_stats(callback: CallbackQuery) -> None:
         f"Новых заявок: {counts['new']}\n"
         f"В работе: {counts['in_progress']}\n"
         f"Подтверждено / оплачено: {counts['confirmed'] + counts['paid']}\n"
-        f"Business: {conn}"
+        f"Business: {conn}\n\n"
+        "<b>Очередь обновлений</b>\n"
+        f"Сейчас выполняется: {queue['active']} / {queue['max_concurrent']}\n"
+        f"Ожидает: {queue['waiting']}\n"
+        f"Активных chat-lock: {queue['chat_locks']}\n"
+        f"Пиковая нагрузка: {queue['peak_active']}"
     )
     if isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=admin_main(await get_autoresponder_enabled()))
@@ -4768,8 +4776,13 @@ async def main() -> None:
         password=settings.web_admin_password,
         on_status_change=web_status_change,
         on_amount_change=web_amount_change,
+        concurrency_snapshot=concurrency_guard.snapshot,
     )
     dp = Dispatcher(storage=MemoryStorage())
+    concurrency_middleware = ConcurrencyMiddleware(concurrency_guard)
+    router.business_message.outer_middleware(concurrency_middleware)
+    router.message.outer_middleware(concurrency_middleware)
+    router.callback_query.outer_middleware(concurrency_middleware)
     dp.include_router(router)
 
     await bot.set_my_commands(
@@ -4781,9 +4794,10 @@ async def main() -> None:
 
     me = await bot.get_me()
     logger.info(
-        "Бот @%s запущен. can_connect_to_business=%s",
+        "Бот @%s запущен. can_connect_to_business=%s; max_concurrent_updates=%s",
         me.username,
         me.can_connect_to_business,
+        settings.max_concurrent_updates,
     )
     if not me.can_connect_to_business:
         logger.warning("Включите Business/Secretary Mode в @BotFather")

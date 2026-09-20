@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -314,6 +315,7 @@ class Database:
                     business_connection_id TEXT NOT NULL,
                     form_id INTEGER NOT NULL,
                     form_message_id INTEGER,
+                    submission_token TEXT NOT NULL,
                     keyboard_question_id INTEGER NOT NULL DEFAULT 0,
                     custom_choice_question_id INTEGER NOT NULL DEFAULT 0,
                     current_index INTEGER NOT NULL DEFAULT 0,
@@ -336,6 +338,7 @@ class Database:
                     form_name TEXT NOT NULL,
                     chat_id INTEGER NOT NULL,
                     business_connection_id TEXT,
+                    submission_token TEXT,
                     user_id INTEGER,
                     username TEXT,
                     first_name TEXT,
@@ -414,6 +417,19 @@ class Database:
                     "ALTER TABLE form_sessions ADD COLUMN custom_choice_question_id INTEGER NOT NULL DEFAULT 0"
                 )
 
+            if "submission_token" not in session_columns:
+                await db.execute("ALTER TABLE form_sessions ADD COLUMN submission_token TEXT")
+            missing_session_tokens = await (
+                await db.execute(
+                    "SELECT chat_id FROM form_sessions WHERE submission_token IS NULL OR submission_token=''"
+                )
+            ).fetchall()
+            for token_row in missing_session_tokens:
+                await db.execute(
+                    "UPDATE form_sessions SET submission_token=? WHERE chat_id=?",
+                    (uuid.uuid4().hex, int(token_row["chat_id"])),
+                )
+
             question_columns = {
                 row["name"]
                 for row in await (await db.execute("PRAGMA table_info(form_questions)")).fetchall()
@@ -440,6 +456,8 @@ class Database:
             }
             if "business_connection_id" not in submission_columns:
                 await db.execute("ALTER TABLE form_submissions ADD COLUMN business_connection_id TEXT")
+            if "submission_token" not in submission_columns:
+                await db.execute("ALTER TABLE form_submissions ADD COLUMN submission_token TEXT")
             if "status" not in submission_columns:
                 await db.execute("ALTER TABLE form_submissions ADD COLUMN status TEXT NOT NULL DEFAULT 'new'")
             if "updated_at" not in submission_columns:
@@ -570,6 +588,10 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_form_submissions_status "
                 "ON form_submissions(status, created_at DESC)"
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_form_submissions_submission_token "
+                "ON form_submissions(submission_token)"
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_availability_date "
@@ -1165,17 +1187,19 @@ class Database:
         form_message_id: int | None = None,
     ) -> None:
         now = utc_now_iso()
+        submission_token = uuid.uuid4().hex
         async with self.connection() as db:
             await db.execute(
                 """
                 INSERT INTO form_sessions(
-                    chat_id, business_connection_id, form_id, form_message_id, keyboard_question_id, custom_choice_question_id, current_index, answers_json,
+                    chat_id, business_connection_id, form_id, form_message_id, submission_token, keyboard_question_id, custom_choice_question_id, current_index, answers_json,
                     selected_addons_json, addons_confirmed, status, user_id, username, first_name, last_name, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, 0, 0, 0, '{}', '[]', 0, 'active', ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, 0, 0, 0, '{}', '[]', 0, 'active', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     business_connection_id=excluded.business_connection_id,
                     form_id=excluded.form_id,
                     form_message_id=excluded.form_message_id,
+                    submission_token=excluded.submission_token,
                     keyboard_question_id=0,
                     custom_choice_question_id=0,
                     current_index=0,
@@ -1195,6 +1219,7 @@ class Database:
                     business_connection_id,
                     form_id,
                     form_message_id,
+                    submission_token,
                     user_id,
                     username,
                     first_name,
@@ -1283,24 +1308,40 @@ class Database:
         calculated_amount: int = 0,
         pricing_details: dict[str, Any] | None = None,
     ) -> int:
+        """Create a submission exactly once for one form session.
+
+        submission_token is generated when the form session starts and has a
+        UNIQUE index in form_submissions. Repeated/parallel submit attempts with
+        the same token return the already-created submission id.
+        """
         now = utc_now_iso()
         answers = session.get("answers") or _decode_answers(session.get("answers_json"))
         calculated_amount = max(0, int(calculated_amount or 0))
         pricing_details = pricing_details or {}
         selected_addon_ids = session.get("selected_addon_ids") or _decode_int_list(session.get("selected_addons_json"))
+        submission_token = str(session.get("submission_token") or "").strip() or uuid.uuid4().hex
+
         async with self.connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if not session.get("submission_token"):
+                await db.execute(
+                    "UPDATE form_sessions SET submission_token=? WHERE chat_id=?",
+                    (submission_token, int(session["chat_id"])),
+                )
             cur = await db.execute(
                 """
                 INSERT INTO form_submissions(
-                    form_id, form_name, chat_id, business_connection_id, user_id, username, first_name, last_name,
+                    form_id, form_name, chat_id, business_connection_id, submission_token, user_id, username, first_name, last_name,
                     answers_json, selected_addons_json, status, total_amount, calculated_amount, pricing_details_json, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
+                ON CONFLICT(submission_token) DO NOTHING
                 """,
                 (
                     session.get("form_id"),
                     form_name,
                     session["chat_id"],
                     session.get("business_connection_id"),
+                    submission_token,
                     session.get("user_id"),
                     session.get("username"),
                     session.get("first_name"),
@@ -1314,11 +1355,23 @@ class Database:
                     now,
                 ),
             )
-            submission_id = int(cur.lastrowid)
-            await db.execute(
-                "INSERT INTO submission_events(submission_id, event_type, new_value, created_at) VALUES(?, 'created', ?, ?)",
-                (submission_id, form_name, now),
-            )
+            changed_row = await (await db.execute("SELECT changes() AS c")).fetchone()
+            created = bool(changed_row and int(changed_row["c"]) == 1)
+            row = await (
+                await db.execute(
+                    "SELECT id FROM form_submissions WHERE submission_token=?",
+                    (submission_token,),
+                )
+            ).fetchone()
+            if not row:
+                await db.rollback()
+                raise RuntimeError("Не удалось создать или найти заявку по submission_token")
+            submission_id = int(row["id"])
+            if created:
+                await db.execute(
+                    "INSERT INTO submission_events(submission_id, event_type, new_value, created_at) VALUES(?, 'created', ?, ?)",
+                    (submission_id, form_name, now),
+                )
             await db.commit()
             return submission_id
 

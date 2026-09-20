@@ -22,6 +22,7 @@ services:
       TZ: Europe/Moscow
       WEB_ADMIN_USERNAME: "admin"
       WEB_ADMIN_PASSWORD: "PASTE_STRONG_WEB_ADMIN_PASSWORD_HERE"
+      MAX_CONCURRENT_UPDATES: "32"
     labels:
       icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/telegram.png
     network_mode: bridge
@@ -72,12 +73,12 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.8.1"
+  version: "1.8.2"
   update_at: "2026-09-20"
   release_notes:
     en_US: >
-      Adds a reusable choice-question type with editable inline options. The Factory rental
-      event format is now selected with buttons, with a custom text follow-up for Other.
+      Concurrency safety: per-chat queues, idempotent form submission, duplicate callback
+      protection, a global update limit and live queue metrics in Telegram/Web Admin.
     ru_RU: >
-      Добавлен универсальный тип вопроса с вариантами-кнопками. Формат мероприятия в
-      «Аренде Фабрики» выбирается кнопками, а «Другое» открывает ручное уточнение.
+      Защита от гонок: очередь на каждый чат, идемпотентная отправка заявки, защита от
+      двойных нажатий, общий лимит параллельных updates и мониторинг очереди в админках.
