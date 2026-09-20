@@ -111,14 +111,40 @@ def form_question_nav(required: bool, can_go_back: bool) -> InlineKeyboardMarkup
     return builder.as_markup()
 
 
-def form_confirmation() -> InlineKeyboardMarkup:
+def form_confirmation(has_addons: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="✅ Отправить заявку", callback_data="form:submit"))
+    if has_addons:
+        builder.row(InlineKeyboardButton(text="🧰 Изменить доп. услуги", callback_data="form:addons_edit"))
     builder.row(
         InlineKeyboardButton(text="✏️ Изменить ответы", callback_data="form:edit"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="form:cancel"),
     )
     builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:menu"))
+    return builder.as_markup()
+
+
+def form_addons(addons: list[dict], selected_ids: set[int], currency: str = "₽") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for addon in addons:
+        addon_id = int(addon["id"])
+        selected = addon_id in selected_ids
+        icon = "✅" if selected else "▫️"
+        amount = int(addon.get("amount") or 0)
+        price = f"{amount:,}".replace(",", " ") + f" {currency}" if amount else "бесплатно"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{icon} {str(addon['name'])[:28]} · {price}",
+                callback_data=f"form:addon_toggle:{addon_id}",
+            )
+        )
+    builder.row(InlineKeyboardButton(text="✅ Продолжить", callback_data="form:addons_done"))
+    if selected_ids:
+        builder.row(InlineKeyboardButton(text="🧹 Убрать все", callback_data="form:addons_clear"))
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="form:back"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="form:cancel"),
+    )
     return builder.as_markup()
 
 
@@ -534,5 +560,58 @@ def admin_pricing_form(form_id: int, pricing: dict, currency: str = "₽") -> In
     builder.row(
         InlineKeyboardButton(text="➕ Доп. час", callback_data=f"adm:pricing_extra:{form_id}"),
     )
+    builder.row(
+        InlineKeyboardButton(text="🛠 Буфер до", callback_data=f"adm:pricing_buffer_before:{form_id}"),
+        InlineKeyboardButton(text="🧹 Буфер после", callback_data=f"adm:pricing_buffer_after:{form_id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🧰 Доп. услуги", callback_data=f"adm:addons:{form_id}"),
+    )
     builder.row(InlineKeyboardButton(text="⬅️ К тарифам", callback_data="adm:pricing"))
+    return builder.as_markup()
+
+
+def admin_addons_list(form_id: int, addons: list[dict], currency: str = "₽") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for addon in addons:
+        icon = "🟢" if addon.get("enabled") else "⚪"
+        amount = int(addon.get("amount") or 0)
+        price = f"{amount:,}".replace(",", " ") + f" {currency}" if amount else "0"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{icon} {str(addon['name'])[:25]} · {price}",
+                callback_data=f"adm:addon:{addon['id']}",
+            )
+        )
+    builder.row(InlineKeyboardButton(text="➕ Добавить услугу", callback_data=f"adm:addon_add:{form_id}"))
+    builder.row(InlineKeyboardButton(text="⬅️ К тарифу", callback_data=f"adm:pricing_form:{form_id}"))
+    return builder.as_markup()
+
+
+def admin_addon_edit(addon: dict) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    addon_id = int(addon["id"])
+    enabled = bool(addon.get("enabled"))
+    builder.row(
+        InlineKeyboardButton(text="✏️ Название", callback_data=f"adm:addon_name:{addon_id}"),
+        InlineKeyboardButton(text="💵 Цена", callback_data=f"adm:addon_amount:{addon_id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=("🟢 Включена" if enabled else "⚪ Выключена"),
+            callback_data=f"adm:addon_toggle:{addon_id}",
+        ),
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm:addon_delete:{addon_id}"),
+    )
+    builder.row(InlineKeyboardButton(text="⬅️ К услугам", callback_data=f"adm:addons:{addon['form_id']}"))
+    return builder.as_markup()
+
+
+def admin_addon_delete_confirm(addon: dict) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    addon_id = int(addon["id"])
+    builder.row(
+        InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"adm:addon_delete_yes:{addon_id}"),
+        InlineKeyboardButton(text="Отмена", callback_data=f"adm:addon:{addon_id}"),
+    )
     return builder.as_markup()

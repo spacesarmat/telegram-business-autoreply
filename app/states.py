@@ -35,3 +35,10 @@ class AdminStates(StatesGroup):
     pricing_base_amount = State()
     pricing_included_hours = State()
     pricing_extra_hour_amount = State()
+    pricing_buffer_before = State()
+    pricing_buffer_after = State()
+
+    addon_add_name = State()
+    addon_add_amount = State()
+    addon_edit_name = State()
+    addon_edit_amount = State()

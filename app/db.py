@@ -152,6 +152,26 @@ def _decode_answers(raw: str | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in value.items() if v is not None}
 
 
+def _decode_int_list(raw: str | None) -> list[int]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    result: list[int] = []
+    for item in value:
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            continue
+        if number > 0 and number not in result:
+            result.append(number)
+    return result
+
+
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -234,6 +254,20 @@ class Database:
                     base_amount INTEGER NOT NULL DEFAULT 0,
                     included_hours INTEGER NOT NULL DEFAULT 0,
                     extra_hour_amount INTEGER NOT NULL DEFAULT 0,
+                    buffer_before_minutes INTEGER NOT NULL DEFAULT 0,
+                    buffer_after_minutes INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS form_addons (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    form_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    position INTEGER NOT NULL DEFAULT 100,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE CASCADE
@@ -267,6 +301,8 @@ class Database:
                     keyboard_question_id INTEGER NOT NULL DEFAULT 0,
                     current_index INTEGER NOT NULL DEFAULT 0,
                     answers_json TEXT NOT NULL DEFAULT '{}',
+                    selected_addons_json TEXT NOT NULL DEFAULT '[]',
+                    addons_confirmed INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'active',
                     user_id INTEGER,
                     username TEXT,
@@ -288,6 +324,7 @@ class Database:
                     first_name TEXT,
                     last_name TEXT,
                     answers_json TEXT NOT NULL,
+                    selected_addons_json TEXT NOT NULL DEFAULT '[]',
                     status TEXT NOT NULL DEFAULT 'new',
                     total_amount INTEGER NOT NULL DEFAULT 0,
                     calculated_amount INTEGER NOT NULL DEFAULT 0,
@@ -347,6 +384,14 @@ class Database:
                 await db.execute(
                     "ALTER TABLE form_sessions ADD COLUMN keyboard_question_id INTEGER NOT NULL DEFAULT 0"
                 )
+            if "selected_addons_json" not in session_columns:
+                await db.execute(
+                    "ALTER TABLE form_sessions ADD COLUMN selected_addons_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "addons_confirmed" not in session_columns:
+                await db.execute(
+                    "ALTER TABLE form_sessions ADD COLUMN addons_confirmed INTEGER NOT NULL DEFAULT 0"
+                )
 
             question_columns = {
                 row["name"]
@@ -384,6 +429,10 @@ class Database:
                 await db.execute("ALTER TABLE form_submissions ADD COLUMN prepayment_amount INTEGER NOT NULL DEFAULT 0")
             if "internal_note" not in submission_columns:
                 await db.execute("ALTER TABLE form_submissions ADD COLUMN internal_note TEXT NOT NULL DEFAULT ''")
+            if "selected_addons_json" not in submission_columns:
+                await db.execute(
+                    "ALTER TABLE form_submissions ADD COLUMN selected_addons_json TEXT NOT NULL DEFAULT '[]'"
+                )
             await db.execute(
                 "UPDATE form_submissions SET updated_at=COALESCE(updated_at, created_at), "
                 "status=COALESCE(NULLIF(status, ''), 'new')"
@@ -392,6 +441,19 @@ class Database:
                 "UPDATE form_questions SET input_type='time' "
                 "WHERE input_type='text' AND trim(label) IN ('Время', 'время', 'ВРЕМЯ', 'Время начала', 'время начала', 'Начало', 'начало')"
             )
+
+            pricing_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(form_pricing)")).fetchall()
+            }
+            if "buffer_before_minutes" not in pricing_columns:
+                await db.execute(
+                    "ALTER TABLE form_pricing ADD COLUMN buffer_before_minutes INTEGER NOT NULL DEFAULT 0"
+                )
+            if "buffer_after_minutes" not in pricing_columns:
+                await db.execute(
+                    "ALTER TABLE form_pricing ADD COLUMN buffer_after_minutes INTEGER NOT NULL DEFAULT 0"
+                )
 
             # v1.4.3: стандартная форма аренды использует явные время начала и окончания.
             # Мигрируем только нетронутые стандартные вопросы, чтобы не перезаписать кастомные формы.
@@ -465,6 +527,10 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_submission_events_submission "
                 "ON submission_events(submission_id, created_at DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_form_addons_form_position "
+                "ON form_addons(form_id, position, id)"
             )
             await db.execute(
                 """
@@ -729,6 +795,8 @@ class Database:
                 "base_amount": 0,
                 "included_hours": 0,
                 "extra_hour_amount": 0,
+                "buffer_before_minutes": 0,
+                "buffer_after_minutes": 0,
             }
 
     async def list_forms_with_pricing(self) -> list[dict[str, Any]]:
@@ -740,7 +808,10 @@ class Database:
                            COALESCE(p.enabled, 0) AS pricing_enabled,
                            COALESCE(p.base_amount, 0) AS base_amount,
                            COALESCE(p.included_hours, 0) AS included_hours,
-                           COALESCE(p.extra_hour_amount, 0) AS extra_hour_amount
+                           COALESCE(p.extra_hour_amount, 0) AS extra_hour_amount,
+                           COALESCE(p.buffer_before_minutes, 0) AS buffer_before_minutes,
+                           COALESCE(p.buffer_after_minutes, 0) AS buffer_after_minutes,
+                           (SELECT COUNT(*) FROM form_addons a WHERE a.form_id=f.id AND a.enabled=1) AS addon_count
                     FROM forms f
                     LEFT JOIN form_pricing p ON p.form_id=f.id
                     ORDER BY f.id ASC
@@ -750,7 +821,10 @@ class Database:
             return [dict(row) for row in rows]
 
     async def update_form_pricing(self, form_id: int, field: str, value: Any) -> None:
-        allowed = {"enabled", "base_amount", "included_hours", "extra_hour_amount"}
+        allowed = {
+            "enabled", "base_amount", "included_hours", "extra_hour_amount",
+            "buffer_before_minutes", "buffer_after_minutes"
+        }
         if field not in allowed:
             raise ValueError("Unsupported pricing field")
         now = utc_now_iso()
@@ -758,8 +832,9 @@ class Database:
             await db.execute(
                 """
                 INSERT OR IGNORE INTO form_pricing(
-                    form_id, enabled, base_amount, included_hours, extra_hour_amount, created_at, updated_at
-                ) VALUES(?, 0, 0, 0, 0, ?, ?)
+                    form_id, enabled, base_amount, included_hours, extra_hour_amount,
+                    buffer_before_minutes, buffer_after_minutes, created_at, updated_at
+                ) VALUES(?, 0, 0, 0, 0, 0, 0, ?, ?)
                 """,
                 (form_id, now, now),
             )
@@ -768,6 +843,72 @@ class Database:
                 (value, now, form_id),
             )
             await db.commit()
+
+    # ---------- Дополнительные услуги ----------
+
+    async def list_form_addons(self, form_id: int, enabled_only: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM form_addons WHERE form_id=?"
+        args: list[Any] = [form_id]
+        if enabled_only:
+            sql += " AND enabled=1"
+        sql += " ORDER BY position ASC, id ASC"
+        async with self.connection() as db:
+            rows = await (await db.execute(sql, tuple(args))).fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_form_addon(self, addon_id: int) -> dict[str, Any] | None:
+        async with self.connection() as db:
+            row = await (await db.execute("SELECT * FROM form_addons WHERE id=?", (addon_id,))).fetchone()
+            return dict(row) if row else None
+
+    async def add_form_addon(self, form_id: int, name: str, amount: int) -> int:
+        now = utc_now_iso()
+        async with self.connection() as db:
+            row = await (
+                await db.execute(
+                    "SELECT COALESCE(MAX(position), 0) + 1 AS p FROM form_addons WHERE form_id=?",
+                    (form_id,),
+                )
+            ).fetchone()
+            cur = await db.execute(
+                """
+                INSERT INTO form_addons(form_id, name, amount, enabled, position, created_at, updated_at)
+                VALUES(?, ?, ?, 1, ?, ?, ?)
+                """,
+                (form_id, name.strip(), max(0, int(amount)), int(row["p"]), now, now),
+            )
+            await db.commit()
+            return int(cur.lastrowid)
+
+    async def update_form_addon_field(self, addon_id: int, field: str, value: Any) -> None:
+        if field not in {"name", "amount", "enabled", "position"}:
+            raise ValueError("Unsupported addon field")
+        async with self.connection() as db:
+            await db.execute(
+                f"UPDATE form_addons SET {field}=?, updated_at=? WHERE id=?",
+                (value, utc_now_iso(), addon_id),
+            )
+            await db.commit()
+
+    async def delete_form_addon(self, addon_id: int) -> None:
+        async with self.connection() as db:
+            await db.execute("DELETE FROM form_addons WHERE id=?", (addon_id,))
+            await db.commit()
+
+    async def get_selected_addons(self, form_id: int, addon_ids: list[int]) -> list[dict[str, Any]]:
+        if not addon_ids:
+            return []
+        placeholders = ",".join("?" for _ in addon_ids)
+        args: list[Any] = [form_id, *addon_ids]
+        async with self.connection() as db:
+            rows = await (
+                await db.execute(
+                    f"SELECT * FROM form_addons WHERE form_id=? AND enabled=1 AND id IN ({placeholders}) "
+                    "ORDER BY position ASC, id ASC",
+                    tuple(args),
+                )
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     # ---------- Формы ----------
 
@@ -936,9 +1077,9 @@ class Database:
             await db.execute(
                 """
                 INSERT INTO form_sessions(
-                    chat_id, business_connection_id, form_id, form_message_id, keyboard_question_id, current_index, answers_json, status,
-                    user_id, username, first_name, last_name, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, 0, 0, '{}', 'active', ?, ?, ?, ?, ?, ?)
+                    chat_id, business_connection_id, form_id, form_message_id, keyboard_question_id, current_index, answers_json,
+                    selected_addons_json, addons_confirmed, status, user_id, username, first_name, last_name, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, 0, 0, '{}', '[]', 0, 'active', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     business_connection_id=excluded.business_connection_id,
                     form_id=excluded.form_id,
@@ -946,6 +1087,8 @@ class Database:
                     keyboard_question_id=0,
                     current_index=0,
                     answers_json='{}',
+                    selected_addons_json='[]',
+                    addons_confirmed=0,
                     status='active',
                     user_id=excluded.user_id,
                     username=excluded.username,
@@ -978,6 +1121,7 @@ class Database:
                 return None
             result = dict(row)
             result["answers"] = _decode_answers(result.get("answers_json"))
+            result["selected_addon_ids"] = _decode_int_list(result.get("selected_addons_json"))
             return result
 
     async def update_form_session(
@@ -990,6 +1134,8 @@ class Database:
         business_connection_id: str | None = None,
         form_message_id: int | None = None,
         keyboard_question_id: int | None = None,
+        selected_addon_ids: list[int] | None = None,
+        addons_confirmed: bool | int | None = None,
     ) -> None:
         fields: list[str] = []
         values: list[Any] = []
@@ -1011,6 +1157,12 @@ class Database:
         if keyboard_question_id is not None:
             fields.append("keyboard_question_id=?")
             values.append(keyboard_question_id)
+        if selected_addon_ids is not None:
+            fields.append("selected_addons_json=?")
+            values.append(json.dumps([int(x) for x in selected_addon_ids], ensure_ascii=False))
+        if addons_confirmed is not None:
+            fields.append("addons_confirmed=?")
+            values.append(int(bool(addons_confirmed)))
         fields.append("updated_at=?")
         values.append(utc_now_iso())
         values.append(chat_id)
@@ -1038,13 +1190,14 @@ class Database:
         answers = session.get("answers") or _decode_answers(session.get("answers_json"))
         calculated_amount = max(0, int(calculated_amount or 0))
         pricing_details = pricing_details or {}
+        selected_addon_ids = session.get("selected_addon_ids") or _decode_int_list(session.get("selected_addons_json"))
         async with self.connection() as db:
             cur = await db.execute(
                 """
                 INSERT INTO form_submissions(
                     form_id, form_name, chat_id, business_connection_id, user_id, username, first_name, last_name,
-                    answers_json, status, total_amount, calculated_amount, pricing_details_json, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
+                    answers_json, selected_addons_json, status, total_amount, calculated_amount, pricing_details_json, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
                 """,
                 (
                     session.get("form_id"),
@@ -1056,6 +1209,7 @@ class Database:
                     session.get("first_name"),
                     session.get("last_name"),
                     json.dumps(answers, ensure_ascii=False),
+                    json.dumps(selected_addon_ids, ensure_ascii=False),
                     calculated_amount,
                     calculated_amount,
                     json.dumps(pricing_details, ensure_ascii=False),
@@ -1090,6 +1244,7 @@ class Database:
                     item["pricing_details"] = json.loads(item.get("pricing_details_json") or "{}")
                 except (TypeError, json.JSONDecodeError):
                     item["pricing_details"] = {}
+                item["selected_addon_ids"] = _decode_int_list(item.get("selected_addons_json"))
                 result.append(item)
             return result
 
@@ -1106,6 +1261,7 @@ class Database:
                 result["pricing_details"] = json.loads(result.get("pricing_details_json") or "{}")
             except (TypeError, json.JSONDecodeError):
                 result["pricing_details"] = {}
+            result["selected_addon_ids"] = _decode_int_list(result.get("selected_addons_json"))
             return result
 
     async def update_submission_status(
@@ -1199,6 +1355,7 @@ class Database:
                     item["pricing_details"] = json.loads(item.get("pricing_details_json") or "{}")
                 except (TypeError, json.JSONDecodeError):
                     item["pricing_details"] = {}
+                item["selected_addon_ids"] = _decode_int_list(item.get("selected_addons_json"))
                 result.append(item)
             return result
 
@@ -1224,6 +1381,7 @@ class Database:
                     item["pricing_details"] = json.loads(item.get("pricing_details_json") or "{}")
                 except (TypeError, json.JSONDecodeError):
                     item["pricing_details"] = {}
+                item["selected_addon_ids"] = _decode_int_list(item.get("selected_addons_json"))
                 result.append(item)
             return result
 

@@ -20,6 +20,9 @@ from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message
 from .config import Settings, load_settings
 from .db import DEFAULT_STATUS_TEMPLATES, Database, utc_now_iso
 from .keyboards import (
+    admin_addon_delete_confirm,
+    admin_addon_edit,
+    admin_addons_list,
     admin_availability,
     admin_button_edit,
     admin_buttons_list,
@@ -41,6 +44,7 @@ from .keyboards import (
     calendar_keyboard,
     delete_confirm,
     end_time_slots_keyboard,
+    form_addons,
     form_confirmation,
     form_question_nav,
     public_menu,
@@ -309,9 +313,49 @@ async def _date_fully_busy(date_iso: str) -> bool:
     return any(not block.get("start_time") or not block.get("end_time") for block in blocks)
 
 
-async def _busy_time_slots(date_iso: str | None, slots: list[str]) -> set[str]:
+async def _busy_time_slots(
+    date_iso: str | None, slots: list[str], form_id: int | None = None
+) -> set[str]:
     if not date_iso:
         return set()
+    if form_id is not None:
+        try:
+            step = int(await db.get_setting("booking_slot_minutes", "60") or 60)
+        except ValueError:
+            step = 60
+        step = max(15, min(step, 240))
+        start_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
+        pricing = await db.get_form_pricing(form_id)
+        before = int(pricing.get("buffer_before_minutes") or 0)
+        after = int(pricing.get("buffer_after_minutes") or 0)
+        busy: set[str] = set()
+        for slot in slots:
+            start_minutes = _time_to_minutes(slot)
+            end_total = start_minutes + step
+            overnight = end_total >= 24 * 60
+            end_clock = end_total % (24 * 60)
+            end_time = f"{end_clock // 60:02d}:{end_clock % 60:02d}"
+            end_date = start_date + timedelta(days=1 if overnight else 0)
+            segments = (
+                [(date_iso, slot, "24:00"), (end_date.isoformat(), "00:00", end_time)]
+                if overnight
+                else [(date_iso, slot, end_time)]
+            )
+            interval = {
+                "date_iso": date_iso,
+                "start_time": slot,
+                "end_time": end_time,
+                "end_date_iso": end_date.isoformat(),
+                "overnight": overnight,
+                "duration_minutes": step,
+                "segments": segments,
+            }
+            if await _booking_interval_conflicts(
+                interval, buffer_before_minutes=before, buffer_after_minutes=after
+            ):
+                busy.add(slot)
+        return busy
+
     blocks = await db.list_availability_blocks(date_iso=date_iso, limit=200)
     busy: set[str] = set()
     for slot in slots:
@@ -457,12 +501,69 @@ def _booking_interval(
     }
 
 
+def _segments_for_datetime_range(start_dt: datetime, end_dt: datetime) -> list[tuple[str, str, str]]:
+    """Split a local naive datetime range into per-calendar-day availability segments."""
+    if end_dt <= start_dt:
+        return []
+    segments: list[tuple[str, str, str]] = []
+    current_date = start_dt.date()
+    final_date = end_dt.date()
+    end_exact_midnight = end_dt.time().hour == 0 and end_dt.time().minute == 0 and end_dt.time().second == 0
+    if end_exact_midnight:
+        final_date = final_date - timedelta(days=1)
+
+    while current_date <= final_date:
+        start_time = start_dt.strftime("%H:%M") if current_date == start_dt.date() else "00:00"
+        if current_date == final_date:
+            if end_exact_midnight:
+                end_time = "24:00"
+            else:
+                end_time = end_dt.strftime("%H:%M")
+        else:
+            end_time = "24:00"
+        if start_time != end_time:
+            segments.append((current_date.isoformat(), start_time, end_time))
+        current_date += timedelta(days=1)
+    return segments
+
+
+def _booking_interval_with_buffers(
+    interval: dict | None, before_minutes: int = 0, after_minutes: int = 0
+) -> dict | None:
+    if not interval or not interval.get("start_time") or not interval.get("end_time"):
+        return interval
+    start_date = datetime.strptime(str(interval["date_iso"]), "%Y-%m-%d").date()
+    end_date = datetime.strptime(str(interval.get("end_date_iso") or interval["date_iso"]), "%Y-%m-%d").date()
+    start_hour, start_minute = [int(x) for x in str(interval["start_time"]).split(":", 1)]
+    end_hour, end_minute = [int(x) for x in str(interval["end_time"]).split(":", 1)]
+    start_dt = datetime.combine(start_date, datetime.min.time()).replace(hour=start_hour, minute=start_minute)
+    end_dt = datetime.combine(end_date, datetime.min.time()).replace(hour=end_hour, minute=end_minute)
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+    before = max(0, min(int(before_minutes or 0), 24 * 60))
+    after = max(0, min(int(after_minutes or 0), 24 * 60))
+    tech_start = start_dt - timedelta(minutes=before)
+    tech_end = end_dt + timedelta(minutes=after)
+    result = dict(interval)
+    result.update({
+        "buffer_before_minutes": before,
+        "buffer_after_minutes": after,
+        "technical_start": tech_start,
+        "technical_end": tech_end,
+        "technical_segments": _segments_for_datetime_range(tech_start, tech_end),
+    })
+    return result
+
+
 async def _booking_interval_conflicts(
-    interval: dict | None, *, exclude_submission_id: int | None = None
+    interval: dict | None, *, exclude_submission_id: int | None = None,
+    buffer_before_minutes: int = 0, buffer_after_minutes: int = 0
 ) -> bool:
     if not interval:
         return False
-    for date_iso, start_time, end_time in interval["segments"]:
+    buffered = _booking_interval_with_buffers(interval, buffer_before_minutes, buffer_after_minutes)
+    segments = (buffered or {}).get("technical_segments") or interval.get("segments") or []
+    for date_iso, start_time, end_time in segments:
         if await db.booking_conflicts(
             date_iso, start_time, end_time, exclude_submission_id=exclude_submission_id
         ):
@@ -470,8 +571,20 @@ async def _booking_interval_conflicts(
     return False
 
 
+async def _booking_interval_conflicts_for_form(
+    form_id: int, interval: dict | None, *, exclude_submission_id: int | None = None
+) -> bool:
+    pricing = await db.get_form_pricing(form_id)
+    return await _booking_interval_conflicts(
+        interval,
+        exclude_submission_id=exclude_submission_id,
+        buffer_before_minutes=int(pricing.get("buffer_before_minutes") or 0),
+        buffer_after_minutes=int(pricing.get("buffer_after_minutes") or 0),
+    )
+
+
 async def _booking_end_time_options(
-    questions: list[dict], answers: dict[str, str]
+    form_id: int, questions: list[dict], answers: dict[str, str]
 ) -> tuple[list[tuple[str, str]], set[str]]:
     start_time = _find_start_time(questions, answers)
     if not start_time:
@@ -485,6 +598,9 @@ async def _booking_end_time_options(
     step = max(15, min(step, 240))
     max_duration = await _max_booking_duration_minutes()
     start_minutes = _time_to_minutes(start_time)
+    pricing = await db.get_form_pricing(form_id)
+    before = int(pricing.get("buffer_before_minutes") or 0)
+    after = int(pricing.get("buffer_after_minutes") or 0)
 
     options: list[tuple[str, str]] = []
     busy: set[str] = set()
@@ -499,7 +615,10 @@ async def _booking_end_time_options(
         if end_question:
             temp_answers = dict(answers)
             temp_answers[str(end_question["id"])] = value
-            if await _booking_interval_conflicts(_booking_interval(questions, temp_answers)):
+            if await _booking_interval_conflicts(
+                _booking_interval(questions, temp_answers),
+                buffer_before_minutes=before, buffer_after_minutes=after,
+            ):
                 busy.add(value)
     return options, busy
 
@@ -512,6 +631,60 @@ def _booking_interval_summary(interval: dict | None) -> str | None:
     duration_text = f"{hours} ч" if not minutes else f"{hours} ч {minutes} мин"
     next_day = " (+1 день)" if interval.get("overnight") else ""
     return f"{interval['start_time']}–{interval['end_time']}{next_day} · {duration_text}"
+
+
+def _duration_minutes_text(value: int | str | None) -> str:
+    try:
+        minutes = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        minutes = 0
+    hours, rest = divmod(minutes, 60)
+    if hours and rest:
+        return f"{hours} ч {rest} мин"
+    if hours:
+        return f"{hours} ч"
+    return f"{rest} мин" if rest else "0 мин"
+
+
+def _parse_buffer_minutes(value: str | None) -> int | None:
+    if value is None:
+        return None
+    raw = value.strip().casefold().replace(" ", "")
+    if not raw:
+        return None
+    if raw.isdigit():
+        number = int(raw)
+        return number if 0 <= number <= 1440 else None
+    match = re.fullmatch(r"(\d{1,2})(?:ч|h)(?:(\d{1,2})(?:м|мин|min)?)?", raw)
+    if match:
+        hours = int(match.group(1))
+        minutes = int(match.group(2) or 0)
+        total = hours * 60 + minutes
+        return total if 0 <= total <= 1440 and minutes < 60 else None
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
+    if match:
+        hours, minutes = int(match.group(1)), int(match.group(2))
+        total = hours * 60 + minutes
+        return total if 0 <= total <= 1440 and minutes < 60 else None
+    return None
+
+
+async def _selected_addon_rows(form_id: int, selected_ids: list[int] | None) -> list[dict]:
+    return await db.get_selected_addons(form_id, selected_ids or [])
+
+
+def _addons_text(addons: list[dict], currency: str, *, with_total: bool = True) -> str | None:
+    if not addons:
+        return None
+    lines = ["🧰 Дополнительные услуги:"]
+    total = 0
+    for addon in addons:
+        amount = max(0, int(addon.get("amount") or 0))
+        total += amount
+        lines.append(f"• {addon.get('name')}: {_money_text(amount, currency)}")
+    if with_total:
+        lines.append(f"Доп. услуги всего: {_money_text(total, currency)}")
+    return "\n".join(lines)
 
 
 SUBMISSION_STATUS_NAMES = {
@@ -550,7 +723,8 @@ def _parse_money_input(value: str | None) -> int | None:
 
 
 async def _calculate_form_pricing(
-    form_id: int, questions: list[dict], answers: dict[str, str]
+    form_id: int, questions: list[dict], answers: dict[str, str],
+    selected_addon_ids: list[int] | None = None,
 ) -> dict | None:
     """Calculate a preliminary rental price for a time-based form.
 
@@ -585,8 +759,19 @@ async def _calculate_form_pricing(
         amount = base_amount + billed_hours * extra_hour_amount
 
     currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    selected_addons = await _selected_addon_rows(form_id, selected_addon_ids)
+    addon_items = [
+        {"id": int(item["id"]), "name": str(item["name"]), "amount": max(0, int(item.get("amount") or 0))}
+        for item in selected_addons
+    ]
+    addons_total = sum(int(item["amount"]) for item in addon_items)
+    rental_amount = amount
+    amount = rental_amount + addons_total
     return {
         "amount": amount,
+        "rental_amount": rental_amount,
+        "addons_total": addons_total,
+        "addons": addon_items,
         "currency": currency,
         "duration_minutes": duration_minutes,
         "base_amount": base_amount,
@@ -597,6 +782,8 @@ async def _calculate_form_pricing(
         "start_time": interval.get("start_time"),
         "end_time": interval.get("end_time"),
         "overnight": bool(interval.get("overnight")),
+        "buffer_before_minutes": max(0, int(pricing.get("buffer_before_minutes") or 0)),
+        "buffer_after_minutes": max(0, int(pricing.get("buffer_after_minutes") or 0)),
     }
 
 
@@ -605,6 +792,9 @@ def _pricing_calculation_text(calculation: dict | None) -> str | None:
         return None
     currency = str(calculation.get("currency") or "₽")
     amount = int(calculation.get("amount") or 0)
+    rental_amount = int(calculation.get("rental_amount") or amount)
+    addons = list(calculation.get("addons") or [])
+    addons_total = int(calculation.get("addons_total") or 0)
     base = int(calculation.get("base_amount") or 0)
     included = int(calculation.get("included_hours") or 0)
     extra_rate = int(calculation.get("extra_hour_amount") or 0)
@@ -614,6 +804,11 @@ def _pricing_calculation_text(calculation: dict | None) -> str | None:
     duration_text = f"{hours} ч" if not minutes else f"{hours} ч {minutes} мин"
 
     lines = [f"💰 Предварительная стоимость: {_money_text(amount, currency)}"]
+    if addons:
+        lines.append(f"Аренда: {_money_text(rental_amount, currency)}")
+        for addon in addons:
+            lines.append(f"+ {addon.get('name')}: {_money_text(addon.get('amount'), currency)}")
+        lines.append(f"Доп. услуги: {_money_text(addons_total, currency)}")
     if included > 0:
         tariff = f"{_money_text(base, currency)} за первые {included} ч"
         if extra_rate:
@@ -651,6 +846,10 @@ async def _pricing_admin_text(form: dict, pricing: dict) -> str:
     base = max(0, int(pricing.get("base_amount") or 0))
     included = max(0, int(pricing.get("included_hours") or 0))
     extra = max(0, int(pricing.get("extra_hour_amount") or 0))
+    buffer_before = max(0, int(pricing.get("buffer_before_minutes") or 0))
+    buffer_after = max(0, int(pricing.get("buffer_after_minutes") or 0))
+    addons = await db.list_form_addons(int(form["id"]))
+    enabled_addons = [item for item in addons if item.get("enabled")]
     questions = await db.list_form_questions(int(form["id"]))
     compatible = _form_supports_time_pricing(questions)
     lines = [
@@ -660,6 +859,9 @@ async def _pricing_admin_text(form: dict, pricing: dict) -> str:
         f"Базовая стоимость: <b>{html.escape(_money_text(base, currency))}</b>",
         f"В базовую стоимость включено: <b>{included} ч</b>",
         f"Каждый начатый дополнительный час: <b>{html.escape(_money_text(extra, currency))}</b>",
+        f"Технический буфер до: <b>{html.escape(_duration_minutes_text(buffer_before))}</b>",
+        f"Технический буфер после: <b>{html.escape(_duration_minutes_text(buffer_after))}</b>",
+        f"Дополнительных услуг: <b>{len(enabled_addons)} активных / {len(addons)} всего</b>",
         "",
     ]
     if included > 0:
@@ -684,7 +886,8 @@ async def _pricing_admin_text(form: dict, pricing: dict) -> str:
             ),
             "",
             "Цена показывается клиенту как предварительная и автоматически записывается в стоимость новой заявки. "
-            "После этого администратор может изменить стоимость вручную.",
+            "Выбранные дополнительные услуги прибавляются к расчёту. Технический буфер влияет только на занятость календаря, "
+            "но не увеличивает оплачиваемую длительность. После этого администратор может изменить стоимость вручную.",
         ]
     )
     return "\n".join(lines)
@@ -767,6 +970,12 @@ async def _submission_admin_text(submission: dict) -> str:
     total_amount = max(0, int(submission.get("total_amount") or 0))
     prepayment = max(0, int(submission.get("prepayment_amount") or 0))
     balance = max(0, total_amount - prepayment) if total_amount else 0
+    pricing_details = submission.get("pricing_details") or {}
+    addon_items = list(pricing_details.get("addons") or [])
+    if not addon_items and submission.get("form_id") and submission.get("selected_addon_ids"):
+        addon_items = await _selected_addon_rows(
+            int(submission["form_id"]), submission.get("selected_addon_ids") or []
+        )
     lines = [
         f"<b>Заявка №{submission['id']}</b>",
         f"Статус: {status}",
@@ -780,21 +989,43 @@ async def _submission_admin_text(submission: dict) -> str:
         f"💳 Предоплата: <b>{html.escape(_money_text(prepayment, currency))}</b>",
         f"🧾 Остаток: <b>{html.escape(_money_text(balance, currency))}</b>",
         f"🗒 Заметка: {html.escape(str(submission.get('internal_note') or '—'))}",
+    ]
+    if addon_items:
+        lines.extend(["", "<b>🧰 Дополнительные услуги:</b>"])
+        for addon in addon_items:
+            lines.append(
+                f"• {html.escape(str(addon.get('name') or 'Услуга'))}: "
+                f"{html.escape(_money_text(addon.get('amount'), currency))}"
+            )
+    lines.extend([
         "",
         f"Клиент: {html.escape(full_name)}",
         f"Telegram: @{html.escape(str(submission['username']))}" if submission.get("username") else "Telegram: —",
         f"User ID: {submission.get('user_id') or '—'}",
         "",
-    ]
+    ])
     questions = await db.list_form_questions(int(submission["form_id"])) if submission.get("form_id") else []
     answers = submission.get("answers") or {}
     if questions:
         for question in questions:
             value = answers.get(str(question["id"])) or "—"
             lines.append(f"<b>{html.escape(str(question['label']))}:</b> {html.escape(str(value))}")
-        interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
+        interval = _booking_interval(questions, answers)
+        interval_summary = _booking_interval_summary(interval)
         if interval_summary:
             lines.extend(["", f"<b>🕐 Интервал:</b> {html.escape(interval_summary)}"])
+            pricing = await db.get_form_pricing(int(submission["form_id"]))
+            before = int(pricing.get("buffer_before_minutes") or 0)
+            after = int(pricing.get("buffer_after_minutes") or 0)
+            if before or after:
+                buffered = _booking_interval_with_buffers(interval, before, after)
+                if buffered and buffered.get("technical_start") and buffered.get("technical_end"):
+                    tech_start = buffered["technical_start"].strftime("%d.%m %H:%M")
+                    tech_end = buffered["technical_end"].strftime("%d.%m %H:%M")
+                    lines.append(
+                        f"<b>🔧 Тех. занятость:</b> {html.escape(tech_start)} → {html.escape(tech_end)} "
+                        f"(до {_duration_minutes_text(before)}, после {_duration_minutes_text(after)})"
+                    )
     else:
         for key, value in answers.items():
             lines.append(f"<b>Поле {html.escape(str(key))}:</b> {html.escape(str(value))}")
@@ -871,7 +1102,9 @@ def _message_answer_text(message: Message) -> str | None:
 
 
 def _form_preview_text(
-    form: dict, questions: list[dict], answers: dict[str, str], pricing_calculation: dict | None = None
+    form: dict, questions: list[dict], answers: dict[str, str],
+    pricing_calculation: dict | None = None, selected_addons: list[dict] | None = None,
+    currency: str = "₽"
 ) -> str:
     lines = ["✅ Проверьте заявку", "", str(form["name"]), ""]
     for question in questions:
@@ -880,6 +1113,10 @@ def _form_preview_text(
     interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
     if interval_summary:
         lines.extend(["", f"🕐 Интервал: {interval_summary}"])
+    if selected_addons and not pricing_calculation:
+        addon_text = _addons_text(selected_addons, currency)
+        if addon_text:
+            lines.extend(["", addon_text])
     pricing_text = _pricing_calculation_text(pricing_calculation)
     if pricing_text:
         lines.extend(["", pricing_text])
@@ -983,22 +1220,64 @@ async def send_current_form_question(
 
     index = max(0, int(session["current_index"]))
     if index >= len(questions):
+        addons = await db.list_form_addons(int(form["id"]), enabled_only=True)
+        if addons and not bool(session.get("addons_confirmed")):
+            selected_ids = set(int(x) for x in session.get("selected_addon_ids") or [])
+            currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+            selected_rows = [item for item in addons if int(item["id"]) in selected_ids]
+            addon_total = sum(max(0, int(item.get("amount") or 0)) for item in selected_rows)
+            lines = [
+                f"🧰 {form['name']}",
+                "",
+                "Выберите дополнительные услуги. Можно выбрать несколько вариантов.",
+            ]
+            if selected_rows:
+                lines.extend(["", "Выбрано:"])
+                for item in selected_rows:
+                    lines.append(f"• {item['name']} — {_money_text(item.get('amount'), currency)}")
+                lines.append(f"Всего доп. услуг: {_money_text(addon_total, currency)}")
+            else:
+                lines.extend(["", "Пока ничего не выбрано."])
+            live_calculation = await _calculate_form_pricing(
+                int(form["id"]), questions, session["answers"], list(selected_ids)
+            )
+            if live_calculation:
+                lines.extend([
+                    "",
+                    f"💰 Предварительный итог с услугами: {_money_text(live_calculation.get('amount'), currency)}",
+                ])
+            await db.update_form_session(
+                chat_id, current_index=len(questions), status="addons", keyboard_question_id=0
+            )
+            session = await db.get_form_session(chat_id)
+            if not session:
+                return
+            await _upsert_form_message(
+                bot, session, text="\n".join(lines),
+                reply_markup=form_addons(addons, selected_ids, currency),
+            )
+            return
+
         await db.update_form_session(
             chat_id, current_index=len(questions), status="confirm", keyboard_question_id=0
         )
         session = await db.get_form_session(chat_id)
         if not session:
             return
-        pricing_calculation = await _calculate_form_pricing(
-            int(form["id"]), questions, session["answers"]
+        selected_rows = await _selected_addon_rows(
+            int(form["id"]), session.get("selected_addon_ids") or []
         )
+        pricing_calculation = await _calculate_form_pricing(
+            int(form["id"]), questions, session["answers"], session.get("selected_addon_ids") or []
+        )
+        currency = str(await db.get_setting("crm_currency", "₽") or "₽")
         await _upsert_form_message(
             bot,
             session,
             text=_form_preview_text(
-                form, questions, session["answers"], pricing_calculation
+                form, questions, session["answers"], pricing_calculation, selected_rows, currency
             ),
-            reply_markup=form_confirmation(),
+            reply_markup=form_confirmation(has_addons=bool(addons)),
         )
         return
 
@@ -1043,7 +1322,7 @@ async def send_current_form_question(
     if input_type == "time":
         date_iso = _selected_date_iso(questions, session["answers"])
         if _is_end_time_question(question):
-            options, busy_values = await _booking_end_time_options(questions, session["answers"])
+            options, busy_values = await _booking_end_time_options(int(form["id"]), questions, session["answers"])
             start_time = _find_start_time(questions, session["answers"])
             text = (
                 f"📝 {form['name']}\n\n"
@@ -1075,7 +1354,7 @@ async def send_current_form_question(
             return
 
         slots = await _booking_time_slots()
-        busy_slots = await _busy_time_slots(date_iso, slots)
+        busy_slots = await _busy_time_slots(date_iso, slots, int(form["id"]))
         text = (
             f"📝 {form['name']}\n\n"
             f"Вопрос {index + 1} из {len(questions)}\n"
@@ -1121,11 +1400,12 @@ async def handle_form_message(
 ) -> bool:
     if session["status"] == "confirm":
         await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+        addons = await db.list_form_addons(int(session["form_id"]), enabled_only=True)
         await _upsert_form_message(
             bot,
             session,
             text="Заявка уже заполнена. Используйте кнопки «Отправить заявку», «Изменить ответы» или «Отмена».",
-            reply_markup=form_confirmation(),
+            reply_markup=form_confirmation(has_addons=bool(addons)),
         )
         return True
 
@@ -1231,7 +1511,7 @@ async def handle_form_message(
                     reply_markup=form_question_nav(bool(question["required"]), index > 0),
                 )
                 return True
-            if await _booking_interval_conflicts(interval):
+            if await _booking_interval_conflicts_for_form(int(session["form_id"]), interval):
                 await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
                 await send_current_form_question(bot, message.chat.id)
                 return True
@@ -1244,7 +1524,7 @@ async def handle_form_message(
                     await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
                     await send_current_form_question(bot, message.chat.id)
                     return True
-                if await _booking_interval_conflicts(interval):
+                if await _booking_interval_conflicts_for_form(int(session["form_id"]), interval):
                     await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
                     await send_current_form_question(bot, message.chat.id)
                     return True
@@ -1303,6 +1583,8 @@ def _submission_chat_text(
     questions: list[dict],
     answers: dict[str, str],
     pricing_calculation: dict | None = None,
+    selected_addons: list[dict] | None = None,
+    currency: str = "₽",
 ) -> str:
     lines = [
         f"✅ Заявка №{submission_id} принята",
@@ -1316,6 +1598,10 @@ def _submission_chat_text(
     interval_summary = _booking_interval_summary(_booking_interval(questions, answers))
     if interval_summary:
         lines.extend(["", f"🕐 Интервал: {interval_summary}"])
+    if selected_addons and not pricing_calculation:
+        addon_text = _addons_text(selected_addons, currency)
+        if addon_text:
+            lines.extend(["", addon_text])
     pricing_text = _pricing_calculation_text(pricing_calculation)
     if pricing_text:
         lines.extend(["", pricing_text])
@@ -1756,7 +2042,7 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
                 f"Максимальный интервал — {max_duration // 60} ч.", show_alert=True
             )
             return
-        if await _booking_interval_conflicts(interval):
+        if await _booking_interval_conflicts_for_form(int(session["form_id"]), interval):
             await callback.answer("Этот интервал пересекается с занятой бронью", show_alert=True)
             await send_current_form_question(bot, callback.message.chat.id)
             return
@@ -1770,7 +2056,7 @@ async def time_pick(callback: CallbackQuery, bot: Bot) -> None:
                     f"Максимальный интервал — {max_duration // 60} ч.", show_alert=True
                 )
                 return
-            if await _booking_interval_conflicts(interval):
+            if await _booking_interval_conflicts_for_form(int(session["form_id"]), interval):
                 await callback.answer("Этот интервал пересекается с занятой бронью", show_alert=True)
                 await send_current_form_question(bot, callback.message.chat.id)
                 return
@@ -1866,6 +2152,70 @@ async def form_skip(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer("Пропущено")
 
 
+@router.callback_query(F.data.startswith("form:addon_toggle:"))
+async def form_addon_toggle(callback: CallbackQuery, bot: Bot) -> None:
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    if session.get("status") != "addons":
+        await callback.answer("Выбор услуг уже завершён", show_alert=True)
+        return
+    try:
+        addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная услуга", show_alert=True)
+        return
+    addon = await db.get_form_addon(addon_id)
+    if not addon or int(addon.get("form_id") or 0) != int(session["form_id"]) or not addon.get("enabled"):
+        await callback.answer("Услуга больше недоступна", show_alert=True)
+        return
+    selected = [int(x) for x in session.get("selected_addon_ids") or []]
+    if addon_id in selected:
+        selected = [x for x in selected if x != addon_id]
+        notice = "Услуга убрана"
+    else:
+        selected.append(addon_id)
+        notice = "Услуга добавлена"
+    await db.update_form_session(callback.message.chat.id, selected_addon_ids=selected)
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer(notice)
+
+
+@router.callback_query(F.data == "form:addons_clear")
+async def form_addons_clear(callback: CallbackQuery, bot: Bot) -> None:
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    await db.update_form_session(callback.message.chat.id, selected_addon_ids=[])
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer("Дополнительные услуги убраны")
+
+
+@router.callback_query(F.data == "form:addons_done")
+async def form_addons_done(callback: CallbackQuery, bot: Bot) -> None:
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    await db.update_form_session(
+        callback.message.chat.id, addons_confirmed=True, status="active"
+    )
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer("Дополнительные услуги сохранены")
+
+
+@router.callback_query(F.data == "form:addons_edit")
+async def form_addons_edit(callback: CallbackQuery, bot: Bot) -> None:
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    await db.update_form_session(
+        callback.message.chat.id, current_index=int(session.get("current_index") or 0),
+        addons_confirmed=False, status="addons"
+    )
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer("Можно изменить дополнительные услуги")
+
+
 @router.callback_query(F.data == "form:back")
 async def form_back(callback: CallbackQuery, bot: Bot) -> None:
     session = await _form_callback_session(callback)
@@ -1875,7 +2225,7 @@ async def form_back(callback: CallbackQuery, bot: Bot) -> None:
     if not questions:
         await callback.answer("В форме нет вопросов", show_alert=True)
         return
-    if session["status"] == "confirm":
+    if session["status"] in {"confirm", "addons"}:
         target = len(questions) - 1
     else:
         target = int(session["current_index"]) - 1
@@ -1883,7 +2233,8 @@ async def form_back(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Это первый вопрос", show_alert=True)
         return
     await db.update_form_session(
-        callback.message.chat.id, current_index=target, status="active", keyboard_question_id=0
+        callback.message.chat.id, current_index=target, status="active", keyboard_question_id=0,
+        addons_confirmed=False
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer()
@@ -1895,7 +2246,8 @@ async def form_edit_answers(callback: CallbackQuery, bot: Bot) -> None:
     if not session or not isinstance(callback.message, Message):
         return
     await db.update_form_session(
-        callback.message.chat.id, current_index=0, status="active", keyboard_question_id=0
+        callback.message.chat.id, current_index=0, status="active", keyboard_question_id=0,
+        addons_confirmed=False
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer("Можно изменить ответы")
@@ -1927,7 +2279,7 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             return
 
     booking_interval = _booking_interval(questions, session["answers"])
-    if booking_interval and await _booking_interval_conflicts(booking_interval):
+    if booking_interval and await _booking_interval_conflicts_for_form(int(form["id"]), booking_interval):
         target_index = 0
         if booking_interval.get("start_time"):
             for idx, question in enumerate(questions):
@@ -1948,21 +2300,34 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
         await send_current_form_question(bot, callback.message.chat.id)
         return
 
+    selected_addons = await _selected_addon_rows(
+        int(form["id"]), session.get("selected_addon_ids") or []
+    )
     pricing_calculation = await _calculate_form_pricing(
-        int(form["id"]), questions, session["answers"]
+        int(form["id"]), questions, session["answers"], session.get("selected_addon_ids") or []
     )
     calculated_amount = int(pricing_calculation.get("amount") or 0) if pricing_calculation else 0
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    pricing_details = pricing_calculation or {
+        "currency": currency,
+        "addons_total": sum(max(0, int(item.get("amount") or 0)) for item in selected_addons),
+        "addons": [
+            {"id": int(item["id"]), "name": str(item["name"]), "amount": max(0, int(item.get("amount") or 0))}
+            for item in selected_addons
+        ],
+    }
     submission_id = await db.create_form_submission(
         session,
         str(form["name"]),
         calculated_amount=calculated_amount,
-        pricing_details=pricing_calculation or {},
+        pricing_details=pricing_details,
     )
     await _upsert_form_message(
         bot,
         session,
         text=_submission_chat_text(
-            submission_id, form, questions, session["answers"], pricing_calculation
+            submission_id, form, questions, session["answers"], pricing_calculation,
+            selected_addons, currency
         ),
         reply_markup=None,
     )
@@ -2871,7 +3236,8 @@ async def admin_pricing_open(callback: CallbackQuery, state: FSMContext) -> None
         "<b>💰 Тарифы и расчёт аренды</b>\n\n"
         "Выберите форму. Для форм с датой, временем начала и окончания бот может "
         "автоматически рассчитать предварительную стоимость аренды.\n\n"
-        "Расчёт: базовая стоимость + каждый начатый дополнительный час."
+        "Расчёт: базовая стоимость + каждый начатый дополнительный час + выбранные доп. услуги. "
+        "Здесь же настраиваются технические буферы для монтажа и уборки."
     )
     if isinstance(callback.message, Message):
         await callback.message.edit_text(
@@ -2976,6 +3342,24 @@ async def _pricing_edit_start(
             "Например: <code>6</code>. Если нужен чисто почасовой тариф — отправьте <code>0</code>.\n\n"
             f"Сейчас: {int(pricing.get('included_hours') or 0)} ч"
         )
+    elif field == "buffer_before_minutes":
+        await state.set_state(AdminStates.pricing_buffer_before)
+        prompt = (
+            "Введите технический буфер <b>до</b> аренды. Он блокирует календарь для монтажа, "
+            "но не добавляется к оплачиваемой длительности.\n\n"
+            "Можно ввести минуты (<code>120</code>), часы (<code>2ч</code>) или <code>1:30</code>. "
+            "Для отключения — <code>0</code>.\n\n"
+            f"Сейчас: {_duration_minutes_text(pricing.get('buffer_before_minutes'))}"
+        )
+    elif field == "buffer_after_minutes":
+        await state.set_state(AdminStates.pricing_buffer_after)
+        prompt = (
+            "Введите технический буфер <b>после</b> аренды. Он блокирует календарь для уборки/демонтажа, "
+            "но не увеличивает цену аренды.\n\n"
+            "Можно ввести минуты (<code>120</code>), часы (<code>2ч</code>) или <code>1:30</code>. "
+            "Для отключения — <code>0</code>.\n\n"
+            f"Сейчас: {_duration_minutes_text(pricing.get('buffer_after_minutes'))}"
+        )
     else:
         await state.set_state(AdminStates.pricing_extra_hour_amount)
         prompt = (
@@ -3003,6 +3387,16 @@ async def admin_pricing_extra_start(callback: CallbackQuery, state: FSMContext) 
     await _pricing_edit_start(callback, state, field="extra_hour_amount")
 
 
+@router.callback_query(F.data.startswith("adm:pricing_buffer_before:"))
+async def admin_pricing_buffer_before_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _pricing_edit_start(callback, state, field="buffer_before_minutes")
+
+
+@router.callback_query(F.data.startswith("adm:pricing_buffer_after:"))
+async def admin_pricing_buffer_after_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _pricing_edit_start(callback, state, field="buffer_after_minutes")
+
+
 async def _pricing_save_value(
     message: Message, state: FSMContext, *, field: str
 ) -> None:
@@ -3024,6 +3418,12 @@ async def _pricing_save_value(
         if value < 0 or value > 24:
             await message.answer("Допустимое значение: от 0 до 24 часов.")
             return
+    elif field in {"buffer_before_minutes", "buffer_after_minutes"}:
+        parsed_buffer = _parse_buffer_minutes(message.text)
+        if parsed_buffer is None:
+            await message.answer("Введите 0–1440 минут, например 120, 2ч или 1:30.")
+            return
+        value = parsed_buffer
     else:
         parsed = _parse_money_input(message.text)
         if parsed is None:
@@ -3053,6 +3453,269 @@ async def admin_pricing_hours_save(message: Message, state: FSMContext) -> None:
 @router.message(AdminStates.pricing_extra_hour_amount)
 async def admin_pricing_extra_save(message: Message, state: FSMContext) -> None:
     await _pricing_save_value(message, state, field="extra_hour_amount")
+
+
+@router.message(AdminStates.pricing_buffer_before)
+async def admin_pricing_buffer_before_save(message: Message, state: FSMContext) -> None:
+    await _pricing_save_value(message, state, field="buffer_before_minutes")
+
+
+@router.message(AdminStates.pricing_buffer_after)
+async def admin_pricing_buffer_after_save(message: Message, state: FSMContext) -> None:
+    await _pricing_save_value(message, state, field="buffer_after_minutes")
+
+
+async def _render_admin_addons(message: Message, form_id: int) -> None:
+    form = await db.get_form(form_id)
+    if not form:
+        await message.answer("Форма не найдена.")
+        return
+    addons = await db.list_form_addons(form_id)
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    active = sum(1 for item in addons if item.get("enabled"))
+    text = (
+        f"<b>🧰 Доп. услуги · {html.escape(str(form['name']))}</b>\n\n"
+        f"Активно: {active} · всего: {len(addons)}\n\n"
+        "Клиент сможет отметить несколько услуг перед подтверждением заявки. "
+        "Стоимость выбранных услуг автоматически прибавится к расчёту аренды."
+    )
+    await message.edit_text(text, reply_markup=admin_addons_list(form_id, addons, currency))
+
+
+@router.callback_query(F.data.startswith("adm:addons:"))
+async def admin_addons_open(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        form_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная форма", show_alert=True)
+        return
+    await state.clear()
+    if isinstance(callback.message, Message):
+        await _render_admin_addons(callback.message, form_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:addon_add:"))
+async def admin_addon_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        form_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная форма", show_alert=True)
+        return
+    if not await db.get_form(form_id):
+        await callback.answer("Форма не найдена", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(addon_form_id=form_id)
+    await state.set_state(AdminStates.addon_add_name)
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            "Введите название дополнительной услуги. Например: <code>Звук</code>, <code>Свет</code> или <code>Уборка</code>."
+        )
+    await callback.answer()
+
+
+@router.message(AdminStates.addon_add_name)
+async def admin_addon_add_name_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    name = (message.text or "").strip()
+    if len(name) < 2 or len(name) > 80:
+        await message.answer("Название должно быть от 2 до 80 символов.")
+        return
+    await state.update_data(addon_name=name)
+    await state.set_state(AdminStates.addon_add_amount)
+    await message.answer("Введите стоимость услуги, например <code>15000</code>. Для бесплатной услуги — <code>0</code>.")
+
+
+@router.message(AdminStates.addon_add_amount)
+async def admin_addon_add_amount_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    amount = _parse_money_input(message.text)
+    if amount is None:
+        await message.answer("Введите сумму целым числом, например 15000 или 0.")
+        return
+    data = await state.get_data()
+    form_id = int(data.get("addon_form_id") or 0)
+    name = str(data.get("addon_name") or "").strip()
+    if not form_id or not name:
+        await state.clear()
+        await message.answer("Сессия настройки устарела. Откройте тариф заново.")
+        return
+    await db.add_form_addon(form_id, name, amount)
+    await state.clear()
+    addons = await db.list_form_addons(form_id)
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    await message.answer(
+        f"✅ Услуга «{html.escape(name)}» добавлена.",
+        reply_markup=admin_addons_list(form_id, addons, currency),
+    )
+
+
+def _addon_admin_text(addon: dict, currency: str) -> str:
+    return (
+        f"<b>🧰 {html.escape(str(addon['name']))}</b>\n\n"
+        f"Цена: <b>{html.escape(_money_text(addon.get('amount'), currency))}</b>\n"
+        f"Статус: {'🟢 включена' if addon.get('enabled') else '⚪ выключена'}"
+    )
+
+
+@router.callback_query(F.data.startswith("adm:addon:"))
+async def admin_addon_open(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная услуга", show_alert=True)
+        return
+    addon = await db.get_form_addon(addon_id)
+    if not addon:
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            _addon_admin_text(addon, currency), reply_markup=admin_addon_edit(addon)
+        )
+    await callback.answer()
+
+
+async def _addon_edit_start(callback: CallbackQuery, state: FSMContext, field: str) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная услуга", show_alert=True)
+        return
+    addon = await db.get_form_addon(addon_id)
+    if not addon:
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(addon_id=addon_id)
+    if field == "name":
+        await state.set_state(AdminStates.addon_edit_name)
+        prompt = f"Введите новое название. Сейчас: <b>{html.escape(str(addon['name']))}</b>"
+    else:
+        await state.set_state(AdminStates.addon_edit_amount)
+        prompt = f"Введите новую стоимость. Сейчас: <b>{_money_text(addon.get('amount'), str(await db.get_setting('crm_currency', '₽') or '₽'))}</b>"
+    if isinstance(callback.message, Message):
+        await callback.message.answer(prompt)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:addon_name:"))
+async def admin_addon_name_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _addon_edit_start(callback, state, "name")
+
+
+@router.callback_query(F.data.startswith("adm:addon_amount:"))
+async def admin_addon_amount_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _addon_edit_start(callback, state, "amount")
+
+
+@router.message(AdminStates.addon_edit_name)
+async def admin_addon_name_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    name = (message.text or "").strip()
+    if len(name) < 2 or len(name) > 80:
+        await message.answer("Название должно быть от 2 до 80 символов.")
+        return
+    data = await state.get_data()
+    addon_id = int(data.get("addon_id") or 0)
+    await db.update_form_addon_field(addon_id, "name", name)
+    addon = await db.get_form_addon(addon_id)
+    await state.clear()
+    if addon:
+        currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+        await message.answer(_addon_admin_text(addon, currency), reply_markup=admin_addon_edit(addon))
+
+
+@router.message(AdminStates.addon_edit_amount)
+async def admin_addon_amount_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    amount = _parse_money_input(message.text)
+    if amount is None:
+        await message.answer("Введите сумму целым числом, например 15000 или 0.")
+        return
+    data = await state.get_data()
+    addon_id = int(data.get("addon_id") or 0)
+    await db.update_form_addon_field(addon_id, "amount", amount)
+    addon = await db.get_form_addon(addon_id)
+    await state.clear()
+    if addon:
+        currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+        await message.answer(_addon_admin_text(addon, currency), reply_markup=admin_addon_edit(addon))
+
+
+@router.callback_query(F.data.startswith("adm:addon_toggle:"))
+async def admin_addon_toggle(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    addon = await db.get_form_addon(addon_id)
+    if not addon:
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+    await db.update_form_addon_field(addon_id, "enabled", 0 if addon.get("enabled") else 1)
+    addon = await db.get_form_addon(addon_id)
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    if isinstance(callback.message, Message) and addon:
+        await callback.message.edit_text(_addon_admin_text(addon, currency), reply_markup=admin_addon_edit(addon))
+    await callback.answer("Готово")
+
+
+@router.callback_query(F.data.startswith("adm:addon_delete:"))
+async def admin_addon_delete(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    addon = await db.get_form_addon(addon_id)
+    if not addon:
+        await callback.answer("Услуга уже удалена", show_alert=True)
+        return
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            f"Удалить услугу <b>{html.escape(str(addon['name']))}</b>?",
+            reply_markup=admin_addon_delete_confirm(addon),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:addon_delete_yes:"))
+async def admin_addon_delete_yes(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    addon = await db.get_form_addon(addon_id)
+    if not addon:
+        await callback.answer("Услуга уже удалена", show_alert=True)
+        return
+    form_id = int(addon["form_id"])
+    await db.delete_form_addon(addon_id)
+    addons = await db.list_form_addons(form_id)
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            "Услуга удалена.", reply_markup=admin_addons_list(form_id, addons, currency)
+        )
+    await callback.answer("Удалено")
 
 
 @router.callback_query(F.data.startswith("adm:reqs:"))
@@ -3126,8 +3789,8 @@ async def admin_request_status(callback: CallbackQuery, bot: Bot) -> None:
     questions = await db.list_form_questions(int(submission["form_id"])) if submission.get("form_id") else []
     interval = _booking_interval(questions, submission.get("answers") or {}) if questions else None
     if new_status in BOOKING_STATUSES and interval:
-        if await _booking_interval_conflicts(
-            interval, exclude_submission_id=submission_id
+        if await _booking_interval_conflicts_for_form(
+            int(submission["form_id"]), interval, exclude_submission_id=submission_id
         ):
             await callback.answer(
                 "Нельзя подтвердить: интервал пересекается с занятой бронью. Проверьте раздел «Занятость».",
@@ -3136,10 +3799,22 @@ async def admin_request_status(callback: CallbackQuery, bot: Bot) -> None:
             return
     await db.update_submission_status(submission_id, new_status, callback.from_user.id)
     if new_status in BOOKING_STATUSES and interval:
+        pricing = await db.get_form_pricing(int(submission["form_id"]))
+        buffered = _booking_interval_with_buffers(
+            interval,
+            int(pricing.get("buffer_before_minutes") or 0),
+            int(pricing.get("buffer_after_minutes") or 0),
+        )
+        segments = (buffered or {}).get("technical_segments") or interval["segments"]
+        before = int(pricing.get("buffer_before_minutes") or 0)
+        after = int(pricing.get("buffer_after_minutes") or 0)
+        buffer_note = ""
+        if before or after:
+            buffer_note = f" · буфер -{_duration_minutes_text(before)} / +{_duration_minutes_text(after)}"
         await db.replace_submission_availability(
             submission_id,
-            interval["segments"],
-            note=f"Заявка №{submission_id}: {submission['form_name']}",
+            segments,
+            note=f"Заявка №{submission_id}: {submission['form_name']}{buffer_note}",
         )
     else:
         await db.delete_submission_availability(submission_id)
