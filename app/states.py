@@ -5,6 +5,7 @@ class AdminStates(StatesGroup):
     greeting = State()
     cooldown = State()
     grid_columns = State()
+    menu_triggers = State()
 
     add_title = State()
     add_response = State()

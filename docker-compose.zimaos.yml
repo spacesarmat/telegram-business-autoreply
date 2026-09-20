@@ -70,8 +70,8 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "1.3.1"
+  version: "1.3.2"
   update_at: "2026-09-20"
   release_notes:
-    en_US: Adds persistent multi-step request forms, confirmations and admin notifications.
-    ru_RU: Добавлены пошаговые формы заявок, подтверждение перед отправкой и уведомления администратору.
+    en_US: Adds manual menu triggers, a Main Menu button inside forms, and editable trigger phrases in /admin.
+    ru_RU: Добавлены ручной вызов меню по фразам, кнопка «Главное меню» в формах и настройка фраз через /admin.

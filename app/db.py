@@ -13,6 +13,7 @@ DEFAULT_SETTINGS = {
     "autoresponder_enabled": "1",
     "cooldown_hours": "168",
     "menu_columns": "1",
+    "menu_triggers": "/menu\nменю\nзаявка",
     "greeting": (
         "Здравствуйте! Спасибо за сообщение.\n\n"
         "Я отвечаю автоматически, если вы пишете впервые или после длительного перерыва. "

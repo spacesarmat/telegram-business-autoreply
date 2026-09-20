@@ -24,6 +24,7 @@ def form_question_nav(required: bool, can_go_back: bool) -> InlineKeyboardMarkup
         row.append(InlineKeyboardButton(text="⏭ Пропустить", callback_data="form:skip"))
     if row:
         builder.row(*row)
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:menu"))
     builder.row(InlineKeyboardButton(text="❌ Отменить заявку", callback_data="form:cancel"))
     return builder.as_markup()
 
@@ -35,6 +36,7 @@ def form_confirmation() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✏️ Изменить ответы", callback_data="form:edit"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="form:cancel"),
     )
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="form:menu"))
     return builder.as_markup()
 
 
@@ -48,7 +50,10 @@ def admin_main(enabled: bool) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🧩 Кнопки", callback_data="adm:buttons"),
         InlineKeyboardButton(text="📝 Формы", callback_data="adm:forms"),
     )
-    builder.row(InlineKeyboardButton(text="🧱 Сетка", callback_data="adm:grid"))
+    builder.row(
+        InlineKeyboardButton(text="🧱 Сетка", callback_data="adm:grid"),
+        InlineKeyboardButton(text="⚡ Вызов меню", callback_data="adm:menu_triggers"),
+    )
     builder.row(
         InlineKeyboardButton(
             text=("🟢 Автоответ включён" if enabled else "⚪ Автоответ выключен"),

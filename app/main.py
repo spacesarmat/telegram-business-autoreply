@@ -50,6 +50,92 @@ async def get_autoresponder_enabled() -> bool:
     return (await db.get_setting("autoresponder_enabled", "1")) == "1"
 
 
+def _normalize_menu_trigger(value: str) -> str:
+    value = " ".join(value.strip().casefold().split())
+    # Telegram may present a slash command as /menu@BotUsername.
+    if value.startswith("/") and " " not in value and "@" in value:
+        value = value.split("@", 1)[0]
+    return value
+
+
+def _parse_menu_triggers(raw: str | None) -> list[str]:
+    raw = raw or ""
+    values: list[str] = []
+    seen: set[str] = set()
+    for line in raw.replace(";", "\n").splitlines():
+        item = _normalize_menu_trigger(line)
+        if item and item not in seen:
+            seen.add(item)
+            values.append(item)
+    return values
+
+
+async def get_menu_triggers() -> list[str]:
+    return _parse_menu_triggers(await db.get_setting("menu_triggers", "/menu\nменю\nзаявка"))
+
+
+async def is_menu_trigger(text: str | None) -> bool:
+    if not text:
+        return False
+    return _normalize_menu_trigger(text) in set(await get_menu_triggers())
+
+
+async def _show_public_menu(
+    bot: Bot,
+    *,
+    chat_id: int,
+    business_connection_id: str,
+    text: str = "Выберите, что вас интересует:",
+    edit_message_id: int | None = None,
+) -> int | None:
+    columns = int(await db.get_setting("menu_columns", "1") or 1)
+    buttons = await db.list_buttons(enabled_only=True)
+    markup = public_menu(buttons, columns)
+
+    if edit_message_id is not None:
+        try:
+            edited = await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=edit_message_id,
+                business_connection_id=business_connection_id,
+                text=text,
+                parse_mode=None,
+                reply_markup=markup,
+            )
+            if isinstance(edited, Message):
+                return int(edited.message_id)
+            return edit_message_id
+        except TelegramAPIError:
+            logger.warning("Не удалось превратить сообщение формы в главное меню; отправляю новое")
+
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            business_connection_id=business_connection_id,
+            text=text,
+            parse_mode=None,
+            reply_markup=markup,
+        )
+        return int(sent.message_id)
+    except TelegramAPIError:
+        logger.exception("Не удалось показать главное меню в chat_id=%s", chat_id)
+        return None
+
+
+async def _delete_incoming_business_message(
+    bot: Bot, *, business_connection_id: str, message_id: int, allowed: bool
+) -> None:
+    if not allowed:
+        return
+    try:
+        await bot.delete_business_messages(
+            business_connection_id=business_connection_id,
+            message_ids=[message_id],
+        )
+    except TelegramAPIError:
+        logger.warning("Не удалось удалить служебное сообщение вызова меню %s", message_id)
+
+
 async def render_admin_button(button: dict) -> tuple[str, object]:
     status = "включена" if button["enabled"] else "выключена"
     bound_form = await db.get_bound_form(int(button["id"]))
@@ -311,6 +397,7 @@ async def render_admin_home() -> tuple[str, object]:
     enabled = await get_autoresponder_enabled()
     cooldown = int(await db.get_setting("cooldown_hours", "168") or 168)
     columns = int(await db.get_setting("menu_columns", "1") or 1)
+    trigger_count = len(await get_menu_triggers())
     connection = await db.latest_business_connection()
 
     if connection and connection["enabled"]:
@@ -331,6 +418,7 @@ async def render_admin_home() -> tuple[str, object]:
         f"Автоответ: {'включён' if enabled else 'выключен'}\n"
         f"Повторный автоответ после паузы: {cooldown} ч.\n"
         f"Кнопок в строке: {columns}\n"
+        f"Фраз вызова меню: {trigger_count}\n"
         f"Business-соединение: {conn_text}\n"
         f"Чистая форма: {clean_form_text}\n\n"
         "Настройки меняются прямо здесь и сохраняются в SQLite."
@@ -440,6 +528,29 @@ async def on_business_message(message: Message, bot: Bot) -> None:
     )
 
     session = await db.get_form_session(message.chat.id)
+
+    # Ручной вызов меню всегда имеет приоритет над cooldown и активной формой.
+    if await is_menu_trigger(message.text):
+        if not connection["can_reply"]:
+            logger.warning("Нет права can_reply для ручного вызова меню в %s", connection_id)
+            return
+        edit_message_id = int(session["form_message_id"]) if session and session.get("form_message_id") else None
+        await _delete_incoming_business_message(
+            bot,
+            business_connection_id=connection_id,
+            message_id=message.message_id,
+            allowed=bool(connection.get("can_delete_all_messages")),
+        )
+        menu_message_id = await _show_public_menu(
+            bot,
+            chat_id=message.chat.id,
+            business_connection_id=connection_id,
+            edit_message_id=edit_message_id,
+        )
+        if menu_message_id is not None and session:
+            await db.delete_form_session(message.chat.id)
+        return
+
     if session:
         if not connection["can_reply"]:
             logger.warning("Нет права can_reply для активной формы в BusinessConnection %s", connection_id)
@@ -477,20 +588,14 @@ async def on_business_message(message: Message, bot: Bot) -> None:
         return
 
     greeting = await db.get_setting("greeting", "Здравствуйте!") or "Здравствуйте!"
-    columns = int(await db.get_setting("menu_columns", "1") or 1)
-    buttons = await db.list_buttons(enabled_only=True)
-
-    try:
-        await bot.send_message(
-            chat_id=message.chat.id,
-            business_connection_id=connection_id,
-            text=greeting,
-            parse_mode=None,
-            reply_markup=public_menu(buttons, columns),
-        )
+    sent_id = await _show_public_menu(
+        bot,
+        chat_id=message.chat.id,
+        business_connection_id=connection_id,
+        text=greeting,
+    )
+    if sent_id is not None:
         await db.mark_auto_reply(message.chat.id, now_iso)
-    except TelegramAPIError:
-        logger.exception("Не удалось отправить Business-автоответ в chat_id=%s", message.chat.id)
 
 
 @router.callback_query(F.data.startswith("pub:"))
@@ -547,6 +652,31 @@ async def on_public_button(callback: CallbackQuery, bot: Bot) -> None:
             )
         except TelegramAPIError:
             pass
+
+
+@router.callback_query(F.data == "form:menu")
+async def form_main_menu(callback: CallbackQuery, bot: Bot) -> None:
+    if not isinstance(callback.message, Message) or not callback.message.business_connection_id:
+        await callback.answer("Не удалось открыть меню", show_alert=True)
+        return
+
+    session = await db.get_form_session(callback.message.chat.id)
+    if session and session.get("form_message_id"):
+        if int(session["form_message_id"]) != int(callback.message.message_id):
+            await callback.answer("Это старая кнопка формы", show_alert=True)
+            return
+
+    menu_message_id = await _show_public_menu(
+        bot,
+        chat_id=callback.message.chat.id,
+        business_connection_id=callback.message.business_connection_id,
+        edit_message_id=callback.message.message_id,
+    )
+    if menu_message_id is None:
+        await callback.answer("Не удалось открыть меню", show_alert=True)
+        return
+    await db.delete_form_session(callback.message.chat.id)
+    await callback.answer("Главное меню")
 
 
 @router.callback_query(F.data == "form:cancel")
@@ -750,6 +880,47 @@ async def admin_cooldown_save(message: Message, state: FSMContext) -> None:
     await db.set_setting("cooldown_hours", str(value))
     await state.clear()
     await message.answer(f"Интервал сохранён: {value} ч.")
+    await show_admin_home_message(message)
+
+
+@router.callback_query(F.data == "adm:menu_triggers")
+async def admin_menu_triggers(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    current = await get_menu_triggers()
+    await state.set_state(AdminStates.menu_triggers)
+    if isinstance(callback.message, Message):
+        shown = "\n".join(f"• {html.escape(item)}" for item in current)
+        await callback.message.answer(
+            "<b>Фразы вызова главного меню</b>\n\n"
+            f"Сейчас:\n{shown}\n\n"
+            "Отправьте новый список — по одной фразе в каждой строке. "
+            "Регистр не важен. Например:\n<code>/menu\nменю\nзаявка</code>"
+        )
+    await callback.answer()
+
+
+@router.message(AdminStates.menu_triggers)
+async def admin_menu_triggers_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    raw = (message.text or "").strip()
+    values = _parse_menu_triggers(raw)
+    if not values:
+        await message.answer("Нужно указать хотя бы одну фразу вызова меню.")
+        return
+    if len(values) > 20:
+        await message.answer("Можно указать не более 20 фраз.")
+        return
+    if any(len(value) > 64 for value in values):
+        await message.answer("Каждая фраза должна быть не длиннее 64 символов.")
+        return
+    await db.set_setting("menu_triggers", "\n".join(values))
+    await state.clear()
+    await message.answer(
+        "Фразы вызова меню сохранены:\n" + "\n".join(f"• {html.escape(v)}" for v in values)
+    )
     await show_admin_home_message(message)
 
 
