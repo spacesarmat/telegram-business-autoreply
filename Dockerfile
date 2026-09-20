@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-LABEL org.opencontainers.image.source="https://github.com/spacesarmat/TGAUTOREPLY" \
+LABEL org.opencontainers.image.source="https://github.com/spacesarmat/telegram-business-autoreply" \
       org.opencontainers.image.title="Telegram Business AutoReply" \
       org.opencontainers.image.description="Telegram Business auto-reply bot for ZimaOS/CasaOS"
 

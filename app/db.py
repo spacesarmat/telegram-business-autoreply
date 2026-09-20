@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,25 +27,85 @@ DEFAULT_BUTTONS = [
     ),
     (
         "Заказать мероприятие",
-        "Отлично! Напишите дату, формат мероприятия, примерное количество гостей и ваши пожелания.",
+        "Отлично! Заполните короткую заявку — я получу её целиком после подтверждения.",
     ),
     (
         "Аренда оборудования",
-        "Укажите, пожалуйста, какое оборудование вас интересует, даты аренды и место использования.",
+        "Заполните короткую заявку на аренду оборудования — я получу её после подтверждения.",
     ),
     (
         "Аренда Фабрики",
-        "Напишите желаемую дату, длительность аренды, формат мероприятия и примерное количество гостей.",
+        "Заполните короткую заявку на аренду Фабрики — я получу её после подтверждения.",
     ),
     (
         "Другое",
-        "Опишите ваш вопрос свободным текстом — я увижу сообщение и отвечу, как только смогу.",
+        "Опишите ваш вопрос в короткой форме — я получу его после подтверждения.",
     ),
+]
+
+DEFAULT_FORMS: list[dict[str, Any]] = [
+    {
+        "button_title": "Заказать мероприятие",
+        "name": "Заказать мероприятие",
+        "questions": [
+            ("Дата", "На какую дату планируется мероприятие?", True),
+            ("Формат", "Какой формат мероприятия планируется?", True),
+            ("Количество гостей", "Сколько примерно будет гостей?", True),
+            ("Место", "Где планируется мероприятие / какая площадка нужна?", False),
+            ("Телефон", "Оставьте контактный телефон для связи.", True),
+            ("Комментарий", "Дополнительные пожелания или комментарий.", False),
+        ],
+    },
+    {
+        "button_title": "Аренда оборудования",
+        "name": "Аренда оборудования",
+        "questions": [
+            ("Оборудование", "Какое оборудование вас интересует?", True),
+            ("Даты аренды", "На какие даты нужна аренда?", True),
+            ("Получение", "Доставка или самовывоз?", True),
+            ("Адрес", "Укажите адрес доставки / место использования.", False),
+            ("Телефон", "Оставьте контактный телефон для связи.", True),
+            ("Комментарий", "Дополнительные пожелания или комментарий.", False),
+        ],
+    },
+    {
+        "button_title": "Аренда Фабрики",
+        "name": "Аренда Фабрики",
+        "questions": [
+            ("Дата", "На какую дату нужна аренда Фабрики?", True),
+            ("Время", "Во сколько планируется начало?", True),
+            ("Продолжительность", "На сколько часов нужна площадка?", True),
+            ("Количество гостей", "Сколько примерно будет гостей?", True),
+            ("Формат", "Какой формат мероприятия планируется?", True),
+            ("Телефон", "Оставьте контактный телефон для связи.", True),
+            ("Комментарий", "Дополнительные пожелания или комментарий.", False),
+        ],
+    },
+    {
+        "button_title": "Другое",
+        "name": "Другой вопрос",
+        "questions": [
+            ("Вопрос", "Опишите, пожалуйста, ваш вопрос.", True),
+            ("Телефон", "Оставьте контактный телефон, если удобно.", False),
+        ],
+    },
 ]
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _decode_answers(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): str(v) for k, v in value.items() if v is not None}
 
 
 class Database:
@@ -102,6 +163,68 @@ class Database:
                     can_reply INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS forms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS form_questions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    form_id INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 100,
+                    required INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS button_forms (
+                    button_id INTEGER PRIMARY KEY,
+                    form_id INTEGER NOT NULL,
+                    FOREIGN KEY(button_id) REFERENCES menu_buttons(id) ON DELETE CASCADE,
+                    FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS form_sessions (
+                    chat_id INTEGER PRIMARY KEY,
+                    business_connection_id TEXT NOT NULL,
+                    form_id INTEGER NOT NULL,
+                    current_index INTEGER NOT NULL DEFAULT 0,
+                    answers_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    user_id INTEGER,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS form_submissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    form_id INTEGER,
+                    form_name TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    answers_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_form_questions_form_position
+                    ON form_questions(form_id, position, id);
+                CREATE INDEX IF NOT EXISTS idx_form_submissions_created
+                    ON form_submissions(created_at DESC);
                 """
             )
 
@@ -122,7 +245,45 @@ class Database:
                         """,
                         (title, response, position, now, now),
                     )
+
+            seeded = await (
+                await db.execute("SELECT value FROM settings WHERE key='forms_seeded_v1'")
+            ).fetchone()
+            if not seeded:
+                await self._seed_default_forms(db)
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings(key, value) VALUES('forms_seeded_v1', '1')"
+                )
             await db.commit()
+
+    async def _seed_default_forms(self, db: aiosqlite.Connection) -> None:
+        now = utc_now_iso()
+        for form_def in DEFAULT_FORMS:
+            button = await (
+                await db.execute(
+                    "SELECT id FROM menu_buttons WHERE title=? ORDER BY id LIMIT 1",
+                    (form_def["button_title"],),
+                )
+            ).fetchone()
+            if not button:
+                continue
+            cur = await db.execute(
+                "INSERT INTO forms(name, enabled, created_at, updated_at) VALUES(?, 1, ?, ?)",
+                (form_def["name"], now, now),
+            )
+            form_id = int(cur.lastrowid)
+            for position, (label, prompt, required) in enumerate(form_def["questions"], start=1):
+                await db.execute(
+                    """
+                    INSERT INTO form_questions(form_id, label, prompt, position, required, created_at, updated_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (form_id, label, prompt, position, int(required), now, now),
+                )
+            await db.execute(
+                "INSERT OR REPLACE INTO button_forms(button_id, form_id) VALUES(?, ?)",
+                (int(button["id"]), form_id),
+            )
 
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
         async with self.connection() as db:
@@ -288,9 +449,266 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
-    async def stats(self) -> dict[str, int]:
+    # ---------- Формы ----------
+
+    async def list_forms(self) -> list[dict[str, Any]]:
+        async with self.connection() as db:
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT f.*,
+                           (SELECT COUNT(*) FROM form_questions q WHERE q.form_id=f.id) AS question_count,
+                           (SELECT COUNT(*) FROM button_forms bf WHERE bf.form_id=f.id) AS button_count
+                    FROM forms f
+                    ORDER BY f.id ASC
+                    """
+                )
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_form(self, form_id: int) -> dict[str, Any] | None:
         async with self.connection() as db:
             row = await (
+                await db.execute(
+                    """
+                    SELECT f.*,
+                           (SELECT COUNT(*) FROM form_questions q WHERE q.form_id=f.id) AS question_count,
+                           (SELECT COUNT(*) FROM button_forms bf WHERE bf.form_id=f.id) AS button_count
+                    FROM forms f WHERE f.id=?
+                    """,
+                    (form_id,),
+                )
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def add_form(self, name: str) -> int:
+        now = utc_now_iso()
+        async with self.connection() as db:
+            cur = await db.execute(
+                "INSERT INTO forms(name, enabled, created_at, updated_at) VALUES(?, 1, ?, ?)",
+                (name, now, now),
+            )
+            await db.commit()
+            return int(cur.lastrowid)
+
+    async def update_form_field(self, form_id: int, field: str, value: Any) -> None:
+        if field not in {"name", "enabled"}:
+            raise ValueError("Unsupported form field")
+        async with self.connection() as db:
+            await db.execute(
+                f"UPDATE forms SET {field}=?, updated_at=? WHERE id=?",
+                (value, utc_now_iso(), form_id),
+            )
+            await db.commit()
+
+    async def delete_form(self, form_id: int) -> None:
+        async with self.connection() as db:
+            await db.execute("DELETE FROM forms WHERE id=?", (form_id,))
+            await db.commit()
+
+    async def list_form_questions(self, form_id: int) -> list[dict[str, Any]]:
+        async with self.connection() as db:
+            rows = await (
+                await db.execute(
+                    "SELECT * FROM form_questions WHERE form_id=? ORDER BY position ASC, id ASC",
+                    (form_id,),
+                )
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_form_question(self, question_id: int) -> dict[str, Any] | None:
+        async with self.connection() as db:
+            row = await (
+                await db.execute("SELECT * FROM form_questions WHERE id=?", (question_id,))
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def add_form_question(self, form_id: int, label: str, prompt: str, required: bool = True) -> int:
+        now = utc_now_iso()
+        async with self.connection() as db:
+            row = await (
+                await db.execute(
+                    "SELECT COALESCE(MAX(position), 0) + 1 AS p FROM form_questions WHERE form_id=?",
+                    (form_id,),
+                )
+            ).fetchone()
+            cur = await db.execute(
+                """
+                INSERT INTO form_questions(form_id, label, prompt, position, required, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (form_id, label, prompt, int(row["p"]), int(required), now, now),
+            )
+            await db.commit()
+            return int(cur.lastrowid)
+
+    async def update_form_question_field(self, question_id: int, field: str, value: Any) -> None:
+        if field not in {"label", "prompt", "position", "required"}:
+            raise ValueError("Unsupported question field")
+        async with self.connection() as db:
+            await db.execute(
+                f"UPDATE form_questions SET {field}=?, updated_at=? WHERE id=?",
+                (value, utc_now_iso(), question_id),
+            )
+            await db.commit()
+
+    async def delete_form_question(self, question_id: int) -> None:
+        async with self.connection() as db:
+            await db.execute("DELETE FROM form_questions WHERE id=?", (question_id,))
+            await db.commit()
+
+    async def list_form_button_ids(self, form_id: int) -> list[int]:
+        async with self.connection() as db:
+            rows = await (
+                await db.execute("SELECT button_id FROM button_forms WHERE form_id=?", (form_id,))
+            ).fetchall()
+            return [int(row["button_id"]) for row in rows]
+
+    async def set_button_form(self, button_id: int, form_id: int | None) -> None:
+        async with self.connection() as db:
+            if form_id is None:
+                await db.execute("DELETE FROM button_forms WHERE button_id=?", (button_id,))
+            else:
+                await db.execute(
+                    "INSERT OR REPLACE INTO button_forms(button_id, form_id) VALUES(?, ?)",
+                    (button_id, form_id),
+                )
+            await db.commit()
+
+    async def get_bound_form(self, button_id: int, enabled_only: bool = False) -> dict[str, Any] | None:
+        sql = (
+            "SELECT f.* FROM button_forms bf JOIN forms f ON f.id=bf.form_id "
+            "WHERE bf.button_id=?"
+        )
+        if enabled_only:
+            sql += " AND f.enabled=1"
+        async with self.connection() as db:
+            row = await (await db.execute(sql, (button_id,))).fetchone()
+            return dict(row) if row else None
+
+    async def start_form_session(
+        self,
+        chat_id: int,
+        business_connection_id: str,
+        form_id: int,
+        user_id: int | None,
+        username: str | None,
+        first_name: str | None,
+        last_name: str | None,
+    ) -> None:
+        now = utc_now_iso()
+        async with self.connection() as db:
+            await db.execute(
+                """
+                INSERT INTO form_sessions(
+                    chat_id, business_connection_id, form_id, current_index, answers_json, status,
+                    user_id, username, first_name, last_name, created_at, updated_at
+                ) VALUES(?, ?, ?, 0, '{}', 'active', ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    business_connection_id=excluded.business_connection_id,
+                    form_id=excluded.form_id,
+                    current_index=0,
+                    answers_json='{}',
+                    status='active',
+                    user_id=excluded.user_id,
+                    username=excluded.username,
+                    first_name=excluded.first_name,
+                    last_name=excluded.last_name,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    chat_id,
+                    business_connection_id,
+                    form_id,
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+
+    async def get_form_session(self, chat_id: int) -> dict[str, Any] | None:
+        async with self.connection() as db:
+            row = await (
+                await db.execute("SELECT * FROM form_sessions WHERE chat_id=?", (chat_id,))
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["answers"] = _decode_answers(result.get("answers_json"))
+            return result
+
+    async def update_form_session(
+        self,
+        chat_id: int,
+        *,
+        current_index: int | None = None,
+        answers: dict[str, str] | None = None,
+        status: str | None = None,
+        business_connection_id: str | None = None,
+    ) -> None:
+        fields: list[str] = []
+        values: list[Any] = []
+        if current_index is not None:
+            fields.append("current_index=?")
+            values.append(current_index)
+        if answers is not None:
+            fields.append("answers_json=?")
+            values.append(json.dumps(answers, ensure_ascii=False))
+        if status is not None:
+            fields.append("status=?")
+            values.append(status)
+        if business_connection_id is not None:
+            fields.append("business_connection_id=?")
+            values.append(business_connection_id)
+        fields.append("updated_at=?")
+        values.append(utc_now_iso())
+        values.append(chat_id)
+        async with self.connection() as db:
+            await db.execute(
+                f"UPDATE form_sessions SET {', '.join(fields)} WHERE chat_id=?",
+                tuple(values),
+            )
+            await db.commit()
+
+    async def delete_form_session(self, chat_id: int) -> None:
+        async with self.connection() as db:
+            await db.execute("DELETE FROM form_sessions WHERE chat_id=?", (chat_id,))
+            await db.commit()
+
+    async def create_form_submission(self, session: dict[str, Any], form_name: str) -> int:
+        now = utc_now_iso()
+        answers = session.get("answers") or _decode_answers(session.get("answers_json"))
+        async with self.connection() as db:
+            cur = await db.execute(
+                """
+                INSERT INTO form_submissions(
+                    form_id, form_name, chat_id, user_id, username, first_name, last_name,
+                    answers_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session.get("form_id"),
+                    form_name,
+                    session["chat_id"],
+                    session.get("user_id"),
+                    session.get("username"),
+                    session.get("first_name"),
+                    session.get("last_name"),
+                    json.dumps(answers, ensure_ascii=False),
+                    now,
+                ),
+            )
+            await db.commit()
+            return int(cur.lastrowid)
+
+    async def stats(self) -> dict[str, int]:
+        async with self.connection() as db:
+            contact = await (
                 await db.execute(
                     """
                     SELECT
@@ -301,8 +719,14 @@ class Database:
                     """
                 )
             ).fetchone()
+            forms = await (
+                await db.execute(
+                    "SELECT COUNT(*) AS submissions FROM form_submissions"
+                )
+            ).fetchone()
             return {
-                "contacts": int(row["contacts"]),
-                "auto_replies": int(row["auto_replies"]),
-                "button_clicks": int(row["button_clicks"]),
+                "contacts": int(contact["contacts"]),
+                "auto_replies": int(contact["auto_replies"]),
+                "button_clicks": int(contact["button_clicks"]),
+                "submissions": int(forms["submissions"]),
             }

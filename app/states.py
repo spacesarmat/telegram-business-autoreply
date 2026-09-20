@@ -12,3 +12,12 @@ class AdminStates(StatesGroup):
     edit_title = State()
     edit_response = State()
     edit_position = State()
+
+    form_add_name = State()
+    form_edit_name = State()
+
+    question_add_label = State()
+    question_add_prompt = State()
+    question_edit_label = State()
+    question_edit_prompt = State()
+    question_edit_position = State()

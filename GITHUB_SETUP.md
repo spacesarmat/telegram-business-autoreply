@@ -2,7 +2,7 @@
 
 Target repository:
 
-`spacesarmat/TGAUTOREPLY`
+`spacesarmat/telegram-business-autoreply`
 
 Container image:
 
@@ -10,7 +10,7 @@ Container image:
 
 ## Required once
 
-1. Repository `spacesarmat/TGAUTOREPLY` is the target repository.
+1. Repository `spacesarmat/telegram-business-autoreply` is the target repository.
 2. Push this project to branch `main`.
 3. Open **Actions** and verify **Publish GHCR image** succeeds.
 4. Open the created Container package settings and set package visibility to **Public** so ZimaOS can pull it anonymously.
