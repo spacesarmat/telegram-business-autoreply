@@ -1,4 +1,4 @@
-name: Publish GHCR image
+﻿name: Publish GHCR image
 
 on:
   push:
@@ -40,7 +40,7 @@ jobs:
         run: python -c "from pathlib import Path; import yaml; [yaml.safe_load(path.read_text(encoding='utf-8')) for path in Path('.').rglob('*.yml')]"
 
       - name: Run regression tests
-        run: pytest -q
+        run: python -m pytest -q
 
   build-and-push:
     needs: test
@@ -87,3 +87,4 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
