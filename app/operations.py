@@ -310,11 +310,29 @@ class OperationsService:
             )
             await conn.commit(); return int(cur.lastrowid)
 
-    async def update_venue(self, venue_id: int, *, name: str, description: str, enabled: bool) -> None:
+    async def update_venue(
+        self, venue_id: int, *, name: str, description: str, enabled: bool,
+        capacity: int | None = None, working_hours_json: str | None = None,
+        buffer_before_minutes: int | None = None, buffer_after_minutes: int | None = None,
+        equipment_description: str | None = None,
+    ) -> None:
+        values: list[Any] = [name[:120], description[:2000], 1 if enabled else 0, utc_now_iso()]
+        assignments = ["name=?", "description=?", "enabled=?", "updated_at=?"]
+        extras = {
+            "capacity": None if capacity is None else max(0, int(capacity)),
+            "working_hours_json": working_hours_json,
+            "buffer_before_minutes": None if buffer_before_minutes is None else max(0, int(buffer_before_minutes)),
+            "buffer_after_minutes": None if buffer_after_minutes is None else max(0, int(buffer_after_minutes)),
+            "equipment_description": equipment_description,
+        }
+        for field, value in extras.items():
+            if value is not None:
+                assignments.append(f"{field}=?")
+                values.append(value)
+        values.append(venue_id)
         async with self.db.connection() as conn:
             await conn.execute(
-                "UPDATE venues SET name=?,description=?,enabled=?,updated_at=? WHERE id=?",
-                (name[:120], description[:2000], 1 if enabled else 0, utc_now_iso(), venue_id),
+                f"UPDATE venues SET {','.join(assignments)} WHERE id=?", tuple(values),
             )
             await conn.commit()
 
@@ -588,6 +606,16 @@ class OperationsService:
     async def acquire_hold(self, *, form_id: int, venue_id: int, chat_id: int, submission_token: str, segments: list[tuple[str,str,str]]) -> tuple[bool, str]:
         if not segments:
             return True, ""
+        window = max(1, int(await self.db.get_setting("hold_rate_window_minutes", "10") or 10))
+        limit = max(1, int(await self.db.get_setting("hold_rate_max", "5") or 5))
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window)).isoformat()
+        async with self.db.connection() as conn:
+            recent = await (await conn.execute(
+                "SELECT COUNT(*) c FROM slot_holds WHERE chat_id=? AND created_at>=?",
+                (chat_id, cutoff),
+            )).fetchone()
+        if int(recent["c"] or 0) >= limit:
+            return False, f"Слишком много временных резервов. Повторите через {window} мин."
         minutes = max(1, min(int(await self.db.get_setting("slot_hold_minutes", "15") or 15), 120))
         await self.cleanup_holds()
         for date_iso, start_time, end_time in segments:

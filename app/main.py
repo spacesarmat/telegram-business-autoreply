@@ -22,6 +22,9 @@ from aiogram.types import BotCommand, BusinessConnection, CallbackQuery, Message
 from .advanced import AdvancedService
 from .operations import OperationsService
 from .payments import PaymentService
+from .games import TicTacToeStore, game_keyboard, game_text
+from .v22 import V22Service
+from .i18n import tr
 from .backup import BackupManager
 from .config import Settings, load_settings
 from .concurrency import ConcurrencyMiddleware, UpdateConcurrencyGuard
@@ -59,6 +62,7 @@ from .keyboards import (
     guest_count_keyboard,
     public_menu,
     public_menu_button,
+    direct_chat_menu,
     time_slots_keyboard,
     venue_keyboard,
 )
@@ -74,6 +78,8 @@ db = Database(settings.database_path)
 advanced = AdvancedService(db, APP_TIMEZONE)
 operations = OperationsService(db, APP_TIMEZONE)
 payments = PaymentService(db)
+v22 = V22Service(db)
+games = TicTacToeStore()
 router = Router(name="main")
 concurrency_guard = UpdateConcurrencyGuard(settings.max_concurrent_updates)
 
@@ -407,6 +413,13 @@ async def _selected_venue(form_id: int, questions: list[dict], answers: dict[str
         return await operations.resolve_venue(form_id, answers.get(str(question["id"])))
     venues = await operations.venues_for_form(form_id)
     return venues[0] if len(venues) == 1 else None
+
+
+def _guest_answer(questions: list[dict], answers: dict[str, str]) -> str | None:
+    for question in questions:
+        if _question_input_type(question) == "guest_count":
+            return answers.get(str(question["id"]))
+    return None
 
 
 async def _rule_month_availability(form_id: int, year: int, month: int, venue_id: int | None = None) -> tuple[set[str], set[str]]:
@@ -1739,6 +1752,10 @@ async def send_current_form_question(
         return
 
     question = questions[index]
+    if not v22.question_visible(question, session.get("answers") or {}):
+        await db.update_form_session(chat_id, current_index=index + 1, keyboard_question_id=0)
+        await send_current_form_question(bot, chat_id)
+        return
     input_type = _question_input_type(question)
     suffix = "\n\nЭтот вопрос необязательный — его можно пропустить." if not question["required"] else ""
     existing = session["answers"].get(str(question["id"]))
@@ -1746,15 +1763,22 @@ async def send_current_form_question(
         suffix += f"\n\nТекущий ответ: {existing}"
 
     if input_type == "venue":
-        venues = await operations.venues_for_form(int(form["id"]))
+        venues = await v22.suitable_venues(
+            int(form["id"]), _guest_answer(questions, session.get("answers") or {})
+        )
         text = (
             f"📝 {form['name']}\n\n"
             f"Вопрос {index + 1} из {len(questions)}\n"
             f"{question['prompt']}{suffix}\n\n"
-            "Выберите площадку / зал."
+            "Выберите площадку / зал. Вместимость проверяется автоматически."
         )
         if not venues:
             text += "\n⚠️ Для этой формы пока не настроено ни одной площадки."
+        elif any(not item.get("suitable", True) for item in venues):
+            text += "\n\n" + "\n".join(
+                f"❌ {item['name']} — {item['capacity_reason']}"
+                for item in venues if not item.get("suitable", True)
+            )
         await _upsert_form_message(
             bot, session, text=text,
             reply_markup=venue_keyboard(
@@ -2067,6 +2091,14 @@ async def handle_form_message(
         raw = (message.text or "").strip()
         venue = await operations.resolve_venue(int(session["form_id"]), raw)
         if not venue:
+            await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
+            await send_current_form_question(bot, message.chat.id)
+            return True
+        suitability = await v22.suitable_venues(
+            int(session["form_id"]), _guest_answer(questions, session.get("answers") or {})
+        )
+        selected = next((item for item in suitability if int(item["id"]) == int(venue["id"])), None)
+        if not selected or not selected.get("suitable", True):
             await _delete_form_answer_message(bot, message, session, can_delete_all_messages)
             await send_current_form_question(bot, message.chat.id)
             return True
@@ -2502,6 +2534,17 @@ async def on_business_message(message: Message, bot: Bot) -> None:
         return
 
     if not message.from_user or message.from_user.is_bot:
+        return
+
+    actor_key = f"u:{message.from_user.id}" if message.from_user else f"c:{message.chat.id}"
+    blocked, blocked_reason = await v22.client_blocked(actor_key)
+    if blocked:
+        logger.warning("Сообщение клиента из blacklist отклонено: %s (%s)", actor_key, blocked_reason)
+        return
+    spam_limit = int(await db.get_setting("antispam_max_messages", "8") or 8)
+    spam_window = int(await db.get_setting("antispam_window_seconds", "20") or 20)
+    if not await v22.rate_allowed("business_message", actor_key, limit=spam_limit, window_seconds=spam_window):
+        logger.warning("Антиспам ограничил сообщения клиента %s", actor_key)
         return
 
     previous = await db.get_contact(message.chat.id)
@@ -3034,6 +3077,16 @@ async def venue_pick(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Зал больше недоступен", show_alert=True)
         await send_current_form_question(bot, callback.message.chat.id)
         return
+    suitability = await v22.suitable_venues(
+        int(session["form_id"]), _guest_answer(questions, session.get("answers") or {})
+    )
+    selected = next((item for item in suitability if int(item["id"]) == venue_id), None)
+    if not selected or not selected.get("suitable", True):
+        await callback.answer(
+            f"Этот зал не подходит: {(selected or {}).get('capacity_reason') or 'ограничение вместимости'}",
+            show_alert=True,
+        )
+        return
     answers = dict(session["answers"]); answers[str(question["id"])] = str(venue["name"])
     next_index = index + 1
     await db.update_form_session(
@@ -3042,6 +3095,11 @@ async def venue_pick(callback: CallbackQuery, bot: Bot) -> None:
     )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer(f"Зал: {venue['name']}")
+
+
+@router.callback_query(F.data.startswith("venue:blocked:"))
+async def venue_capacity_blocked(callback: CallbackQuery) -> None:
+    await callback.answer("Этот зал не подходит по количеству гостей.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("guests:pick:"))
@@ -3392,7 +3450,11 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     for index, question in enumerate(questions):
-        if question["required"] and not session["answers"].get(str(question["id"])):
+        if (
+            v22.question_visible(question, session["answers"])
+            and question["required"]
+            and not session["answers"].get(str(question["id"]))
+        ):
             await db.update_form_session(
                 callback.message.chat.id, current_index=index, status="active"
             )
@@ -3442,6 +3504,16 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
         int(form["id"]), session.get("selected_addon_ids") or [],
         session.get("selected_addon_quantities") or {},
     )
+    if booking_interval:
+        resource_segments = list(booking_interval.get("segments") or [])
+        for addon in selected_addons:
+            available = await v22.addon_available_quantity(int(addon["id"]), resource_segments)
+            requested = max(1, int(addon.get("quantity") or 1))
+            if available is not None and requested > available:
+                await callback.answer(
+                    f"{addon['name']}: доступно только {available} шт.", show_alert=True
+                )
+                return
     pricing_calculation = await _calculate_form_pricing(
         int(form["id"]), questions, session["answers"], session.get("selected_addon_ids") or [],
         session.get("selected_addon_quantities") or {},
@@ -3462,7 +3534,8 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             for item in selected_addons
         ],
     }
-    if _is_test_session(session):
+    staging_mode = (await db.get_setting("staging_mode", "0")) == "1"
+    if _is_test_session(session) or staging_mode:
         preview = _form_preview_text(
             form, questions, session["answers"], pricing_calculation, selected_addons, currency
         ).replace(
@@ -3476,7 +3549,7 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
             ]
         )
         await _upsert_form_message(
-            bot, session, text="🧪 ТЕСТОВЫЙ РЕЖИМ\n\n" + preview, reply_markup=test_markup
+            bot, session, text=("🧪 STAGING / ТЕСТОВЫЙ РЕЖИМ\n\n" if staging_mode else "🧪 ТЕСТОВЫЙ РЕЖИМ\n\n") + preview, reply_markup=test_markup
         )
         await db.delete_form_session(callback.message.chat.id)
         await callback.answer("Тест завершён — заявка не создана")
@@ -3489,6 +3562,7 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
         pricing_details=pricing_details,
     )
     await db.set_submission_venue(submission_id, venue_id)
+    await v22.allocate_addon_resources(submission_id, selected_addons)
     await operations.ensure_submission_public_token(submission_id)
     await operations.release_holds(str(session.get("submission_token") or ""), consumed=True)
     await operations.emit_webhook("submission.created", {"id": submission_id, "form": str(form["name"]), "venue_id": venue_id})
@@ -3554,10 +3628,66 @@ async def form_waitlist(callback: CallbackQuery, bot: Bot) -> None:
 @router.message(Command("start", "admin"))
 async def admin_start(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id if message.from_user else None):
+        if message.chat.type == ChatType.PRIVATE and not message.business_connection_id:
+            await message.answer(
+                tr("direct_menu", message.from_user.language_code if message.from_user else None),
+                reply_markup=direct_chat_menu(),
+            )
         return
     await state.clear()
     await db.delete_form_session(message.chat.id)
     await show_admin_home_message(message)
+
+
+@router.message(Command("game"))
+async def game_command(message: Message) -> None:
+    if message.chat.type != ChatType.PRIVATE or message.business_connection_id:
+        return
+    game = games.reset(message.chat.id)
+    await message.answer(
+        game_text(lang=message.from_user.language_code if message.from_user else None),
+        reply_markup=game_keyboard(game),
+    )
+
+
+@router.callback_query(F.data == "game:new")
+async def game_new(callback: CallbackQuery) -> None:
+    if (
+        not isinstance(callback.message, Message)
+        or callback.message.chat.type != ChatType.PRIVATE
+        or callback.message.business_connection_id
+    ):
+        await callback.answer("Игра доступна только в личном чате с ботом", show_alert=True)
+        return
+    game = games.reset(callback.message.chat.id)
+    await callback.message.edit_text(
+        game_text(lang=callback.from_user.language_code), reply_markup=game_keyboard(game)
+    )
+    await callback.answer("Новая игра")
+
+
+@router.callback_query(F.data.startswith("game:cell:"))
+async def game_cell(callback: CallbackQuery) -> None:
+    if (
+        not isinstance(callback.message, Message)
+        or callback.message.chat.type != ChatType.PRIVATE
+        or callback.message.business_connection_id
+    ):
+        await callback.answer("Игра доступна только в личном чате", show_alert=True)
+        return
+    try:
+        cell = int((callback.data or "").rsplit(":", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Некорректная клетка", show_alert=True)
+        return
+    game, result = games.play(callback.message.chat.id, cell)
+    if result == "invalid":
+        await callback.answer("Клетка занята или партия завершена", show_alert=True)
+        return
+    await callback.message.edit_text(
+        game_text(result, callback.from_user.language_code), reply_markup=game_keyboard(game)
+    )
+    await callback.answer()
 
 
 async def _open_admin_test_menu(bot: Bot, chat_id: int, *, edit_message_id: int | None = None) -> int | None:
@@ -5872,6 +6002,7 @@ async def main() -> None:
     await advanced.init()
     await operations.init()
     await payments.init()
+    await v22.init()
 
     bot = Bot(
         token=settings.bot_token,
@@ -5959,6 +6090,7 @@ async def main() -> None:
             BotCommand(command="admin", description="Открыть админ-панель"),
             BotCommand(command="test", description="Тестировать клиентский сценарий"),
             BotCommand(command="menu", description="Открыть клиентское меню"),
+            BotCommand(command="game", description="Крестики-нолики"),
             BotCommand(command="start", description="Открыть админ-панель"),
         ]
     )

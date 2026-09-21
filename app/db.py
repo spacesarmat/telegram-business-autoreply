@@ -1282,7 +1282,10 @@ class Database:
             return int(cur.lastrowid)
 
     async def update_form_question_field(self, question_id: int, field: str, value: Any) -> None:
-        if field not in {"label", "prompt", "position", "required", "input_type", "choice_options_json"}:
+        if field not in {
+            "label", "prompt", "position", "required", "input_type", "choice_options_json",
+            "condition_question_id", "condition_operator", "condition_value",
+        }:
             raise ValueError("Unsupported question field")
         async with self.connection() as db:
             await db.execute(

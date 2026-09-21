@@ -21,6 +21,12 @@ def public_menu_button() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def direct_chat_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🎮 Крестики-нолики", callback_data="game:new"))
+    return builder.as_markup()
+
+
 MONTH_NAMES_RU = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
@@ -490,10 +496,16 @@ def venue_keyboard(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for venue in venues:
+        suitable = bool(venue.get("suitable", True))
+        capacity = max(0, int(venue.get("capacity") or 0))
+        suffix = f" · до {capacity}" if capacity else ""
         builder.row(
             InlineKeyboardButton(
-                text=f"🏭 {venue['name']}",
-                callback_data=f"venue:pick:{question_id}:{venue['id']}",
+                text=f"{'✅' if suitable else '❌'} {venue['name']}{suffix}",
+                callback_data=(
+                    f"venue:pick:{question_id}:{venue['id']}"
+                    if suitable else f"venue:blocked:{question_id}:{venue['id']}"
+                ),
             )
         )
     if not required:

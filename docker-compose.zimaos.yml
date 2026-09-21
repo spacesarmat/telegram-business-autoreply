@@ -75,10 +75,10 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "2.1.1"
+  version: "2.2.0"
   update_at: "2026-09-21"
   release_notes:
     en_US: >
-      Addon quantities release: additional services can be configured per unit with min/max quantity, live client +/- controls and automatic recalculation. Multi-venue operations from v2.1.0 are preserved.
+      v2.2.0 adds Tic-Tac-Toe in direct bot chat, venue capacity filtering, conditional questions, equipment-bound addons, promotions, payment/refund improvements, CRM operations, analytics and safety controls.
     ru_RU: >
-      Дополнительные услуги теперь могут иметь количество: цена за единицу, минимум/максимум, кнопки −/＋ у клиента и автоматический перерасчёт. Все возможности двух залов из v2.1.0 сохранены.
+      v2.2.0: крестики-нолики в ЛС с ботом, вместимость залов, условные вопросы, связь услуг с оборудованием, промокоды, улучшенные оплаты/возвраты, CRM, аналитика и защита от злоупотреблений.

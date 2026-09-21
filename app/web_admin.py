@@ -998,6 +998,14 @@ class WebAdmin:
                 f'<textarea name="choice_options" placeholder="Вариант 1\nВариант 2\n✨ Другое">{_e(choice_values)}</textarea>'
                 f'<div class="muted">Для типа «🎛 Варианты». Если есть «Другое», бот попросит клиента описать свой вариант.</div></div>'
             )
+            condition_options = '<option value="">Всегда показывать</option>' + ''.join(
+                f'<option value="{int(other["id"])}" {"selected" if int(q.get("condition_question_id") or 0)==int(other["id"]) else ""}>{_e(other["label"])}</option>'
+                for other in qs if int(other["id"]) != int(q["id"])
+            )
+            operators = ''.join(
+                f'<option value="{key}" {"selected" if str(q.get("condition_operator") or "equals")==key else ""}>{label}</option>'
+                for key, label in (("equals","равно"),("not_equals","не равно"),("contains","содержит"),("not_empty","заполнено"),("gt","больше"),("gte","не меньше"),("lt","меньше"),("lte","не больше"))
+            )
             rows += (
                 f'<tr><td colspan="5"><form method="post" action="/admin/forms/{fid}/question/{int(q["id"])}">'
                 f'<div class="row3"><div class="field"><label>Поле</label><input name="label" value="{_e(q["label"])}"></div>'
@@ -1005,6 +1013,7 @@ class WebAdmin:
                 f'<div class="field"><label>Позиция</label><input name="position" value="{int(q["position"])}"></div></div>'
                 f'<div class="field"><label>Вопрос</label><input name="prompt" value="{_e(q["prompt"])}"></div>'
                 f'{choice_editor}'
+                f'<div class="row3"><div class="field"><label>Показывать, если поле</label><select name="condition_question_id">{condition_options}</select></div><div class="field"><label>Условие</label><select name="condition_operator">{operators}</select></div><div class="field"><label>Значение</label><input name="condition_value" value="{_e(q.get("condition_value") or "")}"></div></div>'
                 f'<label><input style="width:auto" type="checkbox" name="required" value="1" {"checked" if q["required"] else ""}> обязательный</label> '
                 f'<button class="btn">Сохранить</button></form></td></tr>'
             )
@@ -1049,6 +1058,9 @@ class WebAdmin:
         for field, value in {
             "label": label, "prompt": prompt, "input_type": qtype, "position": pos,
             "required": 1 if data.get("required") else 0,
+            "condition_question_id": int(data.get("condition_question_id")) if str(data.get("condition_question_id") or "").isdigit() else None,
+            "condition_operator": str(data.get("condition_operator") or "equals")[:20],
+            "condition_value": str(data.get("condition_value") or "")[:500],
         }.items():
             await self.db.update_form_question_field(qid, field, value)
         if qtype == "choice":

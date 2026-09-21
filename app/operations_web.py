@@ -44,7 +44,7 @@ async def operations_page(admin, request: web.Request) -> web.Response:
     csrf = admin._csrf(request)
 
     venue_rows = "".join(
-        f'''<tr><td>#{v['id']}</td><td><form method="post" action="/admin/operations/venue/{v['id']}"><input name="csrf" type="hidden" value="{csrf}"><input name="name" value="{_e(v['name'])}"><textarea name="description">{_e(v.get('description') or '')}</textarea><label><input style="width:auto" type="checkbox" name="enabled" value="1" {'checked' if v.get('enabled') else ''}> включён</label><button class="btn" type="submit">Сохранить</button></form></td></tr>'''
+        f'''<tr><td>#{v['id']}</td><td><form method="post" action="/admin/operations/venue/{v['id']}"><input name="csrf" type="hidden" value="{csrf}"><input name="name" value="{_e(v['name'])}"><div class="row3"><div class="field"><label>Вместимость</label><input name="capacity" type="number" min="0" value="{int(v.get('capacity') or 0)}"></div><div class="field"><label>Буфер до, мин</label><input name="buffer_before_minutes" type="number" min="0" value="{int(v.get('buffer_before_minutes') or 0)}"></div><div class="field"><label>Буфер после, мин</label><input name="buffer_after_minutes" type="number" min="0" value="{int(v.get('buffer_after_minutes') or 0)}"></div></div><textarea name="description">{_e(v.get('description') or '')}</textarea><div class="field"><label>Рабочие часы JSON</label><input name="working_hours_json" value="{_e(v.get('working_hours_json') or chr(123)+chr(125))}"></div><div class="field"><label>Оборудование</label><textarea name="equipment_description">{_e(v.get('equipment_description') or '')}</textarea></div><label><input style="width:auto" type="checkbox" name="enabled" value="1" {'checked' if v.get('enabled') else ''}> включён</label><button class="btn" type="submit">Сохранить</button></form></td></tr>'''
         for v in venues
     ) or '<tr><td colspan="2">Нет залов</td></tr>'
 
@@ -148,7 +148,16 @@ async def venue_create(admin, request: web.Request):
 
 async def venue_update(admin, request: web.Request):
     d=request["post"]; vid=int(request.match_info['vid']); name=str(d.get('name') or '').strip(); desc=str(d.get('description') or '').strip()
-    await admin.operations.update_venue(vid,name=name,description=desc,enabled=str(d.get('enabled') or '')=='1'); raise web.HTTPFound('/admin/operations?ok='+quote('Зал сохранён'))
+    try:
+        capacity=max(0,int(d.get('capacity') or 0)); before=max(0,int(d.get('buffer_before_minutes') or 0)); after=max(0,int(d.get('buffer_after_minutes') or 0))
+    except ValueError:
+        raise web.HTTPFound('/admin/operations?err='+quote('Проверьте вместимость и буферы'))
+    await admin.operations.update_venue(
+        vid,name=name,description=desc,enabled=str(d.get('enabled') or '')=='1',capacity=capacity,
+        working_hours_json=str(d.get('working_hours_json') or '{}')[:2000],
+        buffer_before_minutes=before,buffer_after_minutes=after,
+        equipment_description=str(d.get('equipment_description') or '')[:3000],
+    ); raise web.HTTPFound('/admin/operations?ok='+quote('Зал сохранён'))
 
 async def resource_create(admin, request: web.Request):
     d=request["post"]

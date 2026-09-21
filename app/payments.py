@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
 import secrets
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -42,8 +44,25 @@ class PaymentService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_payment_transactions_submission
                     ON payment_transactions(submission_id, created_at);
+                CREATE TABLE IF NOT EXISTS payment_refunds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id INTEGER NOT NULL,
+                    payment_transaction_id INTEGER NOT NULL,
+                    provider_refund_id TEXT NOT NULL DEFAULT '',
+                    amount INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    reason TEXT NOT NULL DEFAULT '',
+                    raw_json TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(submission_id) REFERENCES form_submissions(id) ON DELETE CASCADE,
+                    FOREIGN KEY(payment_transaction_id) REFERENCES payment_transactions(id) ON DELETE CASCADE
+                );
                 """
             )
+            columns = {str(row["name"]) for row in await (await conn.execute("PRAGMA table_info(form_submissions)")).fetchall()}
+            if "prepayment_due_at" not in columns:
+                await conn.execute("ALTER TABLE form_submissions ADD COLUMN prepayment_due_at TEXT")
             await conn.commit()
 
     async def _credentials(self) -> tuple[str, str]:
@@ -108,7 +127,6 @@ class PaymentService:
             if not url or not payment_id:
                 return None, "ЮKassa не вернула идентификатор/confirmation_url"
             now = utc_now_iso()
-            import json
             async with self.db.connection() as conn:
                 await conn.execute(
                     """INSERT INTO payment_transactions(
@@ -123,6 +141,12 @@ class PaymentService:
                         str(data.get("status") or "pending"), str(url),
                         json.dumps(data, ensure_ascii=False)[:20000], now, now,
                     ),
+                )
+                deadline_hours = int(await self.db.get_setting("prepayment_deadline_hours", "24") or 24)
+                due_at = (datetime.now(timezone.utc) + timedelta(hours=max(1, deadline_hours))).isoformat()
+                await conn.execute(
+                    "UPDATE form_submissions SET prepayment_due_at=COALESCE(prepayment_due_at,?),updated_at=? WHERE id=?",
+                    (due_at, now, int(submission.get("id") or 0)),
                 )
                 await conn.commit()
             return str(url), payment_id
@@ -162,7 +186,6 @@ class PaymentService:
         status = str(verified.get("status") or "unknown")
         amount_data = verified.get("amount") if isinstance(verified.get("amount"), dict) else {}
         amount = self._rubles(amount_data.get("value"))
-        import json
         now = utc_now_iso()
         async with self.db.connection() as conn:
             await conn.execute(
@@ -186,7 +209,13 @@ class PaymentService:
                 )).fetchone()
                 if row:
                     old_pre = int(row["prepayment_amount"] or 0)
-                    new_pre = max(old_pre, amount)
+                    paid = await (await conn.execute(
+                        "SELECT COALESCE(SUM(amount),0) total FROM payment_transactions WHERE submission_id=? AND status='succeeded'",
+                        (submission_id,),
+                    )).fetchone()
+                    # Several successful payments are accumulated. The unique
+                    # provider/payment key keeps repeated webhooks idempotent.
+                    new_pre = max(0, int(paid["total"] or 0))
                     # Status is intentionally changed by the main CRM status path,
                     # so booking occupancy and Telegram notifications stay consistent.
                     await conn.execute(
@@ -199,6 +228,56 @@ class PaymentService:
                     )
             await conn.commit()
         return True, status, submission_id
+
+    async def create_yookassa_refund(
+        self, *, submission_id: int, transaction_id: int, amount: int, reason: str = ""
+    ) -> tuple[bool, str]:
+        amount = max(1, int(amount))
+        async with self.db.connection() as conn:
+            transaction = await (await conn.execute(
+                "SELECT * FROM payment_transactions WHERE id=? AND submission_id=? AND provider='yookassa' AND status='succeeded'",
+                (transaction_id, submission_id),
+            )).fetchone()
+            refunded = await (await conn.execute(
+                "SELECT COALESCE(SUM(amount),0) total FROM payment_refunds WHERE payment_transaction_id=? AND status IN ('pending','succeeded')",
+                (transaction_id,),
+            )).fetchone()
+        if not transaction:
+            return False, "Успешный платёж ЮKassa не найден"
+        if amount + int(refunded["total"] or 0) > int(transaction["amount"] or 0):
+            return False, "Сумма возвратов превышает сумму платежа"
+        shop_id, secret = await self._credentials()
+        if not shop_id or not secret:
+            return False, "ЮKassa не настроена"
+        payload = {
+            "payment_id": str(transaction["provider_payment_id"]),
+            "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
+            "description": reason[:250] or f"Возврат по заявке №{submission_id}",
+        }
+        headers = {
+            "Authorization": self._auth_header(shop_id, secret),
+            "Idempotence-Key": secrets.token_hex(16),
+            "Content-Type": "application/json",
+        }
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=12)) as session:
+                async with session.post("https://api.yookassa.ru/v3/refunds", json=payload, headers=headers) as resp:
+                    data = await resp.json(content_type=None)
+                    if resp.status >= 300:
+                        return False, f"ЮKassa HTTP {resp.status}: {str(data)[:300]}"
+        except Exception as exc:
+            return False, f"Ошибка возврата ЮKassa: {exc}"
+        now = utc_now_iso()
+        async with self.db.connection() as conn:
+            await conn.execute(
+                """INSERT INTO payment_refunds(submission_id,payment_transaction_id,provider_refund_id,amount,status,reason,raw_json,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (submission_id, transaction_id, str(data.get("id") or ""), amount,
+                 str(data.get("status") or "pending"), reason[:1000],
+                 json.dumps(data, ensure_ascii=False)[:20000], now, now),
+            )
+            await conn.commit()
+        return True, str(data.get("status") or "pending")
 
     async def list_transactions(self, submission_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
         sql = "SELECT * FROM payment_transactions"
