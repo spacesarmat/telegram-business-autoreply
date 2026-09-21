@@ -12,6 +12,8 @@
 
 Web Admin: `http://IP_ZIMAOS:18080/admin`. Внутри контейнера приложение слушает `8080`, внешний порт ZimaOS — `18080`.
 
+Автоматические и ручные проверки релиза описаны в [`TESTING.md`](TESTING.md).
+
 ### Игра
 
 В обычном ЛС с ботом отправьте `/game` или `/start` и нажмите кнопку игры. Игрок ходит `X`, бот — `O`; **Новая игра** полностью сбрасывает поле.
@@ -267,7 +269,10 @@ LOG_LEVEL=INFO
 TZ=Europe/Moscow
 WEB_ADMIN_USERNAME=admin
 WEB_ADMIN_PASSWORD=ЗАМЕНИТЕ_НА_СИЛЬНЫЙ_ПАРОЛЬ
+WEB_ADMIN_USERS=manager1:StrongPassword123:manager,viewer1:AnotherPassword123:viewer
 MAX_CONCURRENT_UPDATES=32
+STAGING_MODE=0
+POSTGRES_DSN=
 ```
 
 `ADMIN_IDS` — Telegram user ID владельца/администраторов. Можно несколько через запятую:

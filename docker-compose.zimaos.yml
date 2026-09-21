@@ -25,6 +25,8 @@ services:
       WEB_ADMIN_USERS: ""
       MAX_CONCURRENT_UPDATES: "32"
       BACKUP_DIR: /data/backups
+      STAGING_MODE: "0"
+      POSTGRES_DSN: ""
     labels:
       icon: https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/telegram.png
     network_mode: bridge

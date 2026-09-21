@@ -43,6 +43,8 @@
 
 ## Проверки релиза
 
+Полный ручной маршрут проверки находится в [`TESTING.md`](TESTING.md). GitHub Actions выполняет автоматические проверки до публикации Docker-образа.
+
 - Python compileall;
 - YAML parse;
 - миграция SQLite и сохранность старой заявки;
@@ -54,4 +56,4 @@
 - несколько платежей и идемпотентность webhook;
 - крестики-нолики и сброс партии.
 
-GitHub Actions обновлены до `actions/checkout@v5`, Docker Actions `v4/v6/v7`; сборка остаётся `linux/amd64,linux/arm64`, образ — `ghcr.io/spacesarmat/tgautoreply:latest`.
+GitHub Actions обновлены до `actions/checkout@v5`, `actions/setup-python@v6` и Docker Actions `v4/v6/v7`; сборка остаётся `linux/amd64,linux/arm64`, образ — `ghcr.io/spacesarmat/tgautoreply:latest`.

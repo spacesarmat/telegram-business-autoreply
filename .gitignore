@@ -5,3 +5,7 @@ __pycache__/
 *.db
 .idea/
 .vscode/
+/.pytest_cache/
+/.coverage
+/htmlcov/
+/telegram-business-autoreply*.zip
