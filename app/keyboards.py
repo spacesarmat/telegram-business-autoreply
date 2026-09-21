@@ -205,20 +205,52 @@ def form_confirmation(has_addons: bool = False) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def form_addons(addons: list[dict], selected_ids: set[int], currency: str = "₽") -> InlineKeyboardMarkup:
+def form_addons(
+    addons: list[dict], selected_ids: set[int], currency: str = "₽",
+    quantities: dict[str, int] | dict[int, int] | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    normalized_quantities = {str(k): int(v) for k, v in (quantities or {}).items()}
     for addon in addons:
         addon_id = int(addon["id"])
-        selected = addon_id in selected_ids
-        icon = "✅" if selected else "▫️"
         amount = int(addon.get("amount") or 0)
-        price = f"{amount:,}".replace(",", " ") + f" {currency}" if amount else "бесплатно"
-        builder.row(
-            InlineKeyboardButton(
-                text=f"{icon} {str(addon['name'])[:28]} · {price}",
-                callback_data=f"form:addon_toggle:{addon_id}",
-            )
+        quantity_enabled = bool(addon.get("quantity_enabled"))
+        unit_suffix = "/шт" if quantity_enabled else ""
+        price = (
+            f"{amount:,}".replace(",", " ") + f" {currency}{unit_suffix}"
+            if amount else "бесплатно"
         )
+        if quantity_enabled:
+            minimum = max(1, int(addon.get("min_quantity") or 1))
+            maximum = max(minimum, int(addon.get("max_quantity") or minimum))
+            quantity = max(0, int(normalized_quantities.get(str(addon_id), 0) or 0))
+            selected = quantity > 0 or addon_id in selected_ids
+            if selected and quantity <= 0:
+                quantity = minimum
+            icon = "✅" if selected else "▫️"
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"{icon} {str(addon['name'])[:26]} · {price}",
+                    callback_data=f"form:addon_toggle:{addon_id}",
+                )
+            )
+            builder.row(
+                InlineKeyboardButton(text="➖", callback_data=f"form:addon_dec:{addon_id}"),
+                InlineKeyboardButton(
+                    text=(f"{quantity} шт" if quantity else f"0 шт · {minimum}–{maximum}"),
+                    callback_data=f"form:addon_qtyinfo:{addon_id}",
+                ),
+                InlineKeyboardButton(text="➕", callback_data=f"form:addon_inc:{addon_id}"),
+            )
+        else:
+            selected = addon_id in selected_ids
+            icon = "✅" if selected else "▫️"
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"{icon} {str(addon['name'])[:28]} · {price}",
+                    callback_data=f"form:addon_toggle:{addon_id}",
+                )
+            )
     builder.row(InlineKeyboardButton(text="✅ Продолжить", callback_data="form:addons_done"))
     if selected_ids:
         builder.row(InlineKeyboardButton(text="🧹 Убрать все", callback_data="form:addons_clear"))
@@ -701,7 +733,12 @@ def admin_addons_list(form_id: int, addons: list[dict], currency: str = "₽") -
     for addon in addons:
         icon = "🟢" if addon.get("enabled") else "⚪"
         amount = int(addon.get("amount") or 0)
+        quantity_enabled = bool(addon.get("quantity_enabled"))
         price = f"{amount:,}".replace(",", " ") + f" {currency}" if amount else "0"
+        if quantity_enabled:
+            minimum = max(1, int(addon.get("min_quantity") or 1))
+            maximum = max(minimum, int(addon.get("max_quantity") or minimum))
+            price += f"/шт · {minimum}–{maximum} шт"
         builder.row(
             InlineKeyboardButton(
                 text=f"{icon} {str(addon['name'])[:25]} · {price}",
@@ -717,9 +754,17 @@ def admin_addon_edit(addon: dict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     addon_id = int(addon["id"])
     enabled = bool(addon.get("enabled"))
+    quantity_enabled = bool(addon.get("quantity_enabled"))
     builder.row(
         InlineKeyboardButton(text="✏️ Название", callback_data=f"adm:addon_name:{addon_id}"),
-        InlineKeyboardButton(text="💵 Цена", callback_data=f"adm:addon_amount:{addon_id}"),
+        InlineKeyboardButton(text="💵 Цена за ед.", callback_data=f"adm:addon_amount:{addon_id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=("🔢 Количество: да" if quantity_enabled else "🔢 Количество: нет"),
+            callback_data=f"adm:addon_quantity_toggle:{addon_id}",
+        ),
+        InlineKeyboardButton(text="↔️ Мин/макс", callback_data=f"adm:addon_quantity_limits:{addon_id}"),
     )
     builder.row(
         InlineKeyboardButton(

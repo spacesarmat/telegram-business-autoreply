@@ -44,3 +44,4 @@ class AdminStates(StatesGroup):
     addon_add_amount = State()
     addon_edit_name = State()
     addon_edit_amount = State()
+    addon_edit_quantity_limits = State()

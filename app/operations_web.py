@@ -313,14 +313,44 @@ async def public_book_post(admin, request: web.Request) -> web.Response:
     return web.Response(text=f'Заявка #{rid} принята. Мы свяжемся с вами.',content_type='text/plain')
 
 async def public_submission(admin, request: web.Request) -> web.Response:
-    token=request.match_info['token']
+    token = request.match_info["token"]
     async with admin.db.connection() as conn:
-        row=await (await conn.execute('SELECT s.*,v.name venue_name FROM form_submissions s LEFT JOIN venues v ON v.id=s.venue_id WHERE s.public_token=?',(token,))).fetchone()
-    if not row: raise web.HTTPNotFound()
-    s=dict(row); currency=str(await admin.db.get_setting('crm_currency','₽') or '₽')
-    body=f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Заявка #{s['id']}</title></head><body style="font-family:system-ui;max-width:720px;margin:30px auto;padding:0 16px"><h1>Заявка #{s['id']}</h1><p><b>{_e(s['form_name'])}</b></p><p>Зал: {_e(s.get('venue_name') or '—')}</p><p>Статус: {_e(s.get('status'))}</p><p>Стоимость: {_money(s.get('total_amount'),currency)}</p><p>Предоплата: {_money(s.get('prepayment_amount'),currency)}</p><p>Залог: {_money(s.get('deposit_amount'),currency)} · {_e(s.get('deposit_status'))}</p></body></html>'''
-    return web.Response(text=body,content_type='text/html')
-
+        row = await (await conn.execute(
+            "SELECT s.*,v.name venue_name FROM form_submissions s LEFT JOIN venues v ON v.id=s.venue_id WHERE s.public_token=?",
+            (token,),
+        )).fetchone()
+    if not row:
+        raise web.HTTPNotFound()
+    submission = dict(row)
+    currency = str(await admin.db.get_setting("crm_currency", "₽") or "₽")
+    try:
+        pricing = json.loads(submission.get("pricing_details_json") or "{}")
+    except Exception:
+        pricing = {}
+    addon_lines: list[str] = []
+    for addon in pricing.get("addons") or []:
+        quantity = max(1, int(addon.get("quantity") or 1))
+        unit_amount = int(
+            addon.get("unit_amount")
+            if addon.get("unit_amount") is not None
+            else addon.get("amount") or 0
+        )
+        line_total = int(addon.get("amount") or unit_amount * quantity)
+        if addon.get("quantity_enabled") or quantity > 1:
+            addon_lines.append(
+                f"<li>{_e(addon.get('name') or 'Услуга')} ×{quantity}: "
+                f"{_e(_money(line_total, currency))} ({_e(_money(unit_amount, currency))}/шт)</li>"
+            )
+        else:
+            addon_lines.append(
+                f"<li>{_e(addon.get('name') or 'Услуга')}: {_e(_money(line_total, currency))}</li>"
+            )
+    addons_html = (
+        "<h2>Дополнительные услуги</h2><ul>" + "".join(addon_lines) + "</ul>"
+        if addon_lines else ""
+    )
+    body = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Заявка #{submission['id']}</title></head><body style="font-family:system-ui;max-width:720px;margin:30px auto;padding:0 16px"><h1>Заявка #{submission['id']}</h1><p><b>{_e(submission['form_name'])}</b></p><p>Зал: {_e(submission.get('venue_name') or '—')}</p><p>Статус: {_e(submission.get('status'))}</p><p>Стоимость: {_money(submission.get('total_amount'), currency)}</p><p>Предоплата: {_money(submission.get('prepayment_amount'), currency)}</p><p>Залог: {_money(submission.get('deposit_amount'), currency)} · {_e(submission.get('deposit_status'))}</p>{addons_html}</body></html>"""
+    return web.Response(text=body, content_type="text/html")
 
 def _api_ok(admin, request: web.Request) -> bool:
     if False:
@@ -389,21 +419,68 @@ async def qr_png(admin, request: web.Request) -> web.Response:
     return web.Response(body=buf.getvalue(),content_type='image/png',headers={'Content-Disposition':f'inline; filename="booking-{sid}.png"'})
 
 async def confirmation_pdf(admin, request: web.Request) -> web.Response:
-    sid=int(request.match_info['sid']); s=await admin.db.get_submission(sid)
-    if not s: raise web.HTTPNotFound()
-    venue=await admin.operations.get_venue(int(s.get('venue_id') or 0)) if s.get('venue_id') else None
-    buf=io.BytesIO(); c=canvas.Canvas(buf,pagesize=(595,842))
+    sid = int(request.match_info["sid"])
+    submission = await admin.db.get_submission(sid)
+    if not submission:
+        raise web.HTTPNotFound()
+    venue = (
+        await admin.operations.get_venue(int(submission.get("venue_id") or 0))
+        if submission.get("venue_id") else None
+    )
+    currency = str(await admin.db.get_setting("crm_currency", "₽") or "₽")
+    buf = io.BytesIO()
+    pdf = canvas.Canvas(buf, pagesize=(595, 842))
     try:
-        pdfmetrics.registerFont(TTFont('DejaVu','/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')); font='DejaVu'
-    except Exception: font='Helvetica'
-    c.setFont(font,16); c.drawString(45,790,f"Подтверждение заявки #{sid}")
-    c.setFont(font,11); y=755
-    lines=[f"Форма: {s.get('form_name') or ''}",f"Зал: {(venue or {}).get('name','—')}",f"Клиент: {' '.join(x for x in [s.get('first_name'),s.get('last_name')] if x)}",f"Статус: {s.get('status')}",f"Стоимость: {s.get('total_amount') or 0}",f"Предоплата: {s.get('prepayment_amount') or 0}",f"Залог: {s.get('deposit_amount') or 0} ({s.get('deposit_status') or 'none'})"]
+        pdfmetrics.registerFont(TTFont("DejaVu", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
+        font = "DejaVu"
+    except Exception:
+        font = "Helvetica"
+    pdf.setFont(font, 16)
+    pdf.drawString(45, 790, f"Подтверждение заявки #{sid}")
+    pdf.setFont(font, 11)
+    y = 755
+    lines = [
+        f"Форма: {submission.get('form_name') or ''}",
+        f"Зал: {(venue or {}).get('name', '—')}",
+        f"Клиент: {' '.join(x for x in [submission.get('first_name'), submission.get('last_name')] if x)}",
+        f"Статус: {submission.get('status')}",
+        f"Стоимость: {_money(submission.get('total_amount'), currency)}",
+        f"Предоплата: {_money(submission.get('prepayment_amount'), currency)}",
+        f"Залог: {_money(submission.get('deposit_amount'), currency)} ({submission.get('deposit_status') or 'none'})",
+    ]
+    pricing = submission.get("pricing_details") or {}
+    for addon in pricing.get("addons") or []:
+        quantity = max(1, int(addon.get("quantity") or 1))
+        unit_amount = int(
+            addon.get("unit_amount")
+            if addon.get("unit_amount") is not None
+            else addon.get("amount") or 0
+        )
+        line_total = int(addon.get("amount") or unit_amount * quantity)
+        if addon.get("quantity_enabled") or quantity > 1:
+            lines.append(
+                f"Доп. услуга: {addon.get('name') or 'Услуга'} x{quantity} = "
+                f"{_money(line_total, currency)} ({_money(unit_amount, currency)}/шт)"
+            )
+        else:
+            lines.append(
+                f"Доп. услуга: {addon.get('name') or 'Услуга'} = {_money(line_total, currency)}"
+            )
     for line in lines:
-        c.drawString(45,y,str(line)); y-=22
-    c.setFont(font,9); c.drawString(45,60,'Документ сформирован Telegram Business AutoReply')
-    c.save(); return web.Response(body=buf.getvalue(),content_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="booking-{sid}.pdf"'})
-
+        if y < 90:
+            pdf.showPage()
+            pdf.setFont(font, 11)
+            y = 790
+        pdf.drawString(45, y, str(line)[:100])
+        y -= 22
+    pdf.setFont(font, 9)
+    pdf.drawString(45, 60, "Документ сформирован Telegram Business AutoReply")
+    pdf.save()
+    return web.Response(
+        body=buf.getvalue(),
+        content_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="booking-{sid}.pdf"'},
+    )
 
 def register_operations_routes(app: web.Application, admin) -> None:
     app.router.add_get('/admin/operations', lambda r: operations_page(admin,r))

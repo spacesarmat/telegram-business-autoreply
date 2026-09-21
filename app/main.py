@@ -891,8 +891,30 @@ def _parse_buffer_minutes(value: str | None) -> int | None:
     return None
 
 
-async def _selected_addon_rows(form_id: int, selected_ids: list[int] | None) -> list[dict]:
-    return await db.get_selected_addons(form_id, selected_ids or [])
+async def _selected_addon_rows(
+    form_id: int, selected_ids: list[int] | None,
+    quantities: dict[str, int] | dict[int, int] | None = None,
+) -> list[dict]:
+    rows = await db.get_selected_addons(form_id, selected_ids or [])
+    quantity_map = {str(k): int(v) for k, v in (quantities or {}).items()}
+    result: list[dict] = []
+    for item in rows:
+        addon = dict(item)
+        addon_id = int(addon["id"])
+        quantity_enabled = bool(addon.get("quantity_enabled"))
+        minimum = max(1, int(addon.get("min_quantity") or 1))
+        maximum = max(minimum, int(addon.get("max_quantity") or minimum))
+        if quantity_enabled:
+            quantity = int(quantity_map.get(str(addon_id), minimum) or minimum)
+            quantity = max(minimum, min(quantity, maximum))
+        else:
+            quantity = 1
+        unit_amount = max(0, int(addon.get("amount") or 0))
+        addon["quantity"] = quantity
+        addon["unit_amount"] = unit_amount
+        addon["line_total"] = unit_amount * quantity
+        result.append(addon)
+    return result
 
 
 def _addons_text(addons: list[dict], currency: str, *, with_total: bool = True) -> str | None:
@@ -901,9 +923,17 @@ def _addons_text(addons: list[dict], currency: str, *, with_total: bool = True) 
     lines = ["🧰 Дополнительные услуги:"]
     total = 0
     for addon in addons:
-        amount = max(0, int(addon.get("amount") or 0))
-        total += amount
-        lines.append(f"• {addon.get('name')}: {_money_text(amount, currency)}")
+        quantity = max(1, int(addon.get("quantity") or 1))
+        unit_amount = max(0, int(addon.get("unit_amount") if addon.get("unit_amount") is not None else addon.get("amount") or 0))
+        line_total = max(0, int(addon.get("line_total") if addon.get("line_total") is not None else unit_amount * quantity))
+        total += line_total
+        if bool(addon.get("quantity_enabled")) or quantity > 1:
+            lines.append(
+                f"• {addon.get('name')} ×{quantity}: {_money_text(line_total, currency)} "
+                f"({_money_text(unit_amount, currency)}/шт)"
+            )
+        else:
+            lines.append(f"• {addon.get('name')}: {_money_text(line_total, currency)}")
     if with_total:
         lines.append(f"Доп. услуги всего: {_money_text(total, currency)}")
     return "\n".join(lines)
@@ -947,6 +977,7 @@ def _parse_money_input(value: str | None) -> int | None:
 async def _calculate_form_pricing(
     form_id: int, questions: list[dict], answers: dict[str, str],
     selected_addon_ids: list[int] | None = None,
+    selected_addon_quantities: dict[str, int] | dict[int, int] | None = None,
 ) -> dict | None:
     """Calculate a preliminary rental price for a time-based form.
 
@@ -984,9 +1015,18 @@ async def _calculate_form_pricing(
         amount = base_amount + billed_hours * extra_hour_amount
 
     currency = str(await db.get_setting("crm_currency", "₽") or "₽")
-    selected_addons = await _selected_addon_rows(form_id, selected_addon_ids)
+    selected_addons = await _selected_addon_rows(
+        form_id, selected_addon_ids, selected_addon_quantities
+    )
     addon_items = [
-        {"id": int(item["id"]), "name": str(item["name"]), "amount": max(0, int(item.get("amount") or 0))}
+        {
+            "id": int(item["id"]),
+            "name": str(item["name"]),
+            "amount": max(0, int(item.get("line_total") or 0)),
+            "unit_amount": max(0, int(item.get("unit_amount") or item.get("amount") or 0)),
+            "quantity": max(1, int(item.get("quantity") or 1)),
+            "quantity_enabled": bool(item.get("quantity_enabled")),
+        }
         for item in selected_addons
     ]
     addons_total = sum(int(item["amount"]) for item in addon_items)
@@ -1050,7 +1090,14 @@ def _pricing_calculation_text(calculation: dict | None) -> str | None:
         if surcharge_total:
             lines.append(f"Динамические надбавки: {_money_text(surcharge_total, currency)}")
         for addon in addons:
-            lines.append(f"+ {addon.get('name')}: {_money_text(addon.get('amount'), currency)}")
+            quantity = max(1, int(addon.get("quantity") or 1))
+            if bool(addon.get("quantity_enabled")) or quantity > 1:
+                lines.append(
+                    f"+ {addon.get('name')} ×{quantity}: {_money_text(addon.get('amount'), currency)} "
+                    f"({_money_text(addon.get('unit_amount'), currency)}/шт)"
+                )
+            else:
+                lines.append(f"+ {addon.get('name')}: {_money_text(addon.get('amount'), currency)}")
         if addons_total:
             lines.append(f"Доп. услуги: {_money_text(addons_total, currency)}")
     if included > 0:
@@ -1312,7 +1359,8 @@ async def _submission_admin_text(submission: dict) -> str:
     addon_items = list(pricing_details.get("addons") or [])
     if not addon_items and submission.get("form_id") and submission.get("selected_addon_ids"):
         addon_items = await _selected_addon_rows(
-            int(submission["form_id"]), submission.get("selected_addon_ids") or []
+            int(submission["form_id"]), submission.get("selected_addon_ids") or [],
+            submission.get("selected_addon_quantities") or {},
         )
     lines = [
         f"<b>Заявка №{submission['id']}</b>",
@@ -1331,10 +1379,24 @@ async def _submission_admin_text(submission: dict) -> str:
     if addon_items:
         lines.extend(["", "<b>🧰 Дополнительные услуги:</b>"])
         for addon in addon_items:
-            lines.append(
-                f"• {html.escape(str(addon.get('name') or 'Услуга'))}: "
-                f"{html.escape(_money_text(addon.get('amount'), currency))}"
-            )
+            quantity = max(1, int(addon.get("quantity") or 1))
+            line_amount = addon.get("amount")
+            if addon.get("line_total") is not None:
+                line_amount = addon.get("line_total")
+            unit_amount = addon.get("unit_amount")
+            if unit_amount is None:
+                unit_amount = addon.get("amount")
+            if bool(addon.get("quantity_enabled")) or quantity > 1:
+                lines.append(
+                    f"• {html.escape(str(addon.get('name') or 'Услуга'))} ×{quantity}: "
+                    f"{html.escape(_money_text(line_amount, currency))} "
+                    f"({_money_text(unit_amount, currency)}/шт)"
+                )
+            else:
+                lines.append(
+                    f"• {html.escape(str(addon.get('name') or 'Услуга'))}: "
+                    f"{html.escape(_money_text(line_amount, currency))}"
+                )
     lines.extend([
         "",
         f"Клиент: {html.escape(full_name)}",
@@ -1596,23 +1658,34 @@ async def send_current_form_question(
         addons = await db.list_form_addons(int(form["id"]), enabled_only=True)
         if addons and not bool(session.get("addons_confirmed")):
             selected_ids = set(int(x) for x in session.get("selected_addon_ids") or [])
+            selected_quantities = {
+                str(k): int(v) for k, v in (session.get("selected_addon_quantities") or {}).items()
+            }
+            # Backward compatibility: an old selected quantity-enabled addon starts at its minimum.
+            for addon in addons:
+                addon_id = int(addon["id"])
+                if addon_id in selected_ids and addon.get("quantity_enabled") and str(addon_id) not in selected_quantities:
+                    selected_quantities[str(addon_id)] = max(1, int(addon.get("min_quantity") or 1))
             currency = str(await db.get_setting("crm_currency", "₽") or "₽")
-            selected_rows = [item for item in addons if int(item["id"]) in selected_ids]
-            addon_total = sum(max(0, int(item.get("amount") or 0)) for item in selected_rows)
+            selected_rows = await _selected_addon_rows(
+                int(form["id"]), list(selected_ids), selected_quantities
+            )
+            addon_total = sum(max(0, int(item.get("line_total") or 0)) for item in selected_rows)
             lines = [
                 f"🧰 {form['name']}",
                 "",
-                "Выберите дополнительные услуги. Можно выбрать несколько вариантов.",
+                "Выберите дополнительные услуги. Для услуг с количеством используйте ➖ / ➕.",
             ]
             if selected_rows:
                 lines.extend(["", "Выбрано:"])
-                for item in selected_rows:
-                    lines.append(f"• {item['name']} — {_money_text(item.get('amount'), currency)}")
+                addon_text = _addons_text(selected_rows, currency, with_total=False)
+                if addon_text:
+                    lines.extend(addon_text.splitlines()[1:])
                 lines.append(f"Всего доп. услуг: {_money_text(addon_total, currency)}")
             else:
                 lines.extend(["", "Пока ничего не выбрано."])
             live_calculation = await _calculate_form_pricing(
-                int(form["id"]), questions, session["answers"], list(selected_ids)
+                int(form["id"]), questions, session["answers"], list(selected_ids), selected_quantities
             )
             if live_calculation:
                 lines.extend([
@@ -1620,14 +1693,15 @@ async def send_current_form_question(
                     f"💰 Предварительный итог с услугами: {_money_text(live_calculation.get('amount'), currency)}",
                 ])
             await db.update_form_session(
-                chat_id, current_index=len(questions), status="addons", keyboard_question_id=0
+                chat_id, current_index=len(questions), status="addons", keyboard_question_id=0,
+                selected_addon_quantities=selected_quantities,
             )
             session = await db.get_form_session(chat_id)
             if not session:
                 return
             await _upsert_form_message(
                 bot, session, text="\n".join(lines),
-                reply_markup=form_addons(addons, selected_ids, currency),
+                reply_markup=form_addons(addons, selected_ids, currency, selected_quantities),
             )
             return
 
@@ -1646,10 +1720,12 @@ async def send_current_form_question(
             )
             return
         selected_rows = await _selected_addon_rows(
-            int(form["id"]), session.get("selected_addon_ids") or []
+            int(form["id"]), session.get("selected_addon_ids") or [],
+            session.get("selected_addon_quantities") or {},
         )
         pricing_calculation = await _calculate_form_pricing(
-            int(form["id"]), questions, session["answers"], session.get("selected_addon_ids") or []
+            int(form["id"]), questions, session["answers"], session.get("selected_addon_ids") or [],
+            session.get("selected_addon_quantities") or {},
         )
         currency = str(await db.get_setting("crm_currency", "₽") or "₽")
         await _upsert_form_message(
@@ -3103,15 +3179,93 @@ async def form_addon_toggle(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Услуга больше недоступна", show_alert=True)
         return
     selected = [int(x) for x in session.get("selected_addon_ids") or []]
+    quantities = {str(k): int(v) for k, v in (session.get("selected_addon_quantities") or {}).items()}
     if addon_id in selected:
         selected = [x for x in selected if x != addon_id]
+        quantities.pop(str(addon_id), None)
         notice = "Услуга убрана"
     else:
         selected.append(addon_id)
+        if addon.get("quantity_enabled"):
+            quantities[str(addon_id)] = max(1, int(addon.get("min_quantity") or 1))
         notice = "Услуга добавлена"
-    await db.update_form_session(callback.message.chat.id, selected_addon_ids=selected)
+    await db.update_form_session(
+        callback.message.chat.id, selected_addon_ids=selected, selected_addon_quantities=quantities
+    )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer(notice)
+
+
+async def _change_addon_quantity(callback: CallbackQuery, bot: Bot, delta: int) -> None:
+    session = await _form_callback_session(callback)
+    if not session or not isinstance(callback.message, Message):
+        return
+    if session.get("status") != "addons":
+        await callback.answer("Выбор услуг уже завершён", show_alert=True)
+        return
+    try:
+        addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная услуга", show_alert=True)
+        return
+    addon = await db.get_form_addon(addon_id)
+    if (
+        not addon or int(addon.get("form_id") or 0) != int(session["form_id"])
+        or not addon.get("enabled") or not addon.get("quantity_enabled")
+    ):
+        await callback.answer("Для этой услуги количество не используется", show_alert=True)
+        return
+    minimum = max(1, int(addon.get("min_quantity") or 1))
+    maximum = max(minimum, int(addon.get("max_quantity") or minimum))
+    selected = [int(x) for x in session.get("selected_addon_ids") or []]
+    quantities = {str(k): int(v) for k, v in (session.get("selected_addon_quantities") or {}).items()}
+    current = int(quantities.get(str(addon_id), 0) or 0)
+    if delta > 0:
+        new_quantity = minimum if current <= 0 else min(maximum, current + 1)
+        if addon_id not in selected:
+            selected.append(addon_id)
+        quantities[str(addon_id)] = new_quantity
+        notice = f"Количество: {new_quantity}" if new_quantity < maximum else f"Количество: {new_quantity} (максимум)"
+    else:
+        if current <= minimum:
+            selected = [x for x in selected if x != addon_id]
+            quantities.pop(str(addon_id), None)
+            notice = "Услуга убрана"
+        else:
+            new_quantity = max(minimum, current - 1)
+            quantities[str(addon_id)] = new_quantity
+            notice = f"Количество: {new_quantity}"
+    await db.update_form_session(
+        callback.message.chat.id, selected_addon_ids=selected, selected_addon_quantities=quantities
+    )
+    await send_current_form_question(bot, callback.message.chat.id)
+    await callback.answer(notice)
+
+
+@router.callback_query(F.data.startswith("form:addon_inc:"))
+async def form_addon_inc(callback: CallbackQuery, bot: Bot) -> None:
+    await _change_addon_quantity(callback, bot, 1)
+
+
+@router.callback_query(F.data.startswith("form:addon_dec:"))
+async def form_addon_dec(callback: CallbackQuery, bot: Bot) -> None:
+    await _change_addon_quantity(callback, bot, -1)
+
+
+@router.callback_query(F.data.startswith("form:addon_qtyinfo:"))
+async def form_addon_qtyinfo(callback: CallbackQuery) -> None:
+    try:
+        addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer()
+        return
+    addon = await db.get_form_addon(addon_id)
+    if not addon:
+        await callback.answer()
+        return
+    minimum = max(1, int(addon.get("min_quantity") or 1))
+    maximum = max(minimum, int(addon.get("max_quantity") or minimum))
+    await callback.answer(f"Допустимое количество: {minimum}–{maximum} шт.")
 
 
 @router.callback_query(F.data == "form:addons_clear")
@@ -3119,7 +3273,9 @@ async def form_addons_clear(callback: CallbackQuery, bot: Bot) -> None:
     session = await _form_callback_session(callback)
     if not session or not isinstance(callback.message, Message):
         return
-    await db.update_form_session(callback.message.chat.id, selected_addon_ids=[])
+    await db.update_form_session(
+        callback.message.chat.id, selected_addon_ids=[], selected_addon_quantities={}
+    )
     await send_current_form_question(bot, callback.message.chat.id)
     await callback.answer("Дополнительные услуги убраны")
 
@@ -3283,18 +3439,26 @@ async def form_submit(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     selected_addons = await _selected_addon_rows(
-        int(form["id"]), session.get("selected_addon_ids") or []
+        int(form["id"]), session.get("selected_addon_ids") or [],
+        session.get("selected_addon_quantities") or {},
     )
     pricing_calculation = await _calculate_form_pricing(
-        int(form["id"]), questions, session["answers"], session.get("selected_addon_ids") or []
+        int(form["id"]), questions, session["answers"], session.get("selected_addon_ids") or [],
+        session.get("selected_addon_quantities") or {},
     )
     calculated_amount = int(pricing_calculation.get("amount") or 0) if pricing_calculation else 0
     currency = str(await db.get_setting("crm_currency", "₽") or "₽")
     pricing_details = pricing_calculation or {
         "currency": currency,
-        "addons_total": sum(max(0, int(item.get("amount") or 0)) for item in selected_addons),
+        "addons_total": sum(max(0, int(item.get("line_total") or 0)) for item in selected_addons),
         "addons": [
-            {"id": int(item["id"]), "name": str(item["name"]), "amount": max(0, int(item.get("amount") or 0))}
+            {
+                "id": int(item["id"]), "name": str(item["name"]),
+                "amount": max(0, int(item.get("line_total") or 0)),
+                "unit_amount": max(0, int(item.get("unit_amount") or item.get("amount") or 0)),
+                "quantity": max(1, int(item.get("quantity") or 1)),
+                "quantity_enabled": bool(item.get("quantity_enabled")),
+            }
             for item in selected_addons
         ],
     }
@@ -4648,7 +4812,8 @@ async def _render_admin_addons(message: Message, form_id: int) -> None:
         f"<b>🧰 Доп. услуги · {html.escape(str(form['name']))}</b>\n\n"
         f"Активно: {active} · всего: {len(addons)}\n\n"
         "Клиент сможет отметить несколько услуг перед подтверждением заявки. "
-        "Стоимость выбранных услуг автоматически прибавится к расчёту аренды."
+        "Для штучных услуг можно включить количество и задать минимум/максимум. "
+        "Стоимость автоматически пересчитывается как цена за единицу × количество."
     )
     await message.edit_text(text, reply_markup=admin_addons_list(form_id, addons, currency))
 
@@ -4731,9 +4896,18 @@ async def admin_addon_add_amount_save(message: Message, state: FSMContext) -> No
 
 
 def _addon_admin_text(addon: dict, currency: str) -> str:
+    quantity_enabled = bool(addon.get("quantity_enabled"))
+    minimum = max(1, int(addon.get("min_quantity") or 1))
+    maximum = max(minimum, int(addon.get("max_quantity") or minimum))
+    quantity_text = (
+        f"🔢 Количество: <b>да, {minimum}–{maximum} шт.</b>"
+        if quantity_enabled else "🔢 Количество: <b>нет (услуга 0/1)</b>"
+    )
+    price_label = "Цена за единицу" if quantity_enabled else "Цена"
     return (
         f"<b>🧰 {html.escape(str(addon['name']))}</b>\n\n"
-        f"Цена: <b>{html.escape(_money_text(addon.get('amount'), currency))}</b>\n"
+        f"{price_label}: <b>{html.escape(_money_text(addon.get('amount'), currency))}</b>\n"
+        f"{quantity_text}\n"
         f"Статус: {'🟢 включена' if addon.get('enabled') else '⚪ выключена'}"
     )
 
@@ -4848,6 +5022,101 @@ async def admin_addon_toggle(callback: CallbackQuery) -> None:
     if isinstance(callback.message, Message) and addon:
         await callback.message.edit_text(_addon_admin_text(addon, currency), reply_markup=admin_addon_edit(addon))
     await callback.answer("Готово")
+
+
+@router.callback_query(F.data.startswith("adm:addon_quantity_toggle:"))
+async def admin_addon_quantity_toggle(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная услуга", show_alert=True)
+        return
+    addon = await db.get_form_addon(addon_id)
+    if not addon:
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+    enabling = not bool(addon.get("quantity_enabled"))
+    await db.update_form_addon_field(addon_id, "quantity_enabled", 1 if enabling else 0)
+    if enabling:
+        minimum = max(1, int(addon.get("min_quantity") or 1))
+        maximum = max(minimum, int(addon.get("max_quantity") or 1))
+        if maximum <= 1:
+            maximum = 10
+        await db.update_form_addon_field(addon_id, "min_quantity", minimum)
+        await db.update_form_addon_field(addon_id, "max_quantity", maximum)
+    else:
+        await db.update_form_addon_field(addon_id, "min_quantity", 1)
+        await db.update_form_addon_field(addon_id, "max_quantity", 1)
+    addon = await db.get_form_addon(addon_id)
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    if isinstance(callback.message, Message) and addon:
+        await callback.message.edit_text(
+            _addon_admin_text(addon, currency), reply_markup=admin_addon_edit(addon)
+        )
+    await callback.answer("Количество включено" if enabling else "Количество выключено")
+
+
+@router.callback_query(F.data.startswith("adm:addon_quantity_limits:"))
+async def admin_addon_quantity_limits_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        addon_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная услуга", show_alert=True)
+        return
+    addon = await db.get_form_addon(addon_id)
+    if not addon:
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(addon_id=addon_id)
+    await state.set_state(AdminStates.addon_edit_quantity_limits)
+    minimum = max(1, int(addon.get("min_quantity") or 1))
+    maximum = max(minimum, int(addon.get("max_quantity") or minimum))
+    if isinstance(callback.message, Message):
+        await callback.message.answer(
+            "Введите минимальное и максимальное количество через пробел.\n"
+            f"Сейчас: <b>{minimum} {maximum}</b>\n\n"
+            "Например: <code>1 10</code>"
+        )
+    await callback.answer()
+
+
+@router.message(AdminStates.addon_edit_quantity_limits)
+async def admin_addon_quantity_limits_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        return
+    raw = (message.text or "").strip().replace("-", " ").replace("–", " ")
+    parts = [x for x in raw.split() if x]
+    if len(parts) != 2 or not all(x.isdigit() for x in parts):
+        await message.answer("Введите два целых числа, например <code>1 10</code>.")
+        return
+    minimum, maximum = int(parts[0]), int(parts[1])
+    if minimum < 1 or maximum < minimum or maximum > 999:
+        await message.answer("Допустимо: минимум от 1, максимум до 999 и не меньше минимума.")
+        return
+    data = await state.get_data()
+    addon_id = int(data.get("addon_id") or 0)
+    addon = await db.get_form_addon(addon_id)
+    if not addon:
+        await state.clear()
+        await message.answer("Услуга больше не найдена.")
+        return
+    await db.update_form_addon_field(addon_id, "quantity_enabled", 1)
+    await db.update_form_addon_field(addon_id, "min_quantity", minimum)
+    await db.update_form_addon_field(addon_id, "max_quantity", maximum)
+    addon = await db.get_form_addon(addon_id)
+    await state.clear()
+    currency = str(await db.get_setting("crm_currency", "₽") or "₽")
+    if addon:
+        await message.answer(
+            _addon_admin_text(addon, currency), reply_markup=admin_addon_edit(addon)
+        )
 
 
 @router.callback_query(F.data.startswith("adm:addon_delete:"))

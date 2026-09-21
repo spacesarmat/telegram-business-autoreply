@@ -380,6 +380,21 @@ class WebAdmin:
         else:
             answers = "".join(f'<div><b>{_e(k)}:</b> {_answer_html(v)}</div>' for k, v in answers_data.items())
         answers = answers or '<span class="muted">Нет ответов</span>'
+        pricing_details = item.get("pricing_details") or {}
+        addon_items = list(pricing_details.get("addons") or [])
+        addon_rows = []
+        for addon in addon_items:
+            quantity = max(1, int(addon.get("quantity") or 1))
+            unit_amount = int(addon.get("unit_amount") if addon.get("unit_amount") is not None else addon.get("amount") or 0)
+            line_total = int(addon.get("amount") or unit_amount * quantity)
+            if bool(addon.get("quantity_enabled")) or quantity > 1:
+                label = f"{addon.get('name') or 'Услуга'} ×{quantity}"
+                price = f"{_money(line_total, currency)} ({_money(unit_amount, currency)}/шт)"
+            else:
+                label = str(addon.get("name") or "Услуга")
+                price = _money(line_total, currency)
+            addon_rows.append(f'<tr><td>{_e(label)}</td><td>{_e(price)}</td></tr>')
+        addons_html = "".join(addon_rows) or '<tr><td colspan="2" class="muted">Дополнительные услуги не выбраны</td></tr>'
         events = await self.db.list_submission_events(sid, limit=30)
         event_rows = "".join(f'<tr><td>{_e(_local_dt(ev.get("created_at"), self.timezone))}</td><td>{_e(ev.get("event_type"))}</td><td>{_e(ev.get("old_value") or "—")}</td><td>{_e(ev.get("new_value") or "—")}</td></tr>' for ev in events) or '<tr><td colspan="4" class="muted">Нет событий</td></tr>'
         client = " ".join(x for x in [item.get("first_name"), item.get("last_name")] if x) or "—"
@@ -391,6 +406,7 @@ class WebAdmin:
 <div class="section row"><div class="card"><h2>Статус</h2><form method="post" action="/admin/requests/{sid}/status"><div class="field"><select name="status">{status_opts}</select></div><button class="btn primary">Сохранить и уведомить клиента</button></form></div><div class="card"><h2>CRM</h2><form method="post" action="/admin/requests/{sid}/crm"><div class="row"><div class="field"><label>Стоимость</label><input name="total_amount" value="{total}"></div><div class="field"><label>Предоплата</label><input name="prepayment_amount" value="{prepay}"></div></div><div class="field"><label>Внутренняя заметка</label><textarea name="internal_note">{_e(item.get('internal_note') or '')}</textarea></div><button class="btn primary">Сохранить</button></form></div></div>
 <div class="section card"><h2>Операционные данные</h2><div class="kv"><div><b>Зал:</b></div><div>{_e((venue or {}).get('name') or '—')}</div><div><b>Менеджер:</b></div><div>{_e(item.get('manager') or '—')}</div><div><b>Залог:</b></div><div>{_e(_money(item.get('deposit_amount'),currency))} · {_e(deposit_status_names.get(str(item.get('deposit_status') or 'none'), item.get('deposit_status') or 'none'))}</div><div><b>Публичная карточка:</b></div><div><a href="/booking/{_e(public_token)}" target="_blank">Открыть</a> · <a href="/admin/requests/{sid}/confirmation.pdf">PDF</a> · <a href="/admin/requests/{sid}/qr.png" target="_blank">QR</a></div></div></div>
 <div class="section card"><h2>Ответы формы</h2><div class="kv">{answers}</div></div>
+<div class="section card"><h2>Дополнительные услуги</h2><div class="table-wrap"><table><thead><tr><th>Услуга</th><th>Стоимость</th></tr></thead><tbody>{addons_html}</tbody></table></div></div>
 <div class="section row"><div><h2>Задачи</h2><div class="table-wrap"><table><thead><tr><th>Задача</th><th>Ответственный</th><th>Срок</th><th>Статус</th></tr></thead><tbody>{task_rows}</tbody></table></div></div><div><h2>Ресурсы</h2><div class="table-wrap"><table><thead><tr><th>Ресурс</th><th>Кол.</th><th>Зал</th></tr></thead><tbody>{allocation_rows}</tbody></table></div></div></div>
 <div class="section"><h2>Платежи</h2><div class="table-wrap"><table><thead><tr><th>Провайдер</th><th>ID</th><th>Сумма</th><th>Статус</th><th>Создан</th></tr></thead><tbody>{payment_rows}</tbody></table></div></div>
 <div class="section"><h2>История</h2><div class="table-wrap"><table><thead><tr><th>Время</th><th>Событие</th><th>Было</th><th>Стало</th></tr></thead><tbody>{event_rows}</tbody></table></div></div>"""
@@ -483,8 +499,32 @@ class WebAdmin:
             raise web.HTTPNotFound()
         p = await self.db.get_form_pricing(fid)
         addons = await self.db.list_form_addons(fid)
-        addon_rows = "".join(f'''<tr><td><form method="post" action="/admin/pricing/{fid}/addon/{int(a['id'])}"><input name="name" value="{_e(a['name'])}"></td><td><input name="amount" value="{int(a['amount'])}"></td><td><label><input style="width:auto" type="checkbox" name="enabled" value="1" {'checked' if a['enabled'] else ''}> Вкл</label></td><td><button class="btn">Сохранить</button></form></td><td><form method="post" action="/admin/pricing/{fid}/addon/{int(a['id'])}/delete"><button class="btn danger">Удалить</button></form></td></tr>''' for a in addons) or '<tr><td colspan="5" class="muted">Дополнительных услуг нет</td></tr>'
-        content = f"""<div class="card"><form method="post" action="/admin/pricing/{fid}"><div class="field"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {'checked' if p.get('enabled') else ''}> Автоматический расчёт включён</label></div><div class="row3"><div class="field"><label>Базовая стоимость</label><input name="base_amount" value="{int(p.get('base_amount') or 0)}"></div><div class="field"><label>Включено часов</label><input name="included_hours" value="{int(p.get('included_hours') or 0)}"></div><div class="field"><label>Доп. начатый час</label><input name="extra_hour_amount" value="{int(p.get('extra_hour_amount') or 0)}"></div></div><div class="field"><label>Описание базовой стоимости</label><textarea name="base_description" rows="5" maxlength="1500" placeholder="Например: до 6 часов аренды, мебель, базовая уборка, дежурный администратор">{_e(p.get('base_description') or '')}</textarea><div class="muted">Это пояснение увидит клиент в предварительном расчёте стоимости.</div></div><div class="row"><div class="field"><label>Буфер до, мин</label><input name="buffer_before_minutes" value="{int(p.get('buffer_before_minutes') or 0)}"></div><div class="field"><label>Буфер после, мин</label><input name="buffer_after_minutes" value="{int(p.get('buffer_after_minutes') or 0)}"></div></div><button class="btn primary">Сохранить тариф</button></form></div><div class="section"><h2>Дополнительные услуги</h2><div class="table-wrap"><table><thead><tr><th>Название</th><th>Цена</th><th>Статус</th><th></th><th></th></tr></thead><tbody>{addon_rows}</tbody></table></div><div class="card section"><form method="post" action="/admin/pricing/{fid}/addon"><div class="row"><div class="field"><label>Новая услуга</label><input name="name" required placeholder="Например: Свет"></div><div class="field"><label>Цена</label><input name="amount" required value="0"></div></div><button class="btn">Добавить услугу</button></form></div></div>"""
+        addon_rows_parts: list[str] = []
+        for a in addons:
+            aid = int(a["id"])
+            q_enabled = bool(a.get("quantity_enabled"))
+            q_min = max(1, int(a.get("min_quantity") or 1))
+            q_max = max(q_min, int(a.get("max_quantity") or q_min))
+            addon_rows_parts.append(
+                f"""<tr><td colspan="7">
+                <form method="post" action="/admin/pricing/{fid}/addon/{aid}">
+                  <div class="row3">
+                    <div class="field"><label>Название</label><input name="name" value="{_e(a['name'])}"></div>
+                    <div class="field"><label>Цена за единицу</label><input name="amount" value="{int(a['amount'])}"></div>
+                    <div class="field"><label>Количество</label><label><input style="width:auto" type="checkbox" name="quantity_enabled" value="1" {'checked' if q_enabled else ''}> Разрешить количество</label></div>
+                  </div>
+                  <div class="row3">
+                    <div class="field"><label>Минимум</label><input name="min_quantity" value="{q_min}"></div>
+                    <div class="field"><label>Максимум</label><input name="max_quantity" value="{q_max}"></div>
+                    <div class="field"><label>Статус</label><label><input style="width:auto" type="checkbox" name="enabled" value="1" {'checked' if a['enabled'] else ''}> Включена</label></div>
+                  </div>
+                  <button class="btn">Сохранить</button>
+                </form>
+                <form style="margin-top:8px" method="post" action="/admin/pricing/{fid}/addon/{aid}/delete"><button class="btn danger">Удалить</button></form>
+                </td></tr>"""
+            )
+        addon_rows = "".join(addon_rows_parts) or '<tr><td colspan="7" class="muted">Дополнительных услуг нет</td></tr>'
+        content = f"""<div class="card"><form method="post" action="/admin/pricing/{fid}"><div class="field"><label><input style="width:auto" type="checkbox" name="enabled" value="1" {'checked' if p.get('enabled') else ''}> Автоматический расчёт включён</label></div><div class="row3"><div class="field"><label>Базовая стоимость</label><input name="base_amount" value="{int(p.get('base_amount') or 0)}"></div><div class="field"><label>Включено часов</label><input name="included_hours" value="{int(p.get('included_hours') or 0)}"></div><div class="field"><label>Доп. начатый час</label><input name="extra_hour_amount" value="{int(p.get('extra_hour_amount') or 0)}"></div></div><div class="field"><label>Описание базовой стоимости</label><textarea name="base_description" rows="5" maxlength="1500" placeholder="Например: до 6 часов аренды, мебель, базовая уборка, дежурный администратор">{_e(p.get('base_description') or '')}</textarea><div class="muted">Это пояснение увидит клиент в предварительном расчёте стоимости.</div></div><div class="row"><div class="field"><label>Буфер до, мин</label><input name="buffer_before_minutes" value="{int(p.get('buffer_before_minutes') or 0)}"></div><div class="field"><label>Буфер после, мин</label><input name="buffer_after_minutes" value="{int(p.get('buffer_after_minutes') or 0)}"></div></div><button class="btn primary">Сохранить тариф</button></form></div><div class="section"><h2>Дополнительные услуги</h2><p class="muted">Для штучных услуг включите «Разрешить количество» и задайте диапазон. Цена считается за одну единицу.</p><div class="table-wrap"><table><thead><tr><th colspan="7">Услуги</th></tr></thead><tbody>{addon_rows}</tbody></table></div><div class="card section"><form method="post" action="/admin/pricing/{fid}/addon"><div class="row3"><div class="field"><label>Новая услуга</label><input name="name" required placeholder="Например: Микрофон"></div><div class="field"><label>Цена за единицу</label><input name="amount" required value="0"></div><div class="field"><label>Количество</label><label><input style="width:auto" type="checkbox" name="quantity_enabled" value="1"> Разрешить количество</label></div></div><div class="row"><div class="field"><label>Минимум</label><input name="min_quantity" value="1"></div><div class="field"><label>Максимум</label><input name="max_quantity" value="10"></div></div><button class="btn">Добавить услугу</button></form></div></div>"""
         return self.page(request, f"Тариф: {form['name']}", content, active="pricing")
 
     async def pricing_post(self, request: web.Request) -> web.StreamResponse:
@@ -511,9 +551,15 @@ class WebAdmin:
         data = request["post"]
         name = str(data.get("name") or "").strip()[:80]
         amount = _parse_int(str(data.get("amount") or ""))
-        if not name or amount is None:
-            raise web.HTTPFound(f"/admin/pricing/{fid}?err=" + quote("Укажите название и цену"))
-        await self.db.add_form_addon(fid, name, amount)
+        quantity_enabled = bool(data.get("quantity_enabled"))
+        min_quantity = _parse_int(str(data.get("min_quantity") or "1"), minimum=1, maximum=999)
+        max_quantity = _parse_int(str(data.get("max_quantity") or "1"), minimum=1, maximum=999)
+        if not name or amount is None or min_quantity is None or max_quantity is None or max_quantity < min_quantity:
+            raise web.HTTPFound(f"/admin/pricing/{fid}?err=" + quote("Проверьте название, цену и диапазон количества"))
+        await self.db.add_form_addon(
+            fid, name, amount, quantity_enabled=quantity_enabled,
+            min_quantity=min_quantity, max_quantity=max_quantity,
+        )
         raise web.HTTPFound(f"/admin/pricing/{fid}?ok=" + quote("Услуга добавлена"))
 
     async def addon_update(self, request: web.Request) -> web.StreamResponse:
@@ -521,10 +567,18 @@ class WebAdmin:
         data = request["post"]
         name = str(data.get("name") or "").strip()[:80]
         amount = _parse_int(str(data.get("amount") or ""))
-        if not name or amount is None:
+        quantity_enabled = bool(data.get("quantity_enabled"))
+        min_quantity = _parse_int(str(data.get("min_quantity") or "1"), minimum=1, maximum=999)
+        max_quantity = _parse_int(str(data.get("max_quantity") or "1"), minimum=1, maximum=999)
+        if not name or amount is None or min_quantity is None or max_quantity is None or max_quantity < min_quantity:
             raise web.HTTPFound(f"/admin/pricing/{fid}?err=" + quote("Некорректные данные услуги"))
+        if not quantity_enabled:
+            min_quantity = max_quantity = 1
         await self.db.update_form_addon_field(aid, "name", name)
         await self.db.update_form_addon_field(aid, "amount", amount)
+        await self.db.update_form_addon_field(aid, "quantity_enabled", 1 if quantity_enabled else 0)
+        await self.db.update_form_addon_field(aid, "min_quantity", min_quantity)
+        await self.db.update_form_addon_field(aid, "max_quantity", max_quantity)
         await self.db.update_form_addon_field(aid, "enabled", 1 if data.get("enabled") else 0)
         raise web.HTTPFound(f"/admin/pricing/{fid}?ok=" + quote("Услуга сохранена"))
 
@@ -1201,30 +1255,47 @@ class WebAdmin:
         raise web.HTTPFound(f"/admin/rules/{fid}?ok=" + quote("Блокировка удалена"))
 
     async def export_csv(self, request: web.Request) -> web.Response:
-        import csv, io
+        import csv, io, json
         async with self.db.connection() as conn:
             rows = await (await conn.execute("SELECT * FROM form_submissions ORDER BY created_at DESC,id DESC")).fetchall()
         out=io.StringIO(); w=csv.writer(out, delimiter=';')
-        w.writerow(["id","created_at","form","status","client","username","chat_id","amount","prepayment","balance","answers","note"])
+        w.writerow(["id","created_at","form","status","client","username","chat_id","amount","prepayment","balance","addons","answers","note"])
         for r in rows:
             d=dict(r); total=int(d.get("total_amount") or 0); pre=int(d.get("prepayment_amount") or 0)
             client=" ".join(x for x in [d.get("first_name"),d.get("last_name")] if x)
-            w.writerow([d.get("id"),d.get("created_at"),d.get("form_name"),d.get("status"),client,d.get("username"),d.get("chat_id"),total,pre,max(0,total-pre),d.get("answers_json"),d.get("internal_note")])
+            try:
+                pricing=json.loads(d.get("pricing_details_json") or "{}")
+            except Exception:
+                pricing={}
+            addon_parts=[]
+            for a in pricing.get("addons") or []:
+                q=max(1,int(a.get("quantity") or 1)); unit=int(a.get("unit_amount") if a.get("unit_amount") is not None else a.get("amount") or 0); line=int(a.get("amount") or unit*q)
+                addon_parts.append(f"{a.get('name') or 'Услуга'} x{q}: {line} ({unit}/шт)" if a.get("quantity_enabled") or q>1 else f"{a.get('name') or 'Услуга'}: {line}")
+            w.writerow([d.get("id"),d.get("created_at"),d.get("form_name"),d.get("status"),client,d.get("username"),d.get("chat_id"),total,pre,max(0,total-pre)," | ".join(addon_parts),d.get("answers_json"),d.get("internal_note")])
         body='\ufeff'+out.getvalue()
         return web.Response(text=body, content_type="text/csv", charset="utf-8", headers={"Content-Disposition":"attachment; filename=tgautoreply-export.csv"})
 
     async def export_xlsx(self, request: web.Request) -> web.Response:
+        import json
         from io import BytesIO
         from openpyxl import Workbook
         async with self.db.connection() as conn:
             rows = await (await conn.execute("SELECT * FROM form_submissions ORDER BY created_at DESC,id DESC")).fetchall()
         wb=Workbook(); ws=wb.active; ws.title="Заявки"
-        headers=["ID","Создана UTC","Форма","Статус","Клиент","Username","Chat ID","Стоимость","Предоплата","Остаток","Ответы JSON","Заметка"]
+        headers=["ID","Создана UTC","Форма","Статус","Клиент","Username","Chat ID","Стоимость","Предоплата","Остаток","Доп. услуги","Ответы JSON","Заметка"]
         ws.append(headers)
         for r in rows:
             d=dict(r); total=int(d.get("total_amount") or 0); pre=int(d.get("prepayment_amount") or 0)
             client=" ".join(x for x in [d.get("first_name"),d.get("last_name")] if x)
-            ws.append([d.get("id"),d.get("created_at"),d.get("form_name"),d.get("status"),client,d.get("username"),d.get("chat_id"),total,pre,max(0,total-pre),d.get("answers_json"),d.get("internal_note")])
+            try:
+                pricing=json.loads(d.get("pricing_details_json") or "{}")
+            except Exception:
+                pricing={}
+            addon_parts=[]
+            for a in pricing.get("addons") or []:
+                q=max(1,int(a.get("quantity") or 1)); unit=int(a.get("unit_amount") if a.get("unit_amount") is not None else a.get("amount") or 0); line=int(a.get("amount") or unit*q)
+                addon_parts.append(f"{a.get('name') or 'Услуга'} x{q}: {line} ({unit}/шт)" if a.get("quantity_enabled") or q>1 else f"{a.get('name') or 'Услуга'}: {line}")
+            ws.append([d.get("id"),d.get("created_at"),d.get("form_name"),d.get("status"),client,d.get("username"),d.get("chat_id"),total,pre,max(0,total-pre)," | ".join(addon_parts),d.get("answers_json"),d.get("internal_note")])
         ws.freeze_panes="A2"
         for col in ws.columns:
             ws.column_dimensions[col[0].column_letter].width=min(50,max(12,max(len(str(c.value or "")) for c in col)+2))

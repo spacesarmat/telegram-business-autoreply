@@ -207,6 +207,27 @@ def _decode_int_list(raw: str | None) -> list[int]:
     return result
 
 
+def _decode_int_map(raw: str | None) -> dict[str, int]:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, item in value.items():
+        try:
+            addon_id = int(key)
+            quantity = int(item)
+        except (TypeError, ValueError):
+            continue
+        if addon_id > 0 and quantity > 0:
+            result[str(addon_id)] = quantity
+    return result
+
+
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -344,6 +365,9 @@ class Database:
                     form_id INTEGER NOT NULL,
                     name TEXT NOT NULL,
                     amount INTEGER NOT NULL DEFAULT 0,
+                    quantity_enabled INTEGER NOT NULL DEFAULT 0,
+                    min_quantity INTEGER NOT NULL DEFAULT 1,
+                    max_quantity INTEGER NOT NULL DEFAULT 1,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     position INTEGER NOT NULL DEFAULT 100,
                     created_at TEXT NOT NULL,
@@ -383,6 +407,7 @@ class Database:
                     current_index INTEGER NOT NULL DEFAULT 0,
                     answers_json TEXT NOT NULL DEFAULT '{}',
                     selected_addons_json TEXT NOT NULL DEFAULT '[]',
+                    selected_addon_quantities_json TEXT NOT NULL DEFAULT '{}',
                     addons_confirmed INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'active',
                     user_id INTEGER,
@@ -407,6 +432,7 @@ class Database:
                     last_name TEXT,
                     answers_json TEXT NOT NULL,
                     selected_addons_json TEXT NOT NULL DEFAULT '[]',
+                    selected_addon_quantities_json TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL DEFAULT 'new',
                     total_amount INTEGER NOT NULL DEFAULT 0,
                     calculated_amount INTEGER NOT NULL DEFAULT 0,
@@ -605,6 +631,42 @@ class Database:
             if "buffer_after_minutes" not in pricing_columns:
                 await db.execute(
                     "ALTER TABLE form_pricing ADD COLUMN buffer_after_minutes INTEGER NOT NULL DEFAULT 0"
+                )
+
+            # v2.1.1: количество для дополнительных услуг.
+            addon_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(form_addons)")).fetchall()
+            }
+            if "quantity_enabled" not in addon_columns:
+                await db.execute(
+                    "ALTER TABLE form_addons ADD COLUMN quantity_enabled INTEGER NOT NULL DEFAULT 0"
+                )
+            if "min_quantity" not in addon_columns:
+                await db.execute(
+                    "ALTER TABLE form_addons ADD COLUMN min_quantity INTEGER NOT NULL DEFAULT 1"
+                )
+            if "max_quantity" not in addon_columns:
+                await db.execute(
+                    "ALTER TABLE form_addons ADD COLUMN max_quantity INTEGER NOT NULL DEFAULT 1"
+                )
+
+            session_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(form_sessions)")).fetchall()
+            }
+            if "selected_addon_quantities_json" not in session_columns:
+                await db.execute(
+                    "ALTER TABLE form_sessions ADD COLUMN selected_addon_quantities_json TEXT NOT NULL DEFAULT '{}'"
+                )
+
+            submission_columns = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(form_submissions)")).fetchall()
+            }
+            if "selected_addon_quantities_json" not in submission_columns:
+                await db.execute(
+                    "ALTER TABLE form_submissions ADD COLUMN selected_addon_quantities_json TEXT NOT NULL DEFAULT '{}'"
                 )
 
             # v1.4.3: стандартная форма аренды использует явные время начала и окончания.
@@ -1031,8 +1093,15 @@ class Database:
             row = await (await db.execute("SELECT * FROM form_addons WHERE id=?", (addon_id,))).fetchone()
             return dict(row) if row else None
 
-    async def add_form_addon(self, form_id: int, name: str, amount: int) -> int:
+    async def add_form_addon(
+        self, form_id: int, name: str, amount: int, *,
+        quantity_enabled: bool = False, min_quantity: int = 1, max_quantity: int = 1
+    ) -> int:
         now = utc_now_iso()
+        min_quantity = max(1, min(int(min_quantity or 1), 999))
+        max_quantity = max(min_quantity, min(int(max_quantity or min_quantity), 999))
+        if not quantity_enabled:
+            min_quantity = max_quantity = 1
         async with self.connection() as db:
             row = await (
                 await db.execute(
@@ -1042,16 +1111,21 @@ class Database:
             ).fetchone()
             cur = await db.execute(
                 """
-                INSERT INTO form_addons(form_id, name, amount, enabled, position, created_at, updated_at)
-                VALUES(?, ?, ?, 1, ?, ?, ?)
+                INSERT INTO form_addons(
+                    form_id, name, amount, quantity_enabled, min_quantity, max_quantity,
+                    enabled, position, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
-                (form_id, name.strip(), max(0, int(amount)), int(row["p"]), now, now),
+                (
+                    form_id, name.strip(), max(0, int(amount)), 1 if quantity_enabled else 0,
+                    min_quantity, max_quantity, int(row["p"]), now, now
+                ),
             )
             await db.commit()
             return int(cur.lastrowid)
 
     async def update_form_addon_field(self, addon_id: int, field: str, value: Any) -> None:
-        if field not in {"name", "amount", "enabled", "position"}:
+        if field not in {"name", "amount", "enabled", "position", "quantity_enabled", "min_quantity", "max_quantity"}:
             raise ValueError("Unsupported addon field")
         async with self.connection() as db:
             await db.execute(
@@ -1286,8 +1360,8 @@ class Database:
                 """
                 INSERT INTO form_sessions(
                     chat_id, business_connection_id, form_id, form_message_id, submission_token, keyboard_question_id, custom_choice_question_id, current_index, answers_json,
-                    selected_addons_json, addons_confirmed, status, user_id, username, first_name, last_name, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, 0, 0, 0, '{}', '[]', 0, 'active', ?, ?, ?, ?, ?, ?)
+                    selected_addons_json, selected_addon_quantities_json, addons_confirmed, status, user_id, username, first_name, last_name, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, 0, 0, 0, '{}', '[]', '{}', 0, 'active', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     business_connection_id=excluded.business_connection_id,
                     form_id=excluded.form_id,
@@ -1298,6 +1372,7 @@ class Database:
                     current_index=0,
                     answers_json='{}',
                     selected_addons_json='[]',
+                    selected_addon_quantities_json='{}',
                     addons_confirmed=0,
                     status='active',
                     user_id=excluded.user_id,
@@ -1333,6 +1408,7 @@ class Database:
             result = dict(row)
             result["answers"] = _decode_answers(result.get("answers_json"))
             result["selected_addon_ids"] = _decode_int_list(result.get("selected_addons_json"))
+            result["selected_addon_quantities"] = _decode_int_map(result.get("selected_addon_quantities_json"))
             return result
 
     async def update_form_session(
@@ -1347,6 +1423,7 @@ class Database:
         keyboard_question_id: int | None = None,
         custom_choice_question_id: int | None = None,
         selected_addon_ids: list[int] | None = None,
+        selected_addon_quantities: dict[str, int] | dict[int, int] | None = None,
         addons_confirmed: bool | int | None = None,
     ) -> None:
         fields: list[str] = []
@@ -1375,6 +1452,14 @@ class Database:
         if selected_addon_ids is not None:
             fields.append("selected_addons_json=?")
             values.append(json.dumps([int(x) for x in selected_addon_ids], ensure_ascii=False))
+        if selected_addon_quantities is not None:
+            normalized_quantities = {
+                str(int(k)): max(1, int(v))
+                for k, v in selected_addon_quantities.items()
+                if int(k) > 0 and int(v) > 0
+            }
+            fields.append("selected_addon_quantities_json=?")
+            values.append(json.dumps(normalized_quantities, ensure_ascii=False))
         if addons_confirmed is not None:
             fields.append("addons_confirmed=?")
             values.append(int(bool(addons_confirmed)))
@@ -1412,6 +1497,9 @@ class Database:
         calculated_amount = max(0, int(calculated_amount or 0))
         pricing_details = pricing_details or {}
         selected_addon_ids = session.get("selected_addon_ids") or _decode_int_list(session.get("selected_addons_json"))
+        selected_addon_quantities = session.get("selected_addon_quantities") or _decode_int_map(
+            session.get("selected_addon_quantities_json")
+        )
         submission_token = str(session.get("submission_token") or "").strip() or uuid.uuid4().hex
 
         async with self.connection() as db:
@@ -1425,8 +1513,8 @@ class Database:
                 """
                 INSERT INTO form_submissions(
                     form_id, form_name, chat_id, business_connection_id, submission_token, user_id, username, first_name, last_name,
-                    answers_json, selected_addons_json, status, total_amount, calculated_amount, pricing_details_json, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
+                    answers_json, selected_addons_json, selected_addon_quantities_json, status, total_amount, calculated_amount, pricing_details_json, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
                 ON CONFLICT(submission_token) DO NOTHING
                 """,
                 (
@@ -1441,6 +1529,7 @@ class Database:
                     session.get("last_name"),
                     json.dumps(answers, ensure_ascii=False),
                     json.dumps(selected_addon_ids, ensure_ascii=False),
+                    json.dumps(selected_addon_quantities, ensure_ascii=False),
                     calculated_amount,
                     calculated_amount,
                     json.dumps(pricing_details, ensure_ascii=False),
@@ -1488,6 +1577,7 @@ class Database:
                 except (TypeError, json.JSONDecodeError):
                     item["pricing_details"] = {}
                 item["selected_addon_ids"] = _decode_int_list(item.get("selected_addons_json"))
+                item["selected_addon_quantities"] = _decode_int_map(item.get("selected_addon_quantities_json"))
                 result.append(item)
             return result
 
@@ -1505,6 +1595,7 @@ class Database:
             except (TypeError, json.JSONDecodeError):
                 result["pricing_details"] = {}
             result["selected_addon_ids"] = _decode_int_list(result.get("selected_addons_json"))
+            result["selected_addon_quantities"] = _decode_int_map(result.get("selected_addon_quantities_json"))
             return result
 
     async def update_submission_status(
@@ -1599,6 +1690,7 @@ class Database:
                 except (TypeError, json.JSONDecodeError):
                     item["pricing_details"] = {}
                 item["selected_addon_ids"] = _decode_int_list(item.get("selected_addons_json"))
+                item["selected_addon_quantities"] = _decode_int_map(item.get("selected_addon_quantities_json"))
                 result.append(item)
             return result
 
@@ -1625,6 +1717,7 @@ class Database:
                 except (TypeError, json.JSONDecodeError):
                     item["pricing_details"] = {}
                 item["selected_addon_ids"] = _decode_int_list(item.get("selected_addons_json"))
+                item["selected_addon_quantities"] = _decode_int_map(item.get("selected_addon_quantities_json"))
                 result.append(item)
             return result
 
@@ -1826,6 +1919,7 @@ class Database:
                 except (TypeError, json.JSONDecodeError):
                     item["pricing_details"] = {}
                 item["selected_addon_ids"] = _decode_int_list(item.get("selected_addons_json"))
+                item["selected_addon_quantities"] = _decode_int_map(item.get("selected_addon_quantities_json"))
                 result.append(item)
             return result
 

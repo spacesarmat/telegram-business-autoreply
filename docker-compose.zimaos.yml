@@ -75,10 +75,10 @@ x-casaos:
   title:
     en_US: Telegram AutoReply
     ru_RU: Telegram Автоответчик
-  version: "2.1.0"
+  version: "2.1.1"
   update_at: "2026-09-21"
   release_notes:
     en_US: >
-      Multi-venue operations release: two halls, venue-specific availability, tariffs and rules, slot holds, waitlist, resources, managers/tasks, deposits, packages, public booking, API/webhooks, QR/PDF and optional YooKassa payments.
+      Addon quantities release: additional services can be configured per unit with min/max quantity, live client +/- controls and automatic recalculation. Multi-venue operations from v2.1.0 are preserved.
     ru_RU: >
-      Операционный релиз для двух залов: отдельные занятость, тарифы и правила, временные hold, лист ожидания, ресурсы, менеджеры/задачи, залог, пакеты, публичная бронь, API/webhooks, QR/PDF и опциональная ЮKassa.
+      Дополнительные услуги теперь могут иметь количество: цена за единицу, минимум/максимум, кнопки −/＋ у клиента и автоматический перерасчёт. Все возможности двух залов из v2.1.0 сохранены.
